@@ -1,0 +1,13 @@
+# dependencies and runtime artifacts
+bridge/node_modules/
+bridge/whisper/
+workspace/
+
+# machine-specific pi agent source choice (native vs docker container name)
+bridge/agent-source.txt
+
+# local UI preferences (may contain an uploaded avatar)
+webui-settings.json
+
+# logs
+*.log
