@@ -2,6 +2,7 @@
 
 A browser UI for the [pi coding agent](https://github.com/badlogic/pi-mono) running headless (`pi --mode rpc`) inside a Docker container on Windows 10.
 
+![Project Preview](assets/preview.png)
 ```
 Browser  ──WebSocket/HTTP──▶  bridge (Node.js)  ──stdin/stdout JSONL──▶  pi --mode rpc
      (web/ static files)         (bridge/server.js)         (inside the container)
