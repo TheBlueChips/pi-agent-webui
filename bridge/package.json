@@ -1,0 +1,12 @@
+{
+  "name": "pi-agent-webui-bridge",
+  "version": "1.0.0",
+  "description": "Bridge server that connects a browser WebUI to a Pi coding agent running in RPC mode",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
