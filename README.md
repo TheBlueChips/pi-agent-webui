@@ -1,6 +1,7 @@
 # Pi Agent WebUI
 
 A browser UI for the [pi coding agent](https://github.com/badlogic/pi-mono) running headless (`pi --mode rpc`) inside a Docker container on Windows 10.
+early Work.in.progress (will have bugs)
 
 ![Project Preview](assets/preview.png)
 ```
