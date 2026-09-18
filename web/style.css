@@ -399,6 +399,7 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
   border-color: #2a3b57;
 }
 .msg .msg-tools { display: inline-flex; gap: 6px; margin-left: 8px; }
+.msg .msg-tools.pending { display: none; } /* live message: buttons appear once the turn is over */
 .msg .msg-tools .btn {
   font-size: 11px; padding: 1px 8px;
   color: var(--accent);

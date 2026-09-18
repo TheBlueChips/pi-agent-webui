@@ -1366,6 +1366,10 @@ function startLive() {
   const { root, tools, bubble } = makeMsgShell('assistant streaming', '…');
   addCopyButton(tools, () => S.live ? S.live.text : '');
   addSpeakButton(tools, () => stripMarkdown(S.live ? S.live.text : ''));
+  // Copy/speak only make sense once the message is final — keep the buttons
+  // hidden while streaming. finalizeLive() replaces this shell with the
+  // rendered message, where they are visible again.
+  tools.classList.add('pending');
   const md = el('div', 'md');
   bubble.appendChild(md);
   const statsEl = el('span', 'agent-stats');

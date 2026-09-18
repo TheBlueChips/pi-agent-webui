@@ -89,12 +89,19 @@ export default function App() {
   const [bridgeOk, setBridgeOk] = useState(null); // null = checking
   const [shortsExpanded, setShortsExpanded] = useState(false);
   const [shortsProvider, setShortsProvider] = useState('instagram');
+  const [autoOpenShorts, setAutoOpenShorts] = useState(false);
   const [dims, setDims] = useState(Dimensions.get('window'));
 
   const bridgeRef = useRef(null);
   const listRef = useRef(null);
   const liveRef = useRef(null);
   const initedRef = useRef(false);
+  // True while the shorts feed is open *because of* auto-open — manual opens
+  // are never closed automatically when the agent settles.
+  const autoShortsRef = useRef(false);
+  // Mirror of the setting for callbacks whose deps don't include it (onEvent).
+  const autoOpenShortsRef = useRef(false);
+  autoOpenShortsRef.current = autoOpenShorts;
 
   const landscape = dims.width > dims.height;
   const shortsWidth = landscape ? Math.max(320, Math.min(520, Math.round(dims.width * 0.42))) : 0;
@@ -110,6 +117,7 @@ export default function App() {
       setHost(s.host);
       setPort(s.port);
       setShortsProvider(s.shortsProvider || 'instagram');
+      setAutoOpenShorts(!!s.autoOpenShorts);
     })();
   }, []);
 
@@ -174,10 +182,25 @@ export default function App() {
     switch (msg.type) {
       case 'agent_start':
         setStreaming(true);
+        // Auto-open the shorts feed when the agent starts running (RN-app
+        // only; the ref mirrors the setting because this callback's deps
+        // don't include it).
+        if (autoOpenShortsRef.current) {
+          autoShortsRef.current = true;
+          setShortsOpen(true);
+        }
         break;
       case 'agent_settled':
       case 'agent_end':
-        if (msg.type === 'agent_settled') setStreaming(false);
+        if (msg.type === 'agent_settled') {
+          setStreaming(false);
+          // Close only when the agent is fully settled (no retry/compaction/
+          // follow-up left) — not at the end of every turn.
+          if (autoShortsRef.current) {
+            autoShortsRef.current = false;
+            setShortsOpen(false);
+          }
+        }
         if (msg.type === 'agent_end') {
           setStreaming(false);
           refreshStats();
@@ -284,6 +307,12 @@ export default function App() {
   const loadState = useCallback(async (b) => {
     try {
       const st = await b.rpc({ type: 'get_state' });
+      // Reconnected mid-run: if the agent is already streaming, open the feed
+      // the same way agent_start would have.
+      if (st.isStreaming && autoOpenShortsRef.current) {
+        autoShortsRef.current = true;
+        setShortsOpen(true);
+      }
       if (st.model) setModel(st.model);
       if (st.sessionName) setSessionName(st.sessionName);
       await refreshModels(b);
@@ -346,7 +375,7 @@ export default function App() {
   /* ── Android back button: close overlays before leaving the app ── */
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (shortsOpen) { setShortsOpen(false); return true; }
+      if (shortsOpen) { autoShortsRef.current = false; setShortsOpen(false); return true; }
       if (showModels) { setShowModels(false); return true; }
       if (showSessions) { setShowSessions(false); return true; }
       if (showSettings) { setShowSettings(false); return true; }
@@ -442,6 +471,13 @@ export default function App() {
     saveSettings({ shortsProvider: key });
   }, []);
 
+  const toggleAutoOpenShorts = useCallback(() => {
+    setAutoOpenShorts((v) => {
+      saveSettings({ autoOpenShorts: !v });
+      return !v;
+    });
+  }, []);
+
   /* ── context ring label ── */
   const fmtTok = (n) => {
     if (n == null) return '–';
@@ -516,7 +552,7 @@ export default function App() {
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.iconBtn, shortsOpen && styles.iconBtnActive]}
-            onPress={() => setShortsOpen(!shortsOpen)}
+            onPress={() => { if (shortsOpen) autoShortsRef.current = false; setShortsOpen(!shortsOpen); }}
             hitSlop={8}
           >
             <Text style={[styles.iconText, shortsOpen && { color: C.accent }]}>▶</Text>
@@ -605,7 +641,7 @@ export default function App() {
               <ShortsPanel
                 provider={shortsProvider}
                 onProviderChange={setShortProvider}
-                onClose={() => setShortsOpen(false)}
+                onClose={() => { autoShortsRef.current = false; setShortsOpen(false); }}
                 compact={!landscape}
                 expanded={shortsExpanded}
                 onToggleExpand={!landscape ? () => setShortsExpanded((v) => !v) : undefined}
@@ -644,6 +680,10 @@ export default function App() {
               placeholderTextColor={C.dim}
               keyboardType="number-pad"
             />
+            <TouchableOpacity style={[styles.modalRow, { marginTop: 14 }]} onPress={toggleAutoOpenShorts}>
+              <Text style={styles.modalRowText}>Auto-open Shorts while the agent is running</Text>
+              {autoOpenShorts ? <Text style={{ color: C.accent }}>✓</Text> : null}
+            </TouchableOpacity>
             </ScrollView>
             <TouchableOpacity style={styles.primaryBtn} onPress={applyConnection}>
               <Text style={styles.primaryBtnText}>Connect</Text>
