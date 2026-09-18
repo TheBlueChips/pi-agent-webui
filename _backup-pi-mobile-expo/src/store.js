@@ -1,0 +1,36 @@
+// Tiny AsyncStorage-backed settings store for the standalone app.
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DEFAULT_HOST, DEFAULT_PORT } from './config';
+
+const KEY = 'piagent.settings.v1';
+
+export const DEFAULTS = {
+  host: DEFAULT_HOST,
+  port: String(DEFAULT_PORT),
+  shortsProvider: 'instagram',
+  setupDone: false,
+};
+
+/** Load settings, merged over defaults. Never throws. */
+export async function loadSettings() {
+  try {
+    const raw = await AsyncStorage.getItem(KEY);
+    if (!raw) return { ...DEFAULTS };
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULTS, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+
+/** Persist a partial settings patch. Never throws. */
+export async function saveSettings(patch) {
+  try {
+    const current = await loadSettings();
+    const next = { ...current, ...patch };
+    await AsyncStorage.setItem(KEY, JSON.stringify(next));
+    return next;
+  } catch {
+    return null;
+  }
+}

@@ -13,6 +13,20 @@
   --yellow: #d9a53f;
   --radius: 10px;
   --mono: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+  --chat-font: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --chat-size: 14px;
+  --ui-alpha: 1;
+}
+
+/* ───────────────────────── background media ─────────────────────────
+ * Videos need a real element behind the app (body background-image only
+ * handles static images / GIFs). Kept out of the layout entirely. */
+#bg-media {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
+}
+#bg-media.hidden { display: none; }
+#bg-media video, #bg-media img {
+  width: 100%; height: 100%; object-fit: cover; object-position: center;
 }
 
 * { box-sizing: border-box; }
@@ -68,7 +82,9 @@ body.sidebar-hidden #sidebar { display: none; }
 #topbar {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 12px; border-bottom: 1px solid var(--border);
-  background: var(--bg-panel);
+  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
+  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
+  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
 }
 .session-name {
   flex: 1; min-width: 60px;
@@ -85,6 +101,71 @@ body.sidebar-hidden #sidebar { display: none; }
 .conn-dot.on { background: var(--green); }
 .conn-dot.busy { background: var(--yellow); animation: pulse 1s infinite; }
 @keyframes pulse { 50% { opacity: 0.4; } }
+
+/* Split-feed pill: shown while the Reels split panel is open */
+.reels-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--accent-dim); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 999px;
+  font-size: 12px; font-weight: 600; padding: 3px 10px; cursor: pointer;
+  transition: background .15s, opacity .15s;
+}
+.reels-pill:hover { background: var(--accent); color: #fff; }
+.reels-pill.hidden { display: none; }
+
+/* ───────────────────────── reels in-app panel ───────────────────────── */
+#reels-panel {
+  width: 400px; min-width: 320px;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  position: relative;
+}
+/* Drag handle on the panel's left edge. Dragging it widens the panel, and the
+   docked WebView2 surface (when present) is told the new rectangle so the live
+   feed tracks it in real time. */
+#reels-resize {
+  position: absolute; left: -4px; top: 0; bottom: 0; width: 8px;
+  cursor: col-resize; z-index: 6; background: transparent;
+  transition: background .12s;
+}
+#reels-resize:hover, #reels-resize.dragging { background: var(--accent-dim); }
+/* While a native surface covers the panel, nothing inside it should paint. */
+.reels-video.native-feed > * { display: none; }
+#reels-panel.hidden { display: none; }
+.reels-panel-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+}
+.reels-panel-title { font-weight: 700; font-size: 13px; white-space: nowrap; }
+.reels-tabs { display: flex; gap: 4px; flex: 1; }
+.rtab {
+  background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 999px; font-size: 12px; padding: 3px 10px; cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.rtab:hover { color: var(--text); border-color: var(--accent-dim); }
+.rtab.active { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
+.reels-link-row {
+  display: flex; gap: 6px; padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.reels-link-row input { flex: 1; min-width: 0; }
+.reels-video { flex: 1; min-height: 0; position: relative; background: #000; }
+.reels-video iframe {
+  position: absolute; inset: 0; width: 100%; height: 100%; border: 0;
+}
+.reels-placeholder {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 20px; text-align: center;
+  color: var(--text-dim); font-size: 13px;
+}
+.reels-placeholder p { margin: 0; max-width: 300px; }
+.reels-panel-foot {
+  padding: 8px 10px; border-top: 1px solid var(--border);
+  display: flex; justify-content: center;
+}
 
 /* ───────────────────────── controls ───────────────────────── */
 .btn {
@@ -111,6 +192,20 @@ select, #ext-dialog input, #ext-dialog textarea, #ext-dialog select {
   max-width: 170px;
 }
 
+/* dark inputs with accent focus glow (settings, dialogs) */
+input[type="text"], input[type="password"], input[type="search"], input[type="color"], textarea {
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 5px 8px;
+  font-size: 12.5px; font-family: inherit;
+}
+input[type="text"]:focus, input[type="password"]:focus, input[type="search"]:focus,
+textarea:focus, select:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+input[type="color"] { width: 44px; height: 30px; padding: 2px; cursor: pointer; }
+input::placeholder { color: var(--text-dim); opacity: .75; }
+
 /* avatars */
 .avatar {
   width: 34px; height: 34px; border-radius: 50%;
@@ -133,6 +228,16 @@ select, #ext-dialog input, #ext-dialog textarea, #ext-dialog select {
 .msg.compaction .who {
   color: var(--accent); font-family: var(--mono); font-size: 12px;
   padding: 6px 12px; background: #14202e; border: 1px solid #2a4a6a; border-radius: 8px;
+}
+/* The newest compaction is pinned to the end of the transcript (pi puts it at
+ * the top of the rebuilt context, where nobody would ever see it). */
+.msg.compaction.pinned .who {
+  display: flex; align-items: center; gap: 8px;
+  border-left: 3px solid var(--accent);
+}
+.compaction-count {
+  margin-left: auto; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: #2a4a6a; color: var(--text); opacity: .85; cursor: default;
 }
 .msg.compaction details { margin-top: 6px; }
 .msg.compaction summary {
@@ -194,6 +299,8 @@ body.hide-thinking details.thinking { display: none; }
 .ctx-ring .ring-bg { stroke: var(--bg-hover); }
 .ctx-ring .ring-fg { stroke: var(--accent); transition: stroke-dasharray .4s; }
 .ctx-ring.warn .ring-fg { stroke: var(--yellow); }
+.ctx-ring.critical .ring-fg { stroke: #ef4444; filter: drop-shadow(0 0 4px rgba(239,68,68,.55)); }
+.ctx-ring.critical text { fill: #ef4444; }
 .ctx-ring text { fill: var(--text); font-size: 12px; font-weight: 600; }
 .ctx-label {
   font-family: var(--mono); font-size: 11px; color: var(--text-dim);
@@ -207,8 +314,12 @@ body.hide-thinking details.thinking { display: none; }
   align-items: center; margin-top: 10px;
 }
 .settings-grid label { font-size: 12.5px; color: var(--text-dim); }
-.settings-grid input[type="text"], .settings-grid select {
+.settings-grid input[type="text"], .settings-grid input[type="password"], .settings-grid select {
   width: 100%; max-width: none;
+}
+.settings-grid textarea {
+  width: 100%; box-sizing: border-box;
+  font: 12px var(--mono); resize: vertical;
 }
 .avatar-row { display: flex; align-items: center; gap: 8px; }
 .rate-row { display: flex; align-items: center; gap: 8px; }
@@ -225,8 +336,50 @@ dialog#settings-dialog {
 dialog#settings-dialog::backdrop { background: rgba(0,0,0,.55); }
 dialog#settings-dialog h3 { margin: 0 0 4px; }
 
+/* settings tabs */
+.tabs {
+  display: flex; gap: 2px; margin: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tabs .tab {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-dim); font-size: 12.5px; padding: 6px 10px;
+  cursor: pointer; margin-bottom: -1px;
+}
+.tabs .tab:hover { color: var(--text); }
+.tabs .tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+.tab-panel.hidden { display: none; }
+.hint { font-size: 11.5px; color: var(--text-dim); margin: 8px 0 0; }
+
+/* first-launch setup dialog */
+dialog#setup-dialog {
+  background: var(--bg-panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px; min-width: 380px; max-width: 460px;
+}
+dialog#setup-dialog::backdrop { background: rgba(0,0,0,.7); }
+dialog#setup-dialog h3 { margin: 0 0 2px; }
+.setup-sub { color: var(--text-dim); font-size: 12.5px; margin: 0 0 10px; }
+
+/* pi providers section */
+.settings-section {
+  margin-top: 16px; border-top: 1px solid var(--border); padding-top: 10px;
+}
+.settings-section h4 { margin: 0 0 8px; font-size: 13px; }
+.settings-section h4 .hint { color: var(--text-dim); font-weight: 400; font-size: 11.5px; }
+.prov-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.prov-row { display: flex; align-items: center; gap: 8px; }
+.prov-info { flex: 1; min-width: 0; }
+.prov-id { font: 600 12.5px var(--mono); }
+.prov-meta {
+  font-size: 11px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.prov-empty { font-size: 12px; color: var(--text-dim); }
+.prov-actions { margin-top: 10px; }
+
 /* ───────────────────────── chat ───────────────────────── */
-#chat { flex: 1; overflow-y: auto; padding: 16px 12px 8px; }
+#chat { flex: 1; overflow-y: auto; padding: 16px 12px 8px; font-family: var(--chat-font); font-size: var(--chat-size); }
 .msg { max-width: 860px; margin: 0 auto 14px; }
 .msg .who {
   font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
@@ -235,10 +388,16 @@ dialog#settings-dialog h3 { margin: 0 0 4px; }
 }
 .msg.user .who { color: var(--accent); }
 .msg .bubble {
-  background: var(--bg-panel); border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
+  border: 1px solid var(--border);
   border-radius: var(--radius); padding: 10px 14px;
+  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
+  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
 }
-.msg.user .bubble { background: #1a2231; border-color: #2a3b57; }
+.msg.user .bubble {
+  background: color-mix(in srgb, #1a2231 calc(var(--ui-alpha) * 100%), transparent);
+  border-color: #2a3b57;
+}
 .msg .msg-tools { float: right; margin-left: 8px; }
 .msg .msg-tools .btn { font-size: 11px; padding: 1px 7px; opacity: 0; }
 .msg:hover .msg-tools .btn { opacity: 1; }
@@ -317,7 +476,12 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 }
 .status-bar { padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap; }
 
-#composer { padding: 4px 12px 10px; background: var(--bg); }
+#composer {
+  padding: 4px 12px 10px;
+  background: color-mix(in srgb, var(--bg) calc(var(--ui-alpha) * 100%), transparent);
+  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
+  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
+}
 .edit-banner {
   max-width: 860px; margin: 0 auto 6px;
   background: #2b2410; border: 1px solid var(--yellow); border-radius: 8px;
@@ -340,14 +504,18 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .composer-row {
   max-width: 860px; margin: 0 auto;
   display: flex; gap: 8px; align-items: flex-end;
-  background: var(--bg-panel); border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
+  border: 1px solid var(--border);
   border-radius: var(--radius); padding: 8px;
+  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
+  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
 }
 .composer-row:focus-within { border-color: var(--accent-dim); }
 #input {
   flex: 1; resize: none; border: none; outline: none;
   background: transparent; color: var(--text);
-  font: 14px/1.45 inherit; max-height: 200px; padding: 4px 2px;
+  font: 14px/1.45 inherit; font-family: var(--chat-font); font-size: var(--chat-size);
+  max-height: 200px; padding: 4px 2px;
 }
 #btn-mic.recording { background: var(--red); border-color: var(--red); animation: pulse 1s infinite; }
 #btn-send svg, #btn-mic svg, #btn-stop svg { display: block; }
@@ -440,6 +608,59 @@ body { display: flex; }
 #reels-frame { width: 100%; min-height: 500px; border: none; border-radius: 10px; background: #000; }
 .reels-empty { color: var(--text-dim); font-size: 12.5px; padding: 30px 10px; text-align: center; }
 
+/* ── live tool timers / elapsed ── */
+.tool-card .tool-timer {
+  margin-left: 8px; font-size: 11px; color: var(--accent);
+  font-variant-numeric: tabular-nums; font-family: var(--mono);
+}
+
+/* ── live compaction block ── */
+.msg.compaction.compacting .who { color: var(--accent); }
+.compaction-spin {
+  display: inline-block; width: 10px; height: 10px; margin-right: 2px;
+  border: 2px solid var(--accent-dim); border-top-color: var(--accent);
+  border-radius: 50%; animation: comp-spin .8s linear infinite;
+  vertical-align: baseline;
+}
+@keyframes comp-spin { to { transform: rotate(360deg); } }
+
+/* ── live session indicator ── */
+.session-item.live { border-color: var(--accent); }
+.live-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--green); margin-right: 6px; vertical-align: 1px;
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(80, 200, 120, .5); }
+  50% { opacity: .55; box-shadow: 0 0 0 4px rgba(80, 200, 120, 0); }
+}
+
+/* ── file attachments (PDF / audio / video) ── */
+.attachment.file { display: flex; align-items: center; gap: 8px; max-width: 260px; }
+.attachment.file .file-icon {
+  flex: 0 0 auto; width: 34px; height: 34px; display: flex; align-items: center;
+  justify-content: center; background: var(--accent-dim); color: var(--accent);
+  border-radius: 6px; font-size: 10px; font-weight: 700;
+}
+.attachment.file .file-meta { min-width: 0; }
+.attachment.file .file-name {
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 200px;
+}
+.attachment.file .file-status {
+  font-size: 10.5px; color: var(--text-dim); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 200px;
+}
+
+/* ── font picker ── */
+.font-row { display: flex; gap: 6px; align-items: center; }
+.font-row input {
+  flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: 12.5px;
+}
+.font-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -449,3 +670,8 @@ body { display: flex; }
   #sidebar.open { left: 0; }
   body.sidebar-hidden #sidebar { display: flex; }
 }
+
+/* Reels placeholder: the feed cannot be iframed, so the panel offers a real
+   top-level window instead (a popup gets its own browsing context, where the
+   sites' X-Frame-Options: DENY does not apply). */
+.reels-placeholder-actions { display: flex; gap: 8px; margin-top: 4px; }

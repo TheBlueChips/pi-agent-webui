@@ -18,6 +18,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { spawn, execFile, execSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { WebSocketServer } = require('ws');
@@ -31,8 +32,27 @@ const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd();
 // agent runs in an existing container, e.g. PI_COMMAND="docker exec -i ctr pi --mode rpc").
 const SESSION_DIR =
   process.env.PI_SESSION_DIR || path.join(os.homedir(), '.pi', 'agent', 'sessions');
+// pi's config dir (~/.pi/agent): models.json / settings.json / auth.json live here.
+const PI_AGENT_DIR = process.env.PI_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
+const PI_MODELS_FILE = path.join(PI_AGENT_DIR, 'models.json');
+const PI_SETTINGS_FILE = path.join(PI_AGENT_DIR, 'settings.json');
+
+// Where uploads (attachments + chat backgrounds) live.
+// start-webui.bat runs the bridge from bridge\, while a manual `node server.js`
+// from the repo root uses the root - so both are accepted, and reads look in
+// both. Writes always go to the first (the primary) directory.
+const UPLOAD_DIRS = (() => {
+  const seen = new Set();
+  const out = [];
+  for (const d of [path.join(WORKSPACE_DIR, 'uploads'), path.resolve(WORKSPACE_DIR, '..', 'uploads')]) {
+    if (!seen.has(d)) { seen.add(d); out.push(d); }
+  }
+  return out;
+})();
+const PI_AUTH_FILE = path.join(PI_AGENT_DIR, 'auth.json');
 const WEB_DIR = path.join(__dirname, '..', 'web');
 let whisperUrl = null; // set once the local whisper STT server (if any) is up
+const fontsCache = { list: null, at: 0 }; // GET /api/system-fonts cache
 
 function parseSessionDir() {
   if (SESSION_DIR.startsWith('docker:')) {
@@ -132,7 +152,20 @@ function serveStatic(req, res) {
       res.writeHead(404).end('not found');
       return;
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    // The UI is edited live from disk, so a stale app.js/style.css would
+    // silently hide new features. Revalidate on every load: the files are tiny
+    // and served from localhost, and a 304 keeps repeat loads cheap.
+    const etag = `"${data.length.toString(16)}-${crypto.createHash('sha1').update(data).digest('hex').slice(0, 12)}"`;
+    const headers = {
+      'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
+      'Cache-Control': 'no-cache, must-revalidate',
+      'ETag': etag,
+    };
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers).end();
+      return;
+    }
+    res.writeHead(200, headers);
     res.end(data);
   });
 }
@@ -150,6 +183,39 @@ function execCapture(cmd, args, timeoutMs = 15000) {
 }
 
 // Extract a display title from the head of one session file's content.
+/* Latest `session_info` name found scanning lines backwards (pi appends these
+ * to the end of the session file, latest wins). Empty name clears the title. */
+function nameFromText(text) {
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line || line[0] !== '{') continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (e && e.type === 'session_info') {
+      const n = typeof e.name === 'string' ? e.name.trim() : '';
+      return n || null; // empty clears the title
+    }
+  }
+  return null;
+}
+
+function nameFromTail(file, bytes = 64 * 1024) {
+  try {
+    const st = fs.statSync(file);
+    const len = Math.min(bytes, st.size);
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, st.size - len);
+    fs.closeSync(fd);
+    let text = buf.toString('utf8');
+    // a tail read usually starts mid-line — drop the partial first line
+    if (st.size > len) text = text.slice(text.indexOf('\n') + 1);
+    return nameFromText(text);
+  } catch { /* unreadable */ }
+  return null;
+}
+
 function titleFromHead(head) {
   let title = '';
   for (const line of head.split('\n')) {
@@ -162,6 +228,10 @@ function titleFromHead(head) {
     }
     if (entry && (entry.type === 'session' || entry.type === 'sessionStart')) {
       if (entry.name) title = entry.name;
+      continue;
+    }
+    if (entry && entry.type === 'session_info') {
+      title = typeof entry.name === 'string' ? entry.name.trim() : '';
       continue;
     }
     const msg = entry && (entry.message || entry.payload || entry);
@@ -204,10 +274,13 @@ function scanLocalSessions() {
     } catch {
       /* unreadable file — fall back to file name */
     }
+    const name = path.basename(file);
+    // prefer an explicit rename (tail) over the derived first-message title
+    const explicit = nameFromTail(file);
     sessions.push({
       path: file,
       fileName: name,
-      name: title || name.replace(/\.jsonl$/, ''),
+      name: explicit || title || name.replace(/\.jsonl$/, ''),
       mtime: st.mtimeMs,
       size: st.size,
     });
@@ -232,21 +305,25 @@ async function scanDockerSessions(container, dir) {
     };
   }).filter((f) => f.path.endsWith('.jsonl'));
 
-  // Pull a title out of each file head in a single exec.
+  // Pull a title out of each file head + any explicit renames from the tail.
   const heads = await execCapture('docker', ['exec', container, 'sh', '-c',
     `for f in ${files.map((f) => `'${f.path}'`).join(' ')}; do` +
-    ` echo "===PIWEBUI $f"; head -c 32768 "$f"; echo; done`], 30000);
+    ` echo "===PIWEBUI $f"; head -c 32768 "$f"; echo;` +
+    ` echo "===PIWEBUITAIL $f"; tail -c 65536 "$f" 2>/dev/null; echo; done`], 30000);
   const titleByFile = {};
-  for (const chunk of heads.split('===PIWEBUI ')) {
+  const explicitByFile = {};
+  for (const chunk of heads.split('===PIWEBUI')) {
     const nl = chunk.indexOf('\n');
     if (nl < 0) continue;
-    const name = chunk.slice(0, nl).trim();
-    titleByFile[name] = titleFromHead(chunk.slice(nl + 1));
+    const marker = chunk.slice(0, nl).trim();
+    const body = chunk.slice(nl + 1);
+    if (marker.startsWith('TAIL ')) explicitByFile[marker.slice(5).trim()] = nameFromText(body);
+    else if (marker) titleByFile[marker] = titleFromHead(body);
   }
   return files.map((f) => ({
     path: f.path,
     fileName: f.fileName,
-    name: titleByFile[f.path] || f.fileName.replace(/\.jsonl$/, ''),
+    name: explicitByFile[f.path] || titleByFile[f.path] || f.fileName.replace(/\.jsonl$/, ''),
     mtime: f.mtime,
     size: f.size,
   }));
@@ -265,6 +342,90 @@ async function scanSessions() {
 }
 
 const SETTINGS_FILE = path.join(__dirname, '..', 'webui-settings.json');
+
+// ---------------------------------------------------------------- llama.cpp + pi config
+
+function readJsonSafe(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+/*
+ * llama.cpp server URL candidates, in the same resolution order as the
+ * pi-llama-cpp extension: project .pi/settings.json → $LLAMA_SERVER_URL →
+ * global settings.json → auth.json (built-in provider) → default.
+ */
+function llamaServerCandidates() {
+  const urls = [];
+  const project = readJsonSafe(path.join(WORKSPACE_DIR, '.pi', 'settings.json'));
+  if (project && project.llamaServerUrl) urls.push(project.llamaServerUrl);
+  if (process.env.LLAMA_SERVER_URL) urls.push(process.env.LLAMA_SERVER_URL);
+  const global = readJsonSafe(PI_SETTINGS_FILE);
+  if (global && global.llamaServerUrl) urls.push(global.llamaServerUrl);
+  const auth = readJsonSafe(PI_AUTH_FILE);
+  if (auth && auth['llama.cpp'] && auth['llama.cpp'].env && auth['llama.cpp'].env.LLAMA_BASE_URL) {
+    urls.push(auth['llama.cpp'].env.LLAMA_BASE_URL);
+  }
+  urls.push('http://127.0.0.1:8080');
+  const out = [];
+  for (const raw of urls) {
+    for (const u of String(raw).split(';').map((s) => s.trim().replace(/\/+$/, ''))) {
+      if (u && !out.includes(u)) out.push(u);
+    }
+  }
+  return out;
+}
+
+/* Fetch the model list from one OpenAI-compatible server. Returns null when
+ * the server is unreachable or has no models endpoint. A network error on the
+ * first path means the host is unreachable — don't waste another timeout on
+ * the second path. */
+async function fetchLlamaModels(url) {
+  const parse = (d) => {
+    const arr = Array.isArray(d) ? d : (Array.isArray(d.data) ? d.data : null);
+    if (!arr) return null;
+    return arr
+      .filter((m) => m && typeof m.id === 'string')
+      .map((m) => ({ id: m.id, name: m.name || m.id }));
+  };
+  try {
+    const res = await fetch(url + '/v1/models', { signal: AbortSignal.timeout(1200) });
+    if (res.ok) {
+      const models = parse(await res.json());
+      if (models) return models;
+    }
+    // Server answered (404/405/etc.) — try the plain /models path (llama.cpp).
+    const res2 = await fetch(url + '/models', { signal: AbortSignal.timeout(1200) });
+    if (res2.ok) return parse(await res2.json());
+    return null;
+  } catch {
+    return null; // unreachable host
+  }
+}
+
+const ALLOWED_APIS = new Set([
+  'openai-completions', 'openai-responses', 'anthropic-messages',
+  'google-generative-ai', 'mistral-conversations', 'bedrock-converse-stream',
+  'azure-openai-responses', 'openai-codex-responses',
+]);
+const MODEL_FIELDS = ['id', 'name', 'api', 'baseUrl', 'reasoning', 'input',
+  'contextWindow', 'maxTokens', 'cost', 'compat', 'thinkingLevelMap', 'headers'];
+const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function maskKey(k) {
+  if (!k) return null;
+  const s = String(k);
+  if (s.length <= 8) return s[0] + '…';
+  return s.slice(0, 4) + '…' + s.slice(-4);
+}
+
+function writeModelsFile(file) {
+  fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
+  fs.writeFileSync(PI_MODELS_FILE, JSON.stringify(file, null, 2) + '\n');
+}
+
+/* Small cache for /api/llama-models (the UI probes it on connect, focus and
+ * a retry loop). */
+const llamaModelsCache = { at: 0, data: null };
 
 const server = http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/ui-settings')) {
@@ -317,13 +478,469 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ ok: true }));
     return;
   }
+
+  // llama.cpp: list every model each reachable server knows about. The
+  // providerId matches what the pi-llama-cpp extension registers
+  // ("llama-server=<baseUrl>"), so the WebUI can set_model directly.
+  if (req.url.startsWith('/api/llama-models')) {
+    // 5s cache: the UI probes on connect, on focus, and on a retry loop —
+    // don't hammer the (possibly busy) llama server with identical requests.
+    // Empty results are cached for only 2s so a starting server shows up fast.
+    const ttl = llamaModelsCache.data && llamaModelsCache.data.servers.length ? 5000 : 2000;
+    if (llamaModelsCache.data && Date.now() - llamaModelsCache.at < ttl) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(llamaModelsCache.data));
+      return;
+    }
+    const results = await Promise.all(llamaServerCandidates().map(async (url) => {
+      const models = await fetchLlamaModels(url);
+      return models ? { url, providerId: `llama-server=${url}`, models } : null;
+    }));
+    const payload = { servers: results.filter(Boolean) };
+    llamaModelsCache.at = Date.now();
+    llamaModelsCache.data = payload;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  // Read / write the llamaServerUrl in pi's global settings (~/.pi/agent/settings.json).
+  // pi-llama-cpp resolves this URL at agent startup, so after a change the agent
+  // must be restarted (the UI sends {bridge:'restart'}) for it to take effect.
+  if (req.url.startsWith('/api/llama-config')) {
+    if (req.method === 'GET') {
+      let url = null;
+      try { url = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')).llamaServerUrl || null; } catch { /* no file */ }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ url }));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { url } = JSON.parse(body || '{}');
+          if (typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
+            throw new Error('url must be an http(s) base URL');
+          }
+          const clean = url.trim().replace(/\/+$/, '');
+          let settings = {};
+          try { settings = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
+          const previous = settings.llamaServerUrl || null;
+          settings.llamaServerUrl = clean;
+          fs.mkdirSync(path.dirname(PI_SETTINGS_FILE), { recursive: true });
+          fs.writeFileSync(PI_SETTINGS_FILE, JSON.stringify(settings, null, 2));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, previous, current: clean }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    res.writeHead(405).end();
+    return;
+  }
+
+  // Installed system fonts (Windows: font registry; fallback: font dirs).
+  // Cached 5 minutes — the registry query is slow-ish.
+  if (req.url.startsWith('/api/system-fonts')) {
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    const now = Date.now();
+    if (fontsCache.list && now - fontsCache.at < 5 * 60 * 1000) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(fontsCache.list));
+      return;
+    }
+    // A font-registry line is "NAME    REG_SZ    VALUE". Two layouts exist:
+    //   standard:  "arial.ttf   REG_SZ   Arial, version 7.00"  → family in value
+    //   reversed:  "Arial (TrueType)   REG_SZ   arial.ttf"     → family in key
+    const parseFontLine = (line) => {
+      const m = line.trim().match(/^(.+?)\s+REG_SZ\s+(.+)$/);
+      if (!m) return null;
+      const key = m[1], val = m[2];
+      if (val.includes(',')) {
+        const fam = val.split(',')[0].trim();
+        if (fam && !/\.(ttf|otf|ttc|woff2?)$/i.test(fam)) return fam;
+      }
+      if (/^\S[\w .()_-]*$/.test(key)) {
+        const fam = key.replace(/\s*\([^)]*\)\s*$/i, '').trim();
+        if (fam && !/\.(ttf|otf|ttc|woff2?)$/i.test(fam)) return fam;
+      }
+      return null;
+    };
+    (async () => {
+      const families = new Set();
+      const regKey = 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
+      const regUser = 'HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
+      for (const key of [regKey, regUser]) {
+        try {
+          const out = await new Promise((resolve, reject) => {
+            const { execFile } = require('child_process');
+            execFile('reg', ['query', key], { timeout: 8000 }, (e, stdout) => e ? reject(e) : resolve(stdout || ''));
+          });
+          for (const line of out.split('\n')) {
+            const fam = parseFontLine(line);
+            if (fam) families.add(fam);
+          }
+        } catch { /* registry unavailable / no user fonts */ }
+      }
+      if (!families.size) {
+        // Fallback: scan font directories (family ≈ file base name)
+        const dirs = [path.win32.join(process.env.WINDIR || 'C:\\Windows', 'Fonts'),
+          path.win32.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows', 'Fonts')];
+        for (const dir of dirs) {
+          try {
+            for (const f of fs.readdirSync(dir)) {
+              if (/\.(ttf|otf|ttc|woff2?)$/i.test(f)) families.add(f.replace(/\.[^.]+$/, ''));
+            }
+          } catch { /* dir missing */ }
+        }
+      }
+      fontsCache.list = { at: now, fonts: [...families].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })) };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(fontsCache.list));
+    })().catch((e) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    });
+    return;
+  }
+
+  // Save an uploaded file (PDF / audio / video / other) into the workspace so
+  // the agent can read it with its tools. Body: {name, data(base64), mimeType}.
+  // Serve a previously uploaded file back to the browser. Used for background
+  // images / GIFs / videos, which would otherwise blow the localStorage quota
+  // as data URLs. Only files inside an uploads dir are reachable (basename-only,
+  // no traversal).
+  if (req.url.startsWith('/api/bg-file')) {
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    try {
+      const raw = new URL(req.url, 'http://localhost').searchParams.get('name') || '';
+      const name = path.basename(decodeURIComponent(raw));
+      let file = null;
+      for (const dir of UPLOAD_DIRS) {
+        const cand = path.join(dir, name);
+        if (name && cand.startsWith(dir + path.sep) && fs.existsSync(cand)) { file = cand; break; }
+      }
+      if (!file) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+        return;
+      }
+      const types = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+        '.webp': 'image/webp', '.avif': 'image/avif', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
+        '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/x-m4v',
+        '.ogv': 'video/ogg', '.mkv': 'video/x-matroska',
+      };
+      const st = fs.statSync(file);
+      res.writeHead(200, {
+        'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream',
+        'Content-Length': st.size,
+        'Cache-Control': 'public, max-age=86400',
+      });
+      fs.createReadStream(file).pipe(res);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'bad request' }));
+    }
+    return;
+  }
+
+  if (req.url.startsWith('/api/upload')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    const MAX = 256 * 1024 * 1024; // base64 of ~190 MB
+    req.on('data', (c) => { body += c; if (body.length > MAX) { req.destroy(); } });
+    req.on('end', () => {
+      try {
+        const { name, data, mimeType } = JSON.parse(body || '{}');
+        if (typeof name !== 'string' || !name) throw new Error('name is required');
+        if (typeof data !== 'string' || !data) throw new Error('data (base64) is required');
+        const safe = name.replace(/[^\w.\- ()\[\]]/g, '_').slice(0, 120);
+        const dir = UPLOAD_DIRS[0];
+        fs.mkdirSync(dir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const file = path.join(dir, `${stamp}-${safe}`);
+        fs.writeFileSync(file, Buffer.from(data, 'base64'));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: file, size: fs.statSync(file).size, mimeType: mimeType || null }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Transcribe an audio file (base64 WAV) via the local whisper server.
+  if (req.url.startsWith('/api/transcribe')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    if (!whisperUrl) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no local STT server is running' }));
+      return;
+    }
+    let body = '';
+    const MAX = 256 * 1024 * 1024;
+    req.on('data', (c) => { body += c; if (body.length > MAX) { req.destroy(); } });
+    req.on('end', async () => {
+      try {
+        const { data } = JSON.parse(body || '{}');
+        if (typeof data !== 'string' || !data) throw new Error('data (base64 wav) is required');
+        const wav = Buffer.from(data, 'base64');
+        const boundary = '----piwebui' + Date.now().toString(16);
+        const head = Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="speech.wav"\r\n` +
+          `Content-Type: audio/wav\r\n\r\n`);
+        const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+        const resp = await fetch(`${whisperUrl}/inference`, {
+          method: 'POST',
+          headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+          body: Buffer.concat([head, wav, tail]),
+        });
+        if (!resp.ok) throw new Error(`STT server ${resp.status}`);
+        const d = await resp.json();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, text: d.text || d.transcription || '' }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Test a provider config (url + api + key) with a minimal completion so the
+  // user can verify a provider before saving it. Reports empty responses too
+  // (that was the DeepSeek /anthropic-endpoint failure mode).
+  if (req.url.startsWith('/api/probe-provider')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const { baseUrl, api, apiKey, modelId } = JSON.parse(body || '{}');
+        if (typeof baseUrl !== 'string' || !/^https?:\/\//i.test(baseUrl.trim())) {
+          throw new Error('baseUrl must be an http(s) URL');
+        }
+        const base = baseUrl.trim().replace(/\/+$/, '');
+        const key = apiKey || '';
+        const headers = { 'Content-Type': 'application/json' };
+        if (key) headers['Authorization'] = `Bearer ${key}`;
+        const timeout = (ms) => { const c = new AbortController(); const t = setTimeout(() => c.abort(), ms); return { signal: c.signal, done: () => clearTimeout(t) }; };
+        // 1) model list (OpenAI-style)
+        let models = [];
+        try {
+          const t = timeout(8000);
+          const r = await fetch(`${base}/models`, { headers, signal: t.signal });
+          t.done();
+          if (r.ok) {
+            const d = await r.json();
+            models = (d.data || d.models || []).map((m) => m.id).filter(Boolean);
+          }
+        } catch { /* model list optional */ }
+        // 2) minimal completion. No max_tokens: reasoning models (e.g.
+        // deepseek-flash) spend a small budget on reasoning_content and come
+        // back with empty content + finish_reason "length".
+        const model = modelId || models[0] || 'gpt-4o-mini';
+        let text = '', status = 0, err = null;
+        try {
+          const t = timeout(30000);
+          const r = await fetch(`${base}/chat/completions`, {
+            method: 'POST',
+            headers,
+            signal: t.signal,
+            body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with exactly: OK' }] }),
+          });
+          t.done();
+          status = r.status;
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(`HTTP ${status}: ${(d.error && (d.error.message || d.error.type)) || r.statusText}`);
+          const m0 = (d.choices && d.choices[0]) || {};
+          const msg0 = m0.message || {};
+          text = msg0.content || (msg0.reasoning_content ? '(reasoning only)' : '');
+        } catch (e) { err = e.message; }
+        const empty = !err && status === 200 && !text.trim();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: !err && !empty,
+          status, error: err, empty,
+          model,
+          sample: text.trim().slice(0, 120) || null,
+          models: models.slice(0, 50),
+        }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Probe an arbitrary OpenAI-compatible base URL for its model list
+  // (used by the "discover models" button in settings).
+  if (req.url.startsWith('/api/probe-models')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const { url } = JSON.parse(body || '{}');
+        if (typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
+          throw new Error('url must be an http(s) base URL');
+        }
+        const clean = url.trim().replace(/\/+$/, '');
+        const models = await fetchLlamaModels(clean);
+        if (!models) throw new Error(`no models found at ${clean} (tried /v1/models and /models)`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: clean, models }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // pi custom providers: read / upsert / remove entries in ~/.pi/agent/models.json
+  if (req.url.startsWith('/api/pi-providers')) {
+    if (req.method === 'GET') {
+      const file = readJsonSafe(PI_MODELS_FILE) || {};
+      const providers = {};
+      for (const [id, p] of Object.entries(file.providers || {})) {
+        providers[id] = {
+          name: p.name || null,
+          baseUrl: p.baseUrl || null,
+          api: p.api || null,
+          hasApiKey: !!p.apiKey,
+          apiKey: maskKey(p.apiKey),
+          models: (p.models || []).map((m) => (typeof m === 'string' ? { id: m } : m)),
+        };
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ file: PI_MODELS_FILE, providers }));
+      return;
+    }
+    if (req.method === 'DELETE') {
+      const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
+      if (!PROVIDER_ID_RE.test(id)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid provider id' }));
+        return;
+      }
+      const file = readJsonSafe(PI_MODELS_FILE) || {};
+      if (!(file.providers && file.providers[id])) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `provider "${id}" not found` }));
+        return;
+      }
+      delete file.providers[id];
+      try {
+        writeModelsFile(file);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, file: PI_MODELS_FILE, removed: id }));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const b = JSON.parse(body || '{}');
+          const id = String(b.id || '').trim();
+          const baseUrl = String(b.baseUrl || '').trim().replace(/\/+$/, '');
+          const api = String(b.api || '');
+          const apiKey = b.apiKey != null ? String(b.apiKey).trim() : '';
+          if (!PROVIDER_ID_RE.test(id)) throw new Error('provider id must be 1-64 chars: letters, digits, . _ -');
+          let u;
+          try { u = new URL(baseUrl); } catch { throw new Error('base URL is not a valid URL'); }
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('base URL must be http or https');
+          if (!ALLOWED_APIS.has(api)) throw new Error(`unsupported api "${api}"`);
+          const models = [];
+          if (b.models != null) {
+            if (!Array.isArray(b.models)) throw new Error('models must be an array');
+            for (const m of b.models.slice(0, 500)) {
+              const mid = typeof m === 'string' ? m.trim() : (m && String(m.id || '').trim());
+              if (!mid) continue;
+              const src = typeof m === 'string' ? { id: mid } : { ...m };
+              const clean = {};
+              for (const f of MODEL_FIELDS) if (src[f] !== undefined) clean[f] = src[f];
+              models.push(clean);
+            }
+          }
+          const provider = { baseUrl: u.toString().replace(/\/$/, ''), api };
+          if (b.name) provider.name = String(b.name).trim();
+          if (apiKey) provider.apiKey = apiKey;
+          if (models.length) provider.models = models;
+          if (b.compat && typeof b.compat === 'object') provider.compat = b.compat;
+
+          const file = readJsonSafe(PI_MODELS_FILE) || {};
+          if (!file.providers || typeof file.providers !== 'object') file.providers = {};
+          // blank key on an existing provider keeps its current key
+          if (!apiKey && file.providers[id] && file.providers[id].apiKey) {
+            provider.apiKey = file.providers[id].apiKey;
+          }
+          file.providers[id] = provider;
+          try {
+            writeModelsFile(file);
+          } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, file: PI_MODELS_FILE, id }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    res.writeHead(405).end();
+    return;
+  }
+
   serveStatic(req, res);
 });
 
 // ---------------------------------------------------------------- agent plumbing
 
 const wss = new WebSocketServer({ server });
-const agents = new Map(); // ws -> child process
+
+/*
+ * ONE agent, shared by every connected client.
+ *
+ * The bridge used to spawn a `pi --mode rpc` child per WebSocket, which meant
+ * the browser WebUI and the native app were two independent agents: separate
+ * sessions, separate models, and events only one of them ever saw -- so the two
+ * UIs drifted apart until a manual refresh.
+ *
+ * Now there is a single child. Every client writes its commands to it, every
+ * event is broadcast to every client, and all UIs stay in lockstep in real time.
+ *
+ * Command ids are only unique per client, so a `response` is routed back to the
+ * socket that asked (pendingOwner) rather than broadcast -- otherwise two
+ * clients using "req-1" would resolve each other's requests.
+ */
+let agent = null;               // the shared child process
+const clients = new Set();      // connected sockets
+const pendingOwner = new Map(); // rpc request id -> the ws that sent it
+
+function broadcast(obj, except) {
+  for (const ws of clients) {
+    if (ws !== except) wsSend(ws, obj);
+  }
+}
 
 const isWin = process.platform === 'win32';
 
@@ -346,7 +963,9 @@ function wsSend(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function startAgent(ws) {
+function startAgent() {
+  if (agent) return agent;
+
   const child = spawn(PI_COMMAND, {
     shell: true, // pi is an npm .cmd shim on Windows; shell handles both platforms
     cwd: WORKSPACE_DIR,
@@ -368,19 +987,27 @@ function startAgent(ws) {
       try {
         parsed = JSON.parse(line);
       } catch {
-        wsSend(ws, { bridge: 'agent_raw', line });
+        broadcast({ bridge: 'agent_raw', line });
         continue;
       }
-      wsSend(ws, { bridge: 'rpc', payload: parsed });
+      // A response belongs only to the client that issued the request; events
+      // (everything without a matching owner) go to everybody.
+      if (parsed && parsed.type === 'response' && parsed.id && pendingOwner.has(parsed.id)) {
+        const owner = pendingOwner.get(parsed.id);
+        pendingOwner.delete(parsed.id);
+        wsSend(owner, { bridge: 'rpc', payload: parsed });
+        continue;
+      }
+      broadcast({ bridge: 'rpc', payload: parsed });
     }
   });
 
   child.stderr.on('data', (d) => {
-    wsSend(ws, { bridge: 'agent_stderr', text: d.toString('utf8') });
+    broadcast({ bridge: 'agent_stderr', text: d.toString('utf8') });
   });
 
   child.on('error', (err) => {
-    wsSend(ws, {
+    broadcast({
       bridge: 'agent_exit',
       error: `Failed to start "${PI_COMMAND}": ${err.message}. ` +
              `Is the pi coding agent installed and on PATH? (npm install -g @mariozechner/pi-coding-agent)`,
@@ -388,14 +1015,12 @@ function startAgent(ws) {
   });
 
   child.on('exit', (code, signal) => {
-    if (agents.get(ws) === child) agents.delete(ws);
-    if (ws.readyState === ws.OPEN) {
-      wsSend(ws, { bridge: 'agent_exit', code, signal });
-    }
+    if (agent === child) agent = null;
+    broadcast({ bridge: 'agent_exit', code, signal });
   });
 
-  agents.set(ws, child);
-  wsSend(ws, {
+  agent = child;
+  broadcast({
     bridge: 'agent_started',
     command: PI_COMMAND,
     workspace: WORKSPACE_DIR,
@@ -405,7 +1030,15 @@ function startAgent(ws) {
 }
 
 wss.on('connection', (ws) => {
-  startAgent(ws);
+  clients.add(ws);
+  startAgent();
+  // Tell the newcomer where it is, and let it pull the current state itself.
+  wsSend(ws, {
+    bridge: 'agent_started',
+    command: PI_COMMAND,
+    workspace: WORKSPACE_DIR,
+    sessionDir: SESSION_DIR,
+  });
 
   ws.on('message', (data) => {
     let msg;
@@ -415,34 +1048,79 @@ wss.on('connection', (ws) => {
       return;
     }
     if (msg.bridge === 'restart') {
-      const old = agents.get(ws);
-      if (old) {
-        agents.delete(ws);
-        killTree(old);
-      }
-      // Give the old process a moment to release, then start a fresh one.
-      setTimeout(() => startAgent(ws), 150);
+      // Shared process: everyone gets the fresh agent.
+      const old = agent;
+      agent = null;
+      if (old) killTree(old);
+      setTimeout(() => startAgent(), 150);
       return;
     }
     if (msg.bridge) return; // bridge-level chatter is not forwarded
-    const child = agents.get(ws);
-    if (child && child.stdin.writable) {
-      child.stdin.write(JSON.stringify(msg) + '\n');
+    if (agent && agent.stdin.writable) {
+      // Remember who asked, so the response goes back to them and not to
+      // everybody (ids are only unique per client).
+      if (msg.id) pendingOwner.set(msg.id, ws);
+      agent.stdin.write(JSON.stringify(msg) + '\n');
     } else {
       wsSend(ws, { bridge: 'agent_stderr', text: 'Agent process is not running.' });
     }
   });
 
   ws.on('close', () => {
-    const child = agents.get(ws);
-    if (child) {
-      agents.delete(ws);
-      killTree(child);
+    clients.delete(ws);
+    // Drop any requests this client will never read.
+    for (const [id, owner] of pendingOwner) {
+      if (owner === ws) pendingOwner.delete(id);
+    }
+    // Last one out turns off the lights, so an abandoned agent is not left
+    // running in the background.
+    if (clients.size === 0 && agent) {
+      killTree(agent);
+      agent = null;
     }
   });
 });
 
+// A failed listen() (usually EADDRINUSE from an older bridge still running)
+// must produce a readable message instead of a stack trace.
+//
+// The error is delivered on both objects: `ws` re-emits the http server's
+// 'error' event on the WebSocketServer, and it registers that forwarder first -
+// so without a listener on the WebSocketServer the unhandled 'error' throw
+// happens before the http server's own handler ever runs.
+let listening = false;
+function onFatalServerError(err) {
+  if (listening) {
+    // Already serving - a stray socket error must not take the bridge down.
+    console.error('socket error (ignored):', (err && err.message) || err);
+    return;
+  }
+  if (err && err.code === 'EADDRINUSE') {
+    console.error('');
+    console.error(`  Port ${PORT} is already in use - another Pi Agent WebUI is probably`);
+    console.error('  still running (maybe an old window you forgot about).');
+    console.error('');
+    console.error('  Either close that window, or free the port with:');
+    console.error(`    netstat -ano | findstr :${PORT}`);
+    console.error('    taskkill /PID <pid> /F');
+    console.error('');
+    console.error('  (start-webui.bat offers to stop the old one for you.)');
+    console.error('');
+    process.exit(1);
+  }
+  if (err && err.code === 'EACCES') {
+    console.error(`  Cannot bind port ${PORT} - permission denied. Try a port above 1024.`);
+    process.exit(1);
+  }
+  console.error('server error:', (err && err.message) || err);
+  process.exit(1);
+}
+
+server.on('error', onFatalServerError);
+wss.on('error', onFatalServerError);
+
 server.listen(PORT, () => {
+  listening = true;
   console.log(`Pi Agent WebUI`);
   console.log(`  http://localhost:${PORT}`);
   console.log(`  agent command : ${PI_COMMAND}`);
@@ -465,7 +1143,7 @@ function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('\nStopping Pi Agent WebUI — killing agent processes…');
-  for (const child of agents.values()) killTree(child);
+  if (agent) killTree(agent);
   stopWhisper();
   try { server.close(); } catch { /* ignore */ }
   process.exit(code);
@@ -473,10 +1151,10 @@ function shutdown(code = 0) {
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 process.on('exit', () => {
-  for (const child of agents.values()) {
+  if (agent) {
     try {
-      if (isWin) execSync(`taskkill /F /T /PID ${child.pid}`, { stdio: 'ignore' });
-      else child.kill('SIGKILL');
+      if (isWin) execSync(`taskkill /F /T /PID ${agent.pid}`, { stdio: 'ignore' });
+      else agent.kill('SIGKILL');
     } catch { /* already gone */ }
   }
   try { stopWhisper(); } catch { /* ignore */ }

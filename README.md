@@ -9,7 +9,7 @@ Browser  ──WebSocket/HTTP──▶  bridge (Node.js)  ──stdin/stdout JSO
      (web/ static files)         (bridge/server.js)         (inside the container)
 ```
 
-One `pi --mode rpc` subprocess is spawned per browser tab; every pi RPC command and event is relayed 1:1, so the full agent protocol (streaming, tools, bash, extensions) works.
+A single `pi --mode rpc` subprocess is shared by every connected client; every pi RPC command is relayed to it and every event is broadcast back to all of them, so the full agent protocol (streaming, tools, bash, extensions) works — and the browser UI, the desktop app and any other window stay in lockstep in real time instead of drifting apart.
 
 ## Features
 
@@ -33,6 +33,8 @@ Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-
 ## Run it
 
 > This machine runs Forgejo on port 3000, so the WebUI uses **http://localhost:3080**.
+
+There are two clients: the **browser UI** (`start-webui.bat`) and the **native mobile app** (`start-app.bat`, source in `pi-mobile/`).
 
 ### Choosing the agent source (first run)
 
@@ -71,6 +73,34 @@ npm start                # serves http://localhost:3080 by default (set PORT to 
 ```
 
 Env vars for the bridge: `PORT` (3000), `PI_COMMAND` (default `pi --mode rpc`), `WORKSPACE_DIR` (agent cwd), `PI_SESSION_DIR` (default `~/.pi/agent/sessions`).
+
+### Native desktop app (pi-mobile/)
+
+The `pi-mobile/` folder is a standalone **React Native** app targeting **Windows**
+(as well as Android/iOS from the same code) — the same bridge, the same RPC
+protocol, plus the one thing a browser cannot do: play the real Instagram /
+TikTok / YouTube Shorts feeds in-app (a native `WebView` is a top-level browser
+context, so `X-Frame-Options: DENY` does not apply).
+
+```
+start-app.bat
+```
+
+That checks the bridge is up, builds the app if needed, and launches it:
+
+- `start-webui.bat` must be running (the app talks to that bridge)
+- enter your PC's IP and port `3080` in the app's setup screen (`localhost`
+  works on Windows)
+
+The first run compiles the C++ React Native Windows runtime and takes 5-20
+minutes; afterwards `pi-mobile\windows\x64\Release\PiAgent.exe` starts directly.
+
+On Windows the shorts panel opens feeds in a real browser window, because
+React Native Windows has no WebView component and `react-native-webview`'s
+Windows target is legacy UWP-only. The seamless in-app feed is mobile-only today.
+See `pi-mobile/README.md` for the full build notes and the WebView2 route.
+
+### Try it without any agent (UI smoke test)
 
 ### Try it without any agent (UI smoke test)
 

@@ -8,6 +8,9 @@ rem lives - natively on Windows, or inside a Docker container. The choice is
 rem saved to bridge\agent-source.txt and reused on later launches.
 
 cd /d "%~dp0bridge"
+rem The agent's working directory is the repo root (not bridge\), since that is
+rem the project the WebUI is meant to work on. %%~fI drops the trailing slash.
+for %%I in ("%~dp0.") do set "ROOT=%%~fI"
 if not exist node_modules (
   echo Installing bridge dependencies...
   call npm install --no-fund --no-audit
@@ -101,6 +104,24 @@ if /i "!SOURCE!"=="native" (
 )
 
 set PORT=3080
+
+rem -- if an older bridge is still holding the port, offer to stop it --
+set "OLD_PID="
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /r /c:"LISTENING" ^| findstr /r /c:":!PORT! "') do set "OLD_PID=%%P"
+if defined OLD_PID (
+  echo.
+  echo  A previous Pi Agent WebUI is still listening on port !PORT! ^(PID !OLD_PID!^).
+  choice /c yn /n /m "Stop it and start a fresh one? [y/n]: "
+  if errorlevel 2 (
+    echo  Leaving the running WebUI alone.
+    pause
+    exit /b 0
+  )
+  taskkill /PID !OLD_PID! /T /F >nul 2>nul
+  echo  Stopped PID !OLD_PID!.
+  timeout /t 1 >nul
+)
+
 echo.
 echo Pi Agent WebUI starting on http://localhost:3080
 echo (to change the pi agent source later, run switch_pi_agent_source.bat)
@@ -108,9 +129,11 @@ endlocal & (
   set "PI_COMMAND=%PI_COMMAND%"
   set "PI_SESSION_DIR=%PI_SESSION_DIR%"
   set "PORT=%PORT%"
+  set "WORKSPACE_DIR=%ROOT%"
 )
 echo.
 echo  Pi Agent WebUI is running at  http://localhost:%PORT%
+echo  agent workspace : %ROOT%
 echo.
 echo  To STOP it: press Ctrl+C in this window, or close this window.
 echo  (stopping also kills the pi agent + whisper server - nothing is left running)

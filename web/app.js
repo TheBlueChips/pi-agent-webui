@@ -84,7 +84,36 @@ function timeStr(ts) {
 
 function formatTok(n) {
   if (n == null || isNaN(n)) return null;
-  return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(Math.round(n));
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+/* Live elapsed-time timer for a running tool card (bash etc.). */
+function fmtElapsed(ms) {
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(1) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+function startCardTimer(card) {
+  if (card._timer) return;
+  card._start = Date.now();
+  const tick = () => {
+    card.timerEl.classList.remove('hidden');
+    card.timerEl.textContent = fmtElapsed(Date.now() - card._start);
+  };
+  tick();
+  card._timer = setInterval(tick, 1000);
+}
+function stopCardTimer(card, stateText) {
+  if (!card._timer) return;
+  clearInterval(card._timer);
+  card._timer = null;
+  const elapsed = fmtElapsed(Date.now() - card._start);
+  card.timerEl.textContent = elapsed;
+  card.stateEl.textContent = `${stateText} · ${elapsed}`;
 }
 
 /* "↑ 8.8k read @ 312 t/s · ↓ 89 write @ 18.6 t/s · $0.0012"
@@ -129,7 +158,14 @@ const DEFAULT_SETTINGS = {
   ttsModel: 'piper',
   ttsVoiceName: '',
   themeAccent: null,      // custom accent color
-  themeBg: null,          // background image (URL or dataURL)
+  themeBg: null,          // background image (URL or dataURL) or video URL
+  onboarded: false,       // first-launch setup completed
+  shortsProvider: 'instagram', // 'instagram' | 'tiktok' | 'youtube' | 'none'
+  shortsMode: 'panel',    // 'panel' (in-app split) | 'window' (side window, full feed) | 'tab' — legacy 'split'='panel', 'popup'='window'
+  autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
+  fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
+  chatFontSize: 14,       // px — chat + composer text size
+  chatOpacity: 100,       // 0-100 — chat chrome (composer/topbar) opacity
 };
 let SET = { ...DEFAULT_SETTINGS };
 try { Object.assign(SET, JSON.parse(localStorage.getItem('piwebui-settings') || '{}')); } catch { /* defaults */ }
@@ -188,10 +224,35 @@ function applySettings() {
     rootStyle.removeProperty('--accent');
     rootStyle.removeProperty('--accent-dim');
   }
-  document.body.style.backgroundImage = SET.themeBg ? `url("${SET.themeBg}")` : '';
-  document.body.style.backgroundSize = 'cover';
-  document.body.style.backgroundPosition = 'center';
-  document.body.style.backgroundAttachment = 'fixed';
+  applyBackgroundMedia();
+  // chat-panel transparency (0 = fully transparent, 100 = solid)
+  const alpha = SET.chatOpacity == null ? 1 : Math.max(0, Math.min(1, Number(SET.chatOpacity) / 100));
+  rootStyle.setProperty('--ui-alpha', String(alpha));
+  // chat font + text size. SET.fontFamily is either a preset key ('', mono,
+  // serif, rounded) or a raw system font family name from the picker.
+  const FONT_MAP = {
+    '': '"Segoe UI", system-ui, -apple-system, sans-serif',
+    mono: 'var(--mono)',
+    serif: 'Georgia, "Times New Roman", serif',
+    rounded: '"Comfortaa", "Varela Round", "Trebuchet MS", "Segoe UI", sans-serif',
+  };
+  const fontCss = FONT_MAP[SET.fontFamily] ?? (SET.fontFamily ? `"${SET.fontFamily}", sans-serif` : FONT_MAP['']);
+  rootStyle.setProperty('--chat-font', fontCss);
+  rootStyle.setProperty('--chat-size', `${Number(SET.chatFontSize) || 14}px`);
+  // shorts button follows the chosen feed
+  const reels = $('btn-reels');
+  if (reels) {
+    const feed = SHORTS_FEEDS[SET.shortsProvider || 'instagram'];
+    if (feed) {
+      reels.style.display = '';
+      reels.textContent = feed.label;
+      const mode = SET.shortsMode || 'panel';
+      const modeLabel = mode === 'tab' ? 'new tab' : mode === 'window' ? 'side window (full feed)' : 'in-app split panel';
+      reels.title = `Open ${feed.label} with one tap (${modeLabel})`;
+    } else {
+      reels.style.display = 'none';
+    }
+  }
   // auto-expand state on already-rendered elements
   document.querySelectorAll('details.thinking').forEach((d) => { d.open = SET.autoExpandThinking === true; });
   document.querySelectorAll('.tool-card .tool-body').forEach((b) => {
@@ -212,6 +273,9 @@ const S = {
   isStreaming: false,
   compacting: false,        // true while a compaction is in flight
   compactionQueue: [],      // prompts queued while compacting (sent after it finishes)
+  compactionHappened: false,   // a compaction completed during this run → re-render history on settle
+  compactionNeedsContinue: false, // compaction finished without auto-retry → maybe auto-continue
+  lastAutoContinueAt: 0,       // cooldown guard for auto-continue nudges
   queue: { steering: [], followUp: [] },
   editMode: null,          // {entryId, originalText}
   attachments: [],         // [{data, mimeType, name}]
@@ -222,6 +286,13 @@ const S = {
   stickToBottom: true,
   live: null,              // in-flight assistant render {root, text, thinking, tools}
   toolCards: new Map(),    // toolCallId -> {card, body, stateEl}
+  compactionLive: null,    // live "compacting…" block {root, t}
+  lastCompaction: null,    // last compaction_end result (for the marker's "after" count)
+  // Compactions we watched happen in this page session. Each is anchored to the
+  // message index it sat at, so it stays put instead of being re-appended to the
+  // bottom of the transcript on every turn.
+  compactionMarks: [],     // [{ summary, tokensBefore, estimatedTokensAfter, at }]  (at = ms)
+  ctxStats: null,          // last authoritative contextUsage from get_session_stats
   bashCards: new Map(),    // bash req id -> {body}
   initialized: false,
   totals: { read: 0, write: 0 },  // session token totals
@@ -246,10 +317,17 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.bridge === 'rpc') handleRpcMessage(msg.payload);
     else if (msg.bridge === 'agent_exit') onAgentExit(msg);
+    else if (msg.bridge === 'agent_started') onAgentStarted();
     else if (msg.bridge === 'agent_stderr' && msg.text.trim()) console.warn('[pi stderr]', msg.text);
   };
   ws.onclose = () => {
     setConn('off');
+    S.isStreaming = false;
+    // Connection lost mid-turn: mark any live tool cards as failed so they
+    // don't sit on "running…" forever.
+    markStuckToolCards('connection lost');
+    removeCompactionLive();
+    updateStreamUi();
     showBanner('error', 'Connection to the bridge lost.', 'Retry now', () => connect());
   };
   ws.onerror = () => { /* onclose follows */ };
@@ -257,6 +335,24 @@ function connect() {
 
 function send(obj) {
   if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send(JSON.stringify(obj));
+}
+
+/* Resolve when the (re)started agent reports agent_started. */
+let agentReadyWaiters = [];
+function onAgentStarted() {
+  const w = agentReadyWaiters;
+  agentReadyWaiters = [];
+  w.forEach((r) => r());
+}
+function waitForAgentReady(timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      const i = agentReadyWaiters.indexOf(resolve);
+      if (i >= 0) agentReadyWaiters.splice(i, 1);
+      reject(new Error('agent did not start in time'));
+    }, timeoutMs);
+    agentReadyWaiters.push(() => { clearTimeout(t); resolve(); });
+  });
 }
 
 function rpc(commandObj, timeoutMs = 120000) {
@@ -288,9 +384,24 @@ function handleRpcMessage(msg) {
   handleEvent(msg);
 }
 
+/* Mark every live tool card that is still "running" as failed — the agent
+ * exited or the connection dropped, so the command can no longer be running. */
+function markStuckToolCards(label) {
+  for (const card of S.toolCards.values()) {
+    if (card._timer) stopCardTimer(card, label);
+    else if (card.stateEl.textContent.startsWith('running')) {
+      card.stateEl.textContent = label;
+      card.stateEl.className = 'tool-state error';
+    }
+  }
+}
+
 function onAgentExit(msg) {
   S.isStreaming = false;
   setConn('on');
+  // Any tool card still showing "running…" is stuck — the agent is gone.
+  markStuckToolCards('interrupted');
+  removeCompactionLive();
   if (msg.error) {
     showBanner('error', msg.error, 'Retry', () => send({ bridge: 'restart' }));
   } else {
@@ -343,7 +454,7 @@ function applyState(d) {
     else if (!$('session-name').value) $('session-name').value = '';
     // otherwise the derived session name (first user message) fills in via refreshSessions
     if (d.isStreaming !== undefined) S.isStreaming = d.isStreaming;
-    if (d.model && d.model.id) syncSelect($('model-select'), `${d.model.provider}:${d.model.id}`);
+    if (d.model && d.model.id) syncSelect($('model-select'), `${d.model.provider}||${d.model.id}`);
     if (d.thinkingLevel) syncSelect($('thinking-select'), d.thinkingLevel);
     updateStreamUi();
   }
@@ -361,12 +472,141 @@ async function refreshModels() {
     sel.innerHTML = '';
     for (const m of S.models) {
       const o = el('option', null, `${m.name || m.id}`);
-      o.value = `${m.provider}:${m.id}`;
+      // "||" separator: provider ids can contain colons (llama-server=http://host:8080)
+      o.value = `${m.provider}||${m.id}`;
       sel.appendChild(o);
     }
-    if (S.state.model) syncSelect(sel, `${S.state.model.provider}:${S.state.model.id}`);
+    ensureLlamaGroup(); // retried in the background until the server answers
+    if (S.state.model) syncSelect(sel, `${S.state.model.provider}||${S.state.model.id}`);
   } catch { /* agent may not implement it */ }
 }
+
+/* llama.cpp: query the router(s) directly so every model the server knows
+ * about shows up — even ones pi has not registered yet. Selecting one sends
+ * set_model with the "llama-server=<url>" provider id the pi-llama-cpp
+ * extension uses. If pi has not registered that provider (e.g. its configured
+ * URL is unreachable), a banner offers to point pi at the live server and
+ * restart the agent so the model becomes selectable. */
+let llamaLiveServers = [];
+let llamaConfiguredUrl = null;
+let llamaMismatchBanner = false;
+let llamaFixInFlight = false;
+
+async function refreshLlamaGroup() {
+  const sel = $('model-select');
+  const old = sel.querySelector('optgroup[data-llama]');
+  if (old) old.remove();
+  try {
+    const [d, cfg] = await Promise.all([
+      fetch('/api/llama-models').then((r) => r.json()),
+      fetch('/api/llama-config').then((r) => r.json()),
+    ]);
+    llamaConfiguredUrl = cfg.url || null;
+    llamaLiveServers = d.servers || [];
+    if (!llamaLiveServers.length) {
+      hideLlamaMismatch();
+      return;
+    }
+    const known = new Set(S.models.map((m) => `${m.provider}||${m.id}`));
+    const group = el('optgroup', null, 'llama.cpp (local)');
+    group.dataset.llama = '1';
+    let unregistered = null;
+    for (const srv of llamaLiveServers) {
+      const short = srv.url.replace(/^https?:\/\//, '');
+      const registered = S.models.some((m) => m.provider === srv.providerId);
+      if (!registered && !unregistered) unregistered = srv;
+      for (const m of srv.models) {
+        const key = `${srv.providerId}||${m.id}`;
+        if (known.has(key)) continue; // already listed by the agent itself
+        const o = el('option', null, llamaLiveServers.length > 1 ? `${m.name || m.id} · ${short}` : (m.name || m.id));
+        o.value = key;
+        group.appendChild(o);
+      }
+    }
+    if (group.children.length) sel.appendChild(group);
+    if (unregistered) showLlamaMismatch(unregistered);
+    else hideLlamaMismatch();
+  } catch { /* bridge offline or no llama.cpp server */ }
+}
+
+function showLlamaMismatch(srv) {
+  const short = srv.url.replace(/^https?:\/\//, '');
+  const configured = (llamaConfiguredUrl && llamaConfiguredUrl !== srv.url)
+    ? `pi is configured for ${llamaConfiguredUrl.replace(/^https?:\/\//, '')} (unreachable)`
+    : 'pi has not registered it yet';
+  showBanner('warn',
+    `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it.`,
+    'Point pi here & reload',
+    () => fixLlamaConfig(srv.url));
+  llamaMismatchBanner = true;
+}
+
+function hideLlamaMismatch() {
+  if (!llamaMismatchBanner) return;
+  llamaMismatchBanner = false;
+  hideBanner();
+}
+
+/* One-click fix: write the live URL into pi's global settings, restart the
+ * agent (pi-llama-cpp resolves the URL at startup), then retry the model
+ * the user was trying to select. */
+async function fixLlamaConfig(url) {
+  if (llamaFixInFlight) return;
+  llamaFixInFlight = true;
+  toast('Updating pi config and restarting the agent…');
+  try {
+    const r = await fetch('/api/llama-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const out = await r.json();
+    if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
+    const wait = waitForAgentReady(60000);
+    send({ bridge: 'restart' });
+    await wait;
+    await initSession(true); // full re-init: resume last session + refresh models
+    hideLlamaMismatch();
+    if (S.pendingModel) {
+      const pm = S.pendingModel;
+      S.pendingModel = null;
+      try {
+        await rpc({ type: 'set_model', provider: pm.provider, modelId: pm.modelId });
+        await rpc({ type: 'get_state' }).then(applyState);
+        toast(`Model switched: ${pm.modelId}`);
+      } catch (e) {
+        toast(`Agent restarted, but model switch failed: ${e.message}`, 'error');
+      }
+    }
+  } catch (e) {
+    toast(`Fix failed: ${e.message}`, 'error');
+  } finally {
+    llamaFixInFlight = false;
+  }
+}
+
+/* The llama.cpp server may still be starting up (or pi's own 1s health check
+ * at startup may have skipped it), so keep re-probing in the background until
+ * at least one server answers. */
+const LLAMA_RETRY_DELAYS = [3000, 5000, 10000, 15000, 20000, 30000];
+async function ensureLlamaGroup(attempt = 0) {
+  await refreshLlamaGroup();
+  const g = $('model-select').querySelector('optgroup[data-llama]');
+  // Stop retrying once every live server is registered with pi (its models
+  // then appear in the main list, so the optgroup is intentionally empty).
+  const allRegistered = llamaLiveServers.length > 0 &&
+    llamaLiveServers.every((s) => S.models.some((m) => m.provider === s.providerId));
+  if ((g && g.children.length) || allRegistered || attempt >= LLAMA_RETRY_DELAYS.length) return;
+  setTimeout(() => { ensureLlamaGroup(attempt + 1); }, LLAMA_RETRY_DELAYS[attempt]);
+}
+
+let llamaGroupRefreshAt = 0;
+$('model-select').addEventListener('focus', () => {
+  const now = Date.now();
+  if (now - llamaGroupRefreshAt < 10000) return; // throttle: max once per 10s
+  llamaGroupRefreshAt = now;
+  refreshLlamaGroup();
+});
 
 async function refreshLevels() {
   try {
@@ -422,8 +662,11 @@ async function refreshStats() {
 /* context-usage progress ring + "[used/max]ctx" label.
  * cu = { tokens, contextWindow, percent } from get_session_stats. After a
  * compaction the agent reports tokens:null until the next LLM response, in
- * which case the ring and label show a dash instead of a stale number. */
-function setCtxRing(cu) {
+ * which case the ring and label show a dash instead of a stale number.
+ * While the model streams, liveCtxRing() feeds an estimate on top of the last
+ * authoritative number so the ring fills in real time. */
+function setCtxRing(cu, store = true) {
+  if (store) S.ctxStats = cu && cu.tokens != null && cu.contextWindow ? { ...cu } : null;
   const fg = $('ctx-ring-fg');
   const txt = $('ctx-ring-text');
   const label = $('ctx-label');
@@ -436,7 +679,7 @@ function setCtxRing(cu) {
     txt.textContent = '–';
     fg.setAttribute('stroke-dasharray', '0 999');
     wrap.title = 'Context unknown — waiting for the next response';
-    wrap.classList.remove('warn');
+    wrap.classList.remove('warn', 'critical');
     if (label) label.textContent = '–';
     return;
   }
@@ -445,9 +688,19 @@ function setCtxRing(cu) {
     : Math.max(0, Math.min(100, (tokens / max) * 100));
   fg.setAttribute('stroke-dasharray', `${(C * p / 100).toFixed(1)} ${C.toFixed(1)}`);
   txt.textContent = p >= 10 ? String(Math.round(p)) : p.toFixed(1);
-  wrap.title = `Context: ${Math.round(tokens)} / ${Math.round(max)} tokens (${p.toFixed(1)}%)`;
-  wrap.classList.toggle('warn', p > 75);
-  if (label) label.textContent = `[${Math.round(tokens)}/${Math.round(max)}ctx]`;
+  wrap.title = `Context: ${formatTok(tokens)} / ${formatTok(max)} tokens (${p.toFixed(1)}%)`;
+  wrap.classList.toggle('warn', p >= 75 && p < 90);
+  wrap.classList.toggle('critical', p >= 90);
+  if (label) label.textContent = `[${formatTok(tokens)}/${formatTok(max)}ctx]`;
+}
+
+/* Estimate the in-flight context growth (≈4 chars/token) and add it to the
+ * last authoritative stats so the ring climbs while the model writes. */
+function liveCtxRing(extraTokens) {
+  if (!S.ctxStats) return;
+  const b = S.ctxStats;
+  const tokens = (b.tokens || 0) + (extraTokens || 0);
+  setCtxRing({ ...b, tokens, percent: b.contextWindow ? (tokens / b.contextWindow) * 100 : null }, false);
 }
 
 /* session totals (↑ read / ↓ write) summed from assistant message usage */
@@ -588,10 +841,12 @@ function makeToolCard(name, opts = {}) {
   head.appendChild(el('span', 'tool-name', `${name}`));
   const stateEl = el('span', 'tool-state', opts.state || 'running…');
   head.appendChild(stateEl);
+  const timerEl = el('span', 'tool-timer hidden');
+  head.appendChild(timerEl);
   const body = el('div', 'tool-body hidden');
   head.onclick = () => body.classList.toggle('hidden');
   card.append(head, body);
-  return { card, head, body, stateEl };
+  return { card, head, body, stateEl, timerEl, _timer: null, _start: 0 };
 }
 
 /* Edit-style tool calls (old text -> new text) render as a color diff. */
@@ -701,7 +956,7 @@ function renderToolResult(msg) {
   if (card) {
     // keep a rendered edit diff — the result line adds nothing to it
     if (!card.body.querySelector('.diffbox')) card.body.textContent = bodyText;
-    card.stateEl.textContent = msg.isError ? 'error' : 'done';
+    stopCardTimer(card, msg.isError ? 'error' : 'done');
     card.stateEl.className = `tool-state ${msg.isError ? 'error' : 'done'}`;
     if (!card.body.textContent && !card.body.firstChild) card.body.classList.add('hidden');
   } else {
@@ -740,31 +995,105 @@ function renderBashExecution(msg) {
 }
 
 /* The compaction summary message (role: "compactionSummary") marks where the old
- * history was compressed into a summary. The terminal shows this as a blue block;
- * the web ui previously dropped it (no case for this role), so the compacted
- * marker was invisible. Render it as a compact, collapsible "compacted" block. */
-function renderCompactionSummary(msg) {
-  const root = el('div', 'msg compaction');
+ * history was compressed into a summary.
+ *
+ * It is deliberately NOT rendered inline where it sits in the session order:
+ * pi rebuilds the context as [compaction summary, kept entries…], so the marker
+ * lands at the very TOP of the transcript — hundreds of messages above the
+ * viewport. The user saw the live "compacting…" block appear, then vanish, with
+ * nothing at the bottom to show for it.
+ *
+ * Instead the newest compaction is pinned to the END of the chat (right where
+ * the live block was), so it is always visible and its summary expandable.
+ * Older compactions still render inline so scrolling back stays accurate. */
+function renderCompactionSummary(msg, extra) {
+  chat.appendChild(buildCompactionSummary(msg, extra));
+}
+
+/* Build the "conversation compacted" marker WITHOUT inserting it, so callers can
+ * put it exactly where the compaction happened. */
+function buildCompactionSummary(msg, extra) {
+  const live = !!(extra && extra.live);
+  const root = el('div', 'msg compaction' + (live ? ' pinned' : ''));
   const who = el('div', 'who');
-  const before = msg.tokensBefore != null ? `· ${Math.round(msg.tokensBefore).toLocaleString()} tok → summary` : '';
-  who.textContent = `compacted ${before}`;
+  const before = msg.tokensBefore != null ? `${formatTok(msg.tokensBefore)} tok` : 'context';
+  const after = extra && extra.estimatedTokensAfter != null
+    ? ` → ${formatTok(extra.estimatedTokensAfter)} tok` : '';
+  who.textContent = `conversation compacted · ${before}${after}`;
+  if (extra && extra.count > 1) {
+    const badge = el('span', 'compaction-count', `${extra.count}✕`);
+    badge.title = `${extra.count} compactions in this session`;
+    who.appendChild(badge);
+  }
   const detail = el('details', 'compaction-detail');
   detail.appendChild(el('summary', null, 'show compacted summary'));
   const body = el('div', 'md compaction-body');
   body.innerHTML = renderMarkdown(msg.summary || '');
   detail.appendChild(body);
   root.append(who, detail);
+  return root;
+}
+
+/* Live "compacting…" marker, shown the moment compaction_start arrives so the
+ * user sees compaction happen in real time (with an elapsed timer). Replaced
+ * by renderCompactionBlock() when compaction_end arrives. */
+function renderCompactionLive() {
+  const root = el('div', 'msg compaction compacting');
+  const who = el('div', 'who');
+  const spin = el('span', 'compaction-spin');
+  who.appendChild(spin);
+  who.appendChild(document.createTextNode(' compacting conversation… '));
+  const timer = el('span', 'tool-timer');
+  who.appendChild(timer);
+  root.appendChild(who);
   chat.appendChild(root);
+  const start = Date.now();
+  const t = setInterval(() => { timer.textContent = fmtElapsed(Date.now() - start); }, 500);
+  if (S.stickToBottom) scrollBottom();
+  return { root, t };
+}
+function removeCompactionLive() {
+  if (S.compactionLive) {
+    clearInterval(S.compactionLive.t);
+    S.compactionLive.root.remove();
+    S.compactionLive = null;
+  }
+}
+
+/* Live compaction marker, rendered the moment compaction_end arrives so the
+ * event is visible immediately (the session history only contains the marker
+ * after the next full re-render, which happens on agent_settled). */
+function renderCompactionBlock(result, reason) {
+  removeCompactionLive();
+  for (const old of chat.querySelectorAll('.msg.compaction.pinned')) old.remove();
+  const root = el('div', 'msg compaction pinned');
+  const who = el('div', 'who');
+  const before = result.tokensBefore != null ? `${formatTok(result.tokensBefore)} tok` : 'context';
+  const after = result.estimatedTokensAfter != null ? ` → ${formatTok(result.estimatedTokensAfter)} tok` : '';
+  who.textContent = `conversation compacted · ${before}${after}${reason ? ` · ${reason}` : ''}`;
+  const detail = el('details', 'compaction-detail');
+  detail.appendChild(el('summary', null, 'show compacted summary'));
+  const body = el('div', 'md compaction-body');
+  body.innerHTML = renderMarkdown(result.summary || '');
+  detail.appendChild(body);
+  root.append(who, detail);
+  chat.appendChild(root);
+  if (S.stickToBottom) scrollBottom();
 }
 
 async function refreshMessages() {
   const d = await rpc({ type: 'get_messages' });
   const msgs = asArray(d, 'messages');
+  // Keep the reading position (distance from the bottom) across the re-render.
+  const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
   chat.innerHTML = '';
+  for (const card of S.toolCards.values()) if (card._timer) stopCardTimer(card, 'done');
   S.toolCards.clear();
+  removeCompactionLive();
   // session token totals summed from per-message usage
   let read = 0, write = 0;
   for (const m of msgs) {
+    const firstNew = chat.children.length;
     if (m.role === 'user') renderUserMessage(m);
     else if (m.role === 'assistant') {
       renderAssistantMessage(m);
@@ -775,14 +1104,46 @@ async function refreshMessages() {
     }
     else if (m.role === 'toolResult') renderToolResult(m);
     else if (m.role === 'bashExecution') renderBashExecution(m);
-    else if (m.role === 'compactionSummary') renderCompactionSummary(m);
+    else if (m.role === 'compactionSummary') {
+      // A compaction we watched happen gets placed at its anchor below, so the
+      // marker does not jump. One that came back with the session (page reload)
+      // belongs right here in the transcript.
+      if (!S.compactionMarks.some((k) => k.summary === m.summary)) renderCompactionSummary(m);
+    }
+    // Stamp whatever node(s) this message produced, so a compaction marker can
+    // be anchored to a point in time instead of a shifting position.
+    if (m.timestamp != null) {
+      for (let i = firstNew; i < chat.children.length; i++) chat.children[i].dataset.ts = String(m.timestamp);
+    }
   }
+  // Put each compaction we watched happen back where it happened: after the last
+  // message that already existed when it ran. Messages produced later have a
+  // newer timestamp, so they render after the marker and it stays put instead of
+  // being re-appended to the bottom on every turn.
+  const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
+  for (const k of S.compactionMarks) {
+    let target = null;
+    if (k.at != null) {
+      for (const n of plain) {
+        const ts = Number(n.dataset.ts);
+        if (ts && ts <= k.at) target = n;
+      }
+    }
+    const node = buildCompactionSummary(k, { live: true, count: S.compactionMarks.length });
+    if (target) target.after(node);
+    else if (plain.length) plain[0].before(node);
+    else chat.appendChild(node);
+  }
+  // A compaction still in flight keeps its "compacting…" indicator: the
+  // re-render above wiped the DOM node it lived in.
+  if (S.compacting && !S.compactionLive) S.compactionLive = renderCompactionLive();
   S.totals = { read, write };
   updateTotals();
   // Re-wire fork indexes for user messages in order.
   const userEls = [...chat.querySelectorAll('.msg.user')];
   userEls.forEach((e, i) => e.dataset.forkIdx = String(i));
-  scrollBottom(true);
+  if (S.stickToBottom) scrollBottom(true);
+  else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
 }
 
 function zoomImage(src) {
@@ -801,13 +1162,39 @@ function zoomImage(src) {
 
 function handleEvent(msg) {
   switch (msg.type) {
+    case 'session_info_changed': {
+      // pi emits this when a session is (re)named — keep the topbar in sync and
+      // refresh the sidebar so a rename shows up there immediately.
+      const name = (msg.name || '').trim();
+      if (name) {
+        const input = $('session-name');
+        input.value = name;
+        input.title = `${name} — click to rename`;
+      }
+      refreshSessions().catch(() => {});
+      break;
+    }
     case 'agent_start':
       S.isStreaming = true;
       updateStreamUi();
       break;
     case 'agent_end':
     case 'agent_settled':
-      if (msg.type === 'agent_settled') S.isStreaming = false;
+      if (msg.type === 'agent_settled') {
+        S.isStreaming = false;
+        // After a compaction the session history no longer matches the chat
+        // DOM (older messages were summarized away and the "compacted" marker
+        // is missing) — re-render from the session so the marker shows up.
+        if (S.compactionHappened) {
+          S.compactionHappened = false;
+          refreshMessages().catch(() => {});
+        }
+        // Threshold/manual compactions stop the agent; keep the task going.
+        if (S.compactionNeedsContinue) {
+          S.compactionNeedsContinue = false;
+          maybeAutoContinue();
+        }
+      }
       updateStreamUi();
       if (msg.type === 'agent_end') {
         finalizeLive();
@@ -848,7 +1235,7 @@ function handleEvent(msg) {
       const c = S.toolCards.get(msg.toolCallId);
       if (c) {
         if (msg.result !== undefined && !c.body.querySelector('.diffbox')) c.body.textContent = toolResultText({ content: msg.result });
-        c.stateEl.textContent = msg.isError ? 'error' : 'done';
+        stopCardTimer(c, msg.isError ? 'error' : 'done');
         c.stateEl.className = `tool-state ${msg.isError ? 'error' : 'done'}`;
       }
       break;
@@ -875,17 +1262,33 @@ function handleEvent(msg) {
       // next LLM response reports a real post-compaction context size.
       setCtxRing(null);
       if ($('ctx-label')) $('ctx-label').textContent = 'compacting…';
+      // Live "compacting…" block with an elapsed timer, removed on compaction_end.
+      if (!S.compactionLive) S.compactionLive = renderCompactionLive();
       break;
     case 'compaction_end':
       S.compacting = false;
       if (msg.aborted) {
+        removeCompactionLive();
         toast('Compaction cancelled', 'warning');
       } else if (msg.errorMessage) {
+        removeCompactionLive();
         toast(msg.errorMessage, 'error');
       } else if (msg.result) {
         const before = msg.result.tokensBefore;
         const after = msg.result.estimatedTokensAfter;
-        toast(`Compacted: ${before != null ? Math.round(before) : '?'} → ${after != null ? Math.round(after) : '?'} tokens`);
+        toast(`Compacted: ${before != null ? formatTok(before) : '?'} → ${after != null ? formatTok(after) : '?'} tokens`);
+        S.lastCompaction = msg.result;
+        // Remember it so refreshMessages() can put the marker back where it
+        // happened instead of re-appending it to the bottom every turn.
+        if (!S.compactionMarks.some((k) => k.summary === msg.result.summary)) {
+          S.compactionMarks.push({ ...msg.result, at: Date.now() });
+        }
+        renderCompactionBlock(msg.result, msg.reason);
+        S.compactionHappened = true;
+        // willRetry=true (overflow) → pi retries the prompt itself. A manual
+        // /compact never auto-continues (the user asked for it, task was done).
+        // Only auto-compactions (threshold/overflow without retry) need a nudge.
+        if (!msg.willRetry && msg.reason !== 'manual') S.compactionNeedsContinue = true;
       }
       // Context is unknown right after compaction (agent reports tokens:null
       // until the next response) — refresh to reflect that, then send any
@@ -983,6 +1386,8 @@ function renderLive() {
         (sec > 0.2 ? ` @ ${(est / sec).toFixed(1)} t/s` : '') : '';
     }
     if (stats) L.statsEl.textContent = ` (${stats})`;
+    // Live context ring: last authoritative token count + what's streamed so far.
+    liveCtxRing(Math.round((L.text.length + L.thinking.length) / 4));
     scrollBottom();
   });
 }
@@ -1011,7 +1416,12 @@ function finalizeLive(finalMsg) {
       refreshMessages().catch(() => {});
     }
   }
-  S.isStreaming = false;
+  // Do NOT clear S.isStreaming here. finalizeLive() runs on every message_end
+  // and turn_end -- including the user's own message -- and clearing it there
+  // hid the Stop button the instant the first message ended, and made
+  // sendPrompt() omit streamingBehavior, so pi rejected mid-turn sends instead
+  // of steering them. The turn is only over at agent_settled (or agent_exit /
+  // socket close).
   updateStreamUi();
 }
 
@@ -1023,12 +1433,14 @@ function startToolCard(msg) {
       existing.toolName = msg.toolName;
       existing.card.querySelector('.tool-name').textContent = msg.toolName;
     }
+    startCardTimer(existing);
     return existing;
   }
   const card = makeToolCard(msg.toolName || msg.name || 'tool', { toolCallId: msg.toolCallId });
   card.toolName = msg.toolName || msg.name || '';
   card._rawArgs = '';
   fillToolBody(card, card.toolName, msg.args);
+  startCardTimer(card);
   const parent = S.live ? S.live.root.querySelector('.bubble') : chat;
   parent.appendChild(card.card);
   S.toolCards.set(msg.toolCallId, card);
@@ -1071,15 +1483,30 @@ function flushCompactionQueue() {
   // The next agent_end/agent_settled will flush the rest of the queue.
 }
 
+/* pi only auto-retries after an *overflow* compaction. After a *threshold*
+ * (or manual) compaction it stops and waits for the next user message — even
+ * when the task is clearly not done. Nudge it along automatically (once per
+ * cooldown) so long tasks keep going. */
+function maybeAutoContinue() {
+  if (SET.autoContinueAfterCompaction === false) return;
+  if (S.isStreaming || S.compacting) return;
+  const now = Date.now();
+  if (now - S.lastAutoContinueAt < 120000) return; // don't chain-continue forever
+  S.lastAutoContinueAt = now;
+  toast('Compaction done — continuing the task…', 'info');
+  sendPrompt('Context was just compacted into a summary. Continue the current task from where it left off — use the compaction summary and the recent messages, and keep working until the task is complete.');
+}
+
 function renderQueue() {
   const bar = $('queue-bar');
-  const items = [...S.queue.steering, ...S.queue.followUp];
+  const items = [...S.queue.steering.map((m) => ({ kind: 'steering', m })), ...S.queue.followUp.map((m) => ({ kind: 'after turn', m }))];
   if (!items.length) { bar.classList.add('hidden'); bar.innerHTML = ''; return; }
   bar.classList.remove('hidden');
   bar.innerHTML = '';
-  bar.appendChild(el('span', null, 'queued: '));
-  for (const q of items) {
-    const chip = el('span', 'queue-chip', (typeof q.message === 'string' ? q.message : JSON.stringify(q.message || q)).slice(0, 120));
+  bar.appendChild(el('span', null, 'queued '));
+  for (const { kind, m } of items) {
+    const text = (typeof m === 'string' ? m : JSON.stringify(m || '')).slice(0, 120);
+    const chip = el('span', 'queue-chip', `${kind}: ${text}`);
     bar.appendChild(chip);
   }
 }
@@ -1246,17 +1673,34 @@ async function handleBuiltinCommand(name, arg) {
 }
 
 function sendPrompt(text, images, behavior) {
-  const cmd = { type: 'prompt', message: text };
-  if (images && images.length) {
-    cmd.images = images.map((a) => ({ type: 'image', data: a.data, mimeType: a.mimeType }));
+  const all = images || [];
+  const imgs = all.filter((a) => a.type === 'image');
+  const files = all.filter((a) => a.type === 'file');
+  // Non-image attachments travel as path references in the prompt text so the
+  // agent can open them with its tools (read, bash, etc.). Audio also carries
+  // its transcript inline.
+  let msg = text || '';
+  if (files.length) {
+    const refs = files.map((f) => {
+      let line = `[Attached ${f.kind}: ${f.name} → ${f.path}]`;
+      if (f.kind === 'audio' && f.transcript) line += `\nTranscript: ${f.transcript}`;
+      else if (f.kind === 'audio') line += ' (no transcript available)';
+      return line;
+    }).join('\n');
+    msg = (msg ? msg + '\n\n' : '') + refs;
+  }
+  const cmd = { type: 'prompt', message: msg };
+  if (imgs.length) {
+    cmd.images = imgs.map((a) => ({ type: 'image', data: a.data, mimeType: a.mimeType }));
   }
   if (S.isStreaming) cmd.streamingBehavior = behavior || 'steer';
   rpc(cmd).catch((e) => toast(e.message, 'error'));
   // Optimistic bubble; replaced by the authoritative history on the next agent_end.
-  if (text || (images && images.length)) {
-    renderUserMessage({ role: 'user', content: images && images.length
-      ? [...images.map((a) => ({ type: 'image', data: a.data, mimeType: a.mimeType })), { type: 'text', text }]
-      : text, timestamp: Date.now() });
+  if (text || all.length) {
+    const content = [];
+    for (const a of imgs) content.push({ type: 'image', data: a.data, mimeType: a.mimeType });
+    if (msg) content.push({ type: 'text', text: msg });
+    renderUserMessage({ role: 'user', content: content.length ? content : msg, timestamp: Date.now() });
     S.stickToBottom = true;
     scrollBottom(true);
   }
@@ -1372,10 +1816,88 @@ async function addImageFile(file) {
   if (!file.type.startsWith('image/')) { toast(`Not an image: ${file.name}`, 'warning'); return; }
   const dataUrl = await readAsDataUrl(file);
   S.attachments.push({
+    type: 'image',
     data: dataUrl.split(',')[1],
     mimeType: file.type,
     name: file.name || 'pasted-image',
   });
+  renderAttachments();
+}
+
+/* File kind for non-image attachments. */
+function fileKind(f) {
+  if (f.type.startsWith('audio/')) return 'audio';
+  if (f.type.startsWith('video/')) return 'video';
+  if (f.type === 'application/pdf') return 'pdf';
+  return 'file';
+}
+
+/* Upload a file to the workspace (bridge saves it under uploads/) so the
+ * agent can read it with its tools. Returns {path, size}. */
+async function uploadFile(file) {
+  const data = await readAsDataUrl(file);
+  const d = await (await fetch('/api/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: file.name, data: data.split(',')[1], mimeType: file.type }),
+  })).json();
+  if (!d.ok) throw new Error(d.error || 'upload failed');
+  return d;
+}
+
+/* Transcribe an audio file. Tries the bridge's local whisper first, then the
+ * user-configured STT endpoint. Audio is converted to 16 kHz mono WAV in the
+ * browser first so mp3/m4a/ogg/webm all work. */
+async function transcribeAudioFile(file) {
+  let wavBlob = file;
+  try { wavBlob = await blobToWav(file); } catch { /* not browser-decodable; send raw */ }
+  const dataUrl = await readAsDataUrl(wavBlob);
+  const b64 = dataUrl.split(',')[1];
+  try {
+    const d = await (await fetch('/api/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: b64 }),
+    })).json();
+    if (d.ok && d.text) return d.text;
+  } catch { /* no local STT server */ }
+  if (SET.sttEndpoint) {
+    const fd = new FormData();
+    fd.append('file', wavBlob, wavBlob.name || 'speech.wav');
+    if (/\/v1\/audio\/transcriptions\/?$/.test(SET.sttEndpoint)) {
+      fd.append('model', 'whisper-1');
+      fd.append('response_format', 'json');
+    }
+    const res = await fetch(SET.sttEndpoint, { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(`STT server ${res.status}`);
+    const d = await res.json();
+    return d.text || d.transcription || '';
+  }
+  throw new Error('no STT endpoint available');
+}
+
+/* Attach any file: images go to the model as vision input; everything else
+ * (PDF / audio / video / other) is uploaded to the workspace and referenced
+ * by path in the prompt. Audio is transcribed when STT is available. */
+async function addFile(file) {
+  if (file.type.startsWith('image/')) { await addImageFile(file); return; }
+  if (file.size > 100 * 1024 * 1024) { toast(`File too large (max 100 MB): ${file.name}`, 'error'); return; }
+  const att = { type: 'file', kind: fileKind(file), name: file.name || 'file', mimeType: file.type, size: file.size };
+  try {
+    att.path = (await uploadFile(file)).path;
+  } catch (e) {
+    toast(`Upload failed: ${e.message}`, 'error');
+    return;
+  }
+  if (att.kind === 'audio') {
+    att.transcribing = true;
+    S.attachments.push(att);
+    renderAttachments();
+    try { att.transcript = await transcribeAudioFile(file); }
+    catch (e) { att.transcriptError = e.message; }
+    att.transcribing = false;
+  }
+  S.attachments.push(att);
   renderAttachments();
 }
 
@@ -1384,13 +1906,29 @@ function renderAttachments() {
   wrap.innerHTML = '';
   wrap.classList.toggle('hidden', !S.attachments.length);
   S.attachments.forEach((a, i) => {
-    const box = el('div', 'attachment');
-    const img = el('img');
-    img.src = `data:${a.mimeType};base64,${a.data}`;
-    img.title = a.name;
+    const box = el('div', `attachment${a.type === 'file' ? ' file' : ''}`);
+    if (a.type === 'image') {
+      const img = el('img');
+      img.src = `data:${a.mimeType};base64,${a.data}`;
+      img.title = a.name;
+      box.appendChild(img);
+    } else {
+      const icon = el('div', 'file-icon', a.kind === 'pdf' ? 'PDF' : a.kind === 'audio' ? '♪' : a.kind === 'video' ? '▶' : '·');
+      const meta = el('div', 'file-meta');
+      meta.appendChild(el('div', 'file-name', a.name));
+      const status = a.transcribing
+        ? 'transcribing…'
+        : a.transcript
+          ? `transcribed: ${a.transcript.slice(0, 80)}${a.transcript.length > 80 ? '…' : ''}`
+          : a.transcriptError
+            ? `transcript failed (${a.transcriptError})`
+            : `${(a.size / 1024).toFixed(0)} KB`;
+      meta.appendChild(el('div', 'file-status', status));
+      box.append(icon, meta);
+    }
     const rm = el('button', 'rm', '×');
     rm.onclick = () => { S.attachments.splice(i, 1); renderAttachments(); };
-    box.append(img, rm);
+    box.appendChild(rm);
     wrap.appendChild(box);
   });
 }
@@ -1402,7 +1940,7 @@ function clearAttachments() {
 
 $('btn-attach').onclick = () => $('file-input').click();
 $('file-input').onchange = async (e) => {
-  for (const f of e.target.files) await addImageFile(f);
+  for (const f of e.target.files) await addFile(f);
   e.target.value = '';
 };
 
@@ -1434,7 +1972,7 @@ document.addEventListener('drop', async (e) => {
   e.preventDefault();
   dragDepth = 0;
   $('drop-overlay').classList.add('hidden');
-  for (const f of e.dataTransfer?.files || []) await addImageFile(f);
+  for (const f of e.dataTransfer?.files || []) await addFile(f);
 });
 
 /* ───────────────────────── slash commands ───────────────────────── */
@@ -1849,8 +2387,13 @@ function renderSessions(sessions) {
   if (!shown.length) list.appendChild(el('div', 'session-item s-meta', 'No sessions found'));
   for (const s of shown) {
     const item = el('div', 'session-item');
-    if (current && (s.path === current || s.fileName === current.split(/[\\/]/).pop())) item.classList.add('active');
-    item.appendChild(el('div', 's-name', s.name));
+    const isCurrent = current && (s.path === current || s.fileName === current.split(/[\\/]/).pop());
+    if (isCurrent) item.classList.add('active');
+    if (isCurrent && S.isStreaming) item.classList.add('live');
+    const nameRow = el('div', 's-name');
+    if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
+    nameRow.appendChild(document.createTextNode(s.name));
+    item.appendChild(nameRow);
     item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
     item.onclick = () => switchToSession(s.path);
     list.appendChild(item);
@@ -1861,6 +2404,11 @@ $('session-filter').oninput = () => refreshSessions();
 $('btn-refresh-sessions').onclick = () => refreshSessions();
 
 async function switchToSession(sessionPath) {
+  if (S.isStreaming && sessionPath !== S.state.sessionFile) {
+    const ok = window.confirm('The agent is still running in this session.\nSwitching will stop the current run. Continue?');
+    if (!ok) return;
+    try { await rpc({ type: 'abort' }); } catch { /* best effort */ }
+  }
   try {
     await rpc({ type: 'switch_session', sessionPath });
     S.state.sessionFile = sessionPath;
@@ -1891,12 +2439,37 @@ $('session-name').addEventListener('change', async (e) => {
 /* ───────────────────────── model / thinking selects ───────────────────────── */
 
 $('model-select').onchange = async (e) => {
-  const [provider, ...rest] = e.target.value.split(':');
+  // llama.cpp entries use "provider||modelId" because the provider id itself
+  // contains colons (llama-server=http://host:8080).
+  let provider, modelId;
+  const sep = e.target.value.indexOf('||');
+  if (sep >= 0) {
+    provider = e.target.value.slice(0, sep);
+    modelId = e.target.value.slice(sep + 2);
+  } else {
+    [provider, ...rest] = e.target.value.split(':');
+    modelId = rest.join(':');
+  }
+  const isLlama = provider.startsWith('llama-server=');
+  // If pi has not registered this llama provider yet (its configured URL is
+  // dead), point pi at the live server, restart the agent, then retry.
+  if (isLlama && !S.models.some((m) => m.provider === provider)) {
+    const live = llamaLiveServers.find((s) => s.providerId === provider);
+    if (live && confirm(`pi has not registered the llama.cpp server at ${live.url} yet.\n\nPoint pi at it and restart the agent? (updates llamaServerUrl in your pi config)`)) {
+      S.pendingModel = { provider, modelId };
+      fixLlamaConfig(live.url);
+    }
+    return;
+  }
   try {
-    await rpc({ type: 'set_model', provider, modelId: rest.join(':') });
+    await rpc({ type: 'set_model', provider, modelId });
     await rpc({ type: 'get_state' }).then(applyState);
-    toast('Model switched');
-  } catch (err) { toast(err.message, 'error'); }
+    toast(isLlama ? 'Model switched — loading into llama.cpp…' : 'Model switched');
+  } catch (err) {
+    toast(err.message + (isLlama
+      ? ' — pi does not know this model yet. If the llama.cpp banner is showing, use "Point pi here & reload", or type /models in the chat'
+      : ''), 'error');
+  }
 };
 
 $('thinking-select').onchange = async (e) => {
@@ -2093,10 +2666,22 @@ function openSettings() {
   $('set-tts-model').value = SET.ttsModel || '';
   $('set-tts-voice-name').value = SET.ttsVoiceName || '';
   $('set-accent').value = SET.themeAccent || '#5b9dff';
-  $('set-bg-url').value = SET.themeBg && !SET.themeBg.startsWith('data:') ? SET.themeBg : '';
+  $('set-bg-url').value = SET.themeBg && !SET.themeBg.startsWith('data:') && !SET.themeBg.startsWith('/api/bg-file') ? SET.themeBg : '';
   $('set-tts-rate').value = SET.ttsRate;
   $('set-tts-rate-val').textContent = Number(SET.ttsRate).toFixed(2);
+  $('set-font').value = SET.fontFamily || '';
+  // System font list for the searchable font picker (loaded async).
+  loadSystemFonts();
+  $('set-font-size').value = Number(SET.chatFontSize) || 14;
+  $('set-font-size-val').textContent = `${Number(SET.chatFontSize) || 14}px`;
+  $('set-chat-opacity').value = SET.chatOpacity == null ? 100 : Number(SET.chatOpacity);
+  $('set-chat-opacity-val').textContent = `${SET.chatOpacity == null ? 100 : Number(SET.chatOpacity)}%`;
+  $('set-shorts-provider').value = SHORTS_FEEDS[SET.shortsProvider] ? SET.shortsProvider : 'none';
+  const legacyMode = { split: 'panel', popup: 'window' }[SET.shortsMode] || SET.shortsMode;
+  $('set-shorts-mode').value = (legacyMode === 'tab' || legacyMode === 'window') ? legacyMode : 'panel';
+  $('set-auto-continue').checked = SET.autoContinueAfterCompaction !== false;
   populateTtsVoiceSelect();
+  loadPiProviders();
   $('settings-dialog').showModal();
 }
 
@@ -2171,47 +2756,621 @@ $('set-bg-url').addEventListener('change', (e) => { SET.themeBg = e.target.value
 $('btn-bg-upload').onclick = () => $('bg-input').click();
 $('bg-input').onchange = async (e) => {
   const f = e.target.files[0];
-  if (f && f.type.startsWith('image/')) {
-    SET.themeBg = await readAsDataUrl(f);
-    saveSettings();
-  }
   e.target.value = '';
+  if (!f) return;
+  // Anything the user picks is uploaded to the bridge and referenced by URL —
+  // a multi-MB GIF/video as a data URL would overflow localStorage.
+  const isVideo = f.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(f.name);
+  const isImage = f.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(f.name);
+  if (!isVideo && !isImage) { toast('Pick an image, GIF or video file', 'warning'); return; }
+  toast(isVideo ? 'Uploading background video…' : 'Uploading background…');
+  try {
+    const up = await uploadFile(f);
+    SET.themeBg = `/api/bg-file?name=${encodeURIComponent(up.path.split(/[\\/]/).pop())}`;
+    saveSettings();
+    toast(isVideo ? 'Video background set' : 'Background set');
+  } catch (err) {
+    // offline bridge: fall back to inlining small images so it still works
+    if (isImage && f.size < 1.5 * 1024 * 1024) {
+      try {
+        SET.themeBg = await readAsDataUrl(f);
+        saveSettings();
+        toast('Background set for this session (bridge not reachable to store it)');
+        return;
+      } catch { /* fall through */ }
+    }
+    toast(`Upload failed: ${err.message}`, 'error');
+  }
 };
 $('btn-bg-clear').onclick = () => { SET.themeBg = null; saveSettings(); };
 
-/* ───────────────────────── Instagram reels drawer ───────────────────────── */
-
-/* Reels: opens the real, logged-in instagram.com/reels in a reusable popup
- * window. Browsers don't expose their native split view to pages, so the
- * button tooltip explains the manual split-view hotkey per browser. */
-function reelsSplitHint() {
-  const ua = navigator.userAgent;
-  if (/Firefox\//.test(ua)) return 'Firefox: Alt+click the Reels tab to open Split View beside the chat.';
-  if (/Edg\//.test(ua)) return 'Edge: press Alt+F to open Split screen, then pick the Reels tab.';
-  if (/Chrome\//.test(ua)) return 'Chrome: right-click the Reels tab and choose "New split view with current tab".';
-  return 'Find the split view option in your browser, then pick the Reels tab.';
+/* Apply SET.themeBg to the page. Static images/GIFs use the body's
+ * background-image; videos need a real <video> layer behind everything. */
+function applyBackgroundMedia() {
+  const host = $('bg-media');
+  const src = SET.themeBg || '';
+  const isVideo = /^data:video\//i.test(src) || /\.(mp4|webm|mov|m4v|ogv|mkv)(\?|#|$)/i.test(src);
+  if (host) {
+    host.innerHTML = '';
+    if (isVideo) {
+      const v = document.createElement('video');
+      v.src = src;
+      v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
+      v.setAttribute('playsinline', '');
+      v.onerror = () => toast('Background video failed to load', 'error');
+      host.appendChild(v);
+      host.classList.remove('hidden');
+    } else {
+      host.classList.add('hidden');
+    }
+  }
+  document.body.style.backgroundImage = src && !isVideo ? `url("${src}")` : '';
+  document.body.style.backgroundSize = 'cover';
+  document.body.style.backgroundPosition = 'center';
+  document.body.style.backgroundAttachment = 'fixed';
 }
 
-$('btn-reels').title = 'Open the reels feed. Split view: ' + reelsSplitHint();
-$('btn-reels').onclick = () => {
-  const w = Math.min(460, Math.max(360, Math.round(window.innerWidth * 0.42)));
-  const h = Math.max(500, window.outerHeight - 60);
-  const left = Math.max(0, window.screenX + window.outerWidth - w - 12);
-  const top = Math.max(0, window.screenY + (window.outerHeight - h) / 2);
-  const existing = window.open('', 'pi_reels_feed');
-  if (existing && !existing.closed) {
-    existing.location.href = 'https://www.instagram.com/reels/';
-    existing.focus();
-  } else {
-    window.open('https://www.instagram.com/reels/', 'pi_reels_feed',
-      'popup=yes,width=' + w + ',height=' + h + ',left=' + left + ',top=' + top);
-  }
-  toast('Reels opened beside the UI - ' + reelsSplitHint());
+/* appearance: font + text size */
+/* Searchable system-font picker: enumerate installed fonts via the bridge
+ * (Windows font registry) and offer them in a datalist under the font input.
+ * Preset names (System/Monospace/Serif/Rounded) stay available too. */
+let systemFontsLoaded = false;
+async function loadSystemFonts() {
+  const list = $('font-list');
+  if (!list) return;
+  if (systemFontsLoaded) return;
+  try {
+    const d = await (await fetch('/api/system-fonts')).json();
+    const fonts = d.fonts || [];
+    list.innerHTML = '';
+    for (const f of fonts) list.appendChild(el('option', null, f));
+    systemFontsLoaded = true;
+  } catch { /* bridge may be old — picker still works with presets */ }
+}
+
+function applyFontChoice(value) {
+  const v = (value || '').trim();
+  const preset = {
+    '': '', 'system (segoe ui)': '', 'monospace': 'mono', 'serif': 'serif', 'rounded': 'rounded',
+  };
+  if (v.toLowerCase() in preset) SET.fontFamily = preset[v.toLowerCase()];
+  else SET.fontFamily = v; // raw system font family name
+  saveSettings();
+}
+
+$('set-font').oninput = (e) => { applyFontChoice(e.target.value); };
+$('set-font').onchange = (e) => { applyFontChoice(e.target.value); };
+if ($('btn-font-reset')) $('btn-font-reset').onclick = () => {
+  $('set-font').value = '';
+  applyFontChoice('');
+  toast('Font reset to system default');
 };
+$('set-font-size').oninput = (e) => {
+  SET.chatFontSize = parseInt(e.target.value, 10) || 14;
+  $('set-font-size-val').textContent = `${SET.chatFontSize}px`;
+  applySettings();
+};
+$('set-font-size').onchange = () => saveSettings();
+
+/* chatbox transparency: applies live while dragging, persists on release */
+$('set-chat-opacity').value = SET.chatOpacity == null ? 100 : Number(SET.chatOpacity);
+$('set-chat-opacity-val').textContent = `${SET.chatOpacity == null ? 100 : Number(SET.chatOpacity)}%`;
+$('set-chat-opacity').oninput = (e) => {
+  SET.chatOpacity = parseInt(e.target.value, 10);
+  $('set-chat-opacity-val').textContent = `${SET.chatOpacity}%`;
+  applySettings();
+};
+$('set-chat-opacity').onchange = () => saveSettings();
+
+/* shorts feed */
+$('set-shorts-provider').onchange = (e) => { SET.shortsProvider = e.target.value; saveSettings(); };
+$('set-shorts-mode').onchange = (e) => { SET.shortsMode = e.target.value; saveSettings(); };
+$('set-auto-continue').onchange = (e) => { SET.autoContinueAfterCompaction = e.target.checked; saveSettings(); };
+
+/* settings tabs */
+document.querySelectorAll('#settings-tabs .tab').forEach((t) => {
+  t.onclick = () => {
+    document.querySelectorAll('#settings-tabs .tab').forEach((x) => x.classList.toggle('active', x === t));
+    document.querySelectorAll('#settings-dialog .tab-panel').forEach((p) => {
+      p.classList.toggle('hidden', p.id !== `tab-${t.dataset.tab}`);
+    });
+  };
+});
+
+/* first-launch setup */
+function maybeShowSetup() {
+  if (SET.onboarded) return;
+  $('setup-agent-name').value = SET.agentName === 'pi' ? '' : SET.agentName;
+  $('setup-shorts-provider').value = SHORTS_FEEDS[SET.shortsProvider] ? SET.shortsProvider : 'instagram';
+  $('setup-accent').value = SET.themeAccent || '#5b9dff';
+  $('setup-dialog').showModal();
+}
+$('setup-skip').onclick = () => {
+  SET.onboarded = true;
+  saveSettings();
+  $('setup-dialog').close();
+};
+$('setup-accent-reset').onclick = () => { $('setup-accent').value = '#5b9dff'; };
+$('setup-done').onclick = () => {
+  const name = $('setup-agent-name').value.trim();
+  if (name) SET.agentName = name;
+  const prov = $('setup-shorts-provider').value;
+  if (SHORTS_FEEDS[prov] || prov === 'none') SET.shortsProvider = prov;
+  const acc = $('setup-accent').value;
+  SET.themeAccent = acc && acc !== '#5b9dff' ? acc : null;
+  SET.onboarded = true;
+  saveSettings();
+  $('setup-dialog').close();
+  toast(`Welcome, ${SET.agentName || 'pi'}!`);
+};
+
+/* ───────────────────────── pi providers (models.json) ───────────────────────── */
+
+async function loadPiProviders() {
+  const list = $('pi-providers-list');
+  list.innerHTML = '';
+  list.appendChild(el('div', 'prov-empty', 'loading…'));
+  try {
+    const d = await fetch('/api/pi-providers').then((r) => r.json());
+    list.innerHTML = '';
+    const provs = Object.entries(d.providers || {});
+    if (!provs.length) {
+      list.appendChild(el('div', 'prov-empty', 'no custom providers yet'));
+      return;
+    }
+    for (const [id, p] of provs) {
+      const row = el('div', 'prov-row');
+      const info = el('div', 'prov-info');
+      info.appendChild(el('div', 'prov-id', id));
+      info.appendChild(el('div', 'prov-meta',
+        `${p.baseUrl || '—'} · ${p.models?.length || 0} models · key ${p.hasApiKey ? '✓' : '—'}`));
+      const btn = el('button', 'btn small', 'remove');
+      btn.title = `Remove provider "${id}" from pi's models.json`;
+      btn.onclick = async () => {
+        if (!confirm(`Remove provider "${id}" from pi's models.json?`)) return;
+        try {
+          const r = await fetch(`/api/pi-providers?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+          const out = await r.json();
+          if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
+          toast(`Provider "${id}" removed`);
+          loadPiProviders();
+          refreshModels();
+        } catch (e) { toast(e.message, 'error'); }
+      };
+      row.append(info, btn);
+      list.appendChild(row);
+    }
+  } catch {
+    list.innerHTML = '';
+    list.appendChild(el('div', 'prov-empty', 'bridge offline'));
+  }
+}
+
+$('btn-prov-discover').onclick = async () => {
+  const url = $('prov-base-url').value.trim().replace(/\/+$/, '');
+  if (!url) { toast('Enter the base URL first', 'warning'); return; }
+  const btn = $('btn-prov-discover');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/probe-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `probe failed (${r.status})`);
+    if (!d.models.length) { toast('No models found at that URL', 'warning'); return; }
+    $('prov-models').value = d.models.map((m) => m.id).join('\n');
+    toast(`Found ${d.models.length} models`);
+  } catch (e) {
+    toast(`Discover failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$('btn-prov-test').onclick = async () => {
+  const baseUrl = $('prov-base-url').value.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(baseUrl)) { toast('Enter a valid base URL first', 'warning'); return; }
+  const btn = $('btn-prov-test');
+  btn.disabled = true;
+  btn.textContent = 'testing…';
+  try {
+    const r = await fetch('/api/probe-provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        baseUrl,
+        api: $('prov-api').value,
+        apiKey: $('prov-api-key').value.trim(),
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `probe failed (${r.status})`);
+    if (d.ok) {
+      toast(`✓ Connection works — model "${d.model}" replied: ${d.sample || '(empty)'}`);
+      if (d.models.length && !$('prov-models').value.trim()) {
+        $('prov-models').value = d.models.join('\n');
+        toast(`Filled ${d.models.length} discovered models`);
+      }
+    } else if (d.empty) {
+      toast(`✗ Endpoint answered HTTP ${d.status} but with an EMPTY reply — check the URL path (e.g. OpenAI-style needs /v1, not /anthropic)`, 'error');
+    } else {
+      toast(`✗ ${d.error || `HTTP ${d.status}`}`, 'error');
+    }
+  } catch (e) {
+    toast(`Test failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'test connection';
+  }
+};
+
+$('btn-prov-add').onclick = async () => {
+  const id = $('prov-id').value.trim();
+  const baseUrl = $('prov-base-url').value.trim();
+  const api = $('prov-api').value;
+  const apiKey = $('prov-api-key').value.trim();
+  const models = $('prov-models').value.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!id) { toast('Provider id is required', 'warning'); return; }
+  if (!/^https?:\/\//i.test(baseUrl)) { toast('Base URL must start with http:// or https://', 'warning'); return; }
+  const btn = $('btn-prov-add');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/pi-providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, baseUrl, api, apiKey: apiKey || undefined, models }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
+    toast(`Provider "${id}" saved to pi — new models appear in the model list`);
+    $('prov-api-key').value = '';
+    $('prov-models').value = '';
+    loadPiProviders();
+    refreshModels(); // pi re-reads models.json when the model list is opened
+  } catch (e) {
+    toast(`Save failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+/* ───────────────────────── shorts feed (one-tap) ───────────────────────── */
+
+const SHORTS_FEEDS = {
+  instagram: { url: 'https://www.instagram.com/reels/', label: 'Reels' },
+  tiktok: { url: 'https://www.tiktok.com/', label: 'TikTok' },
+  youtube: { url: 'https://www.youtube.com/shorts/', label: 'Shorts' },
+};
+
+/* ───────────────────────── Reels / Shorts ─────────────────────────
+ * Three ways to watch, depending on the platform:
+ *
+ *  1. NATIVE (React Native app): the page runs inside a WebView, so we can
+ *     hand off to the app's native shorts sheet via window.webview.postMessage.
+ *     The app loads the real feed top-level (a WebView is a full browser
+ *     context, so X-Frame-Options doesn't apply) — the true seamless split.
+ *
+ *  2. IN-APP PANEL (browser default): a split pane inside the app that plays
+ *     single videos via the official embeds (YouTube /embed/<id>, Instagram
+ *     /reel/<id>/embed/, TikTok /embed/v2/<id>). The infinite feed itself
+ *     can't be iframed (IG/TikTok send X-Frame-Options: DENY), so for that:
+ *
+ *  3. SIDE WINDOW: a popup docked flush against the right edge of the app
+ *     window (zero gap) that loads the full feed — plus a plain tab fallback.
+ * ─────────────────────────────────────────────────────────────────── */
+/* Check at call time (not load time): react-native-webview injects the
+ * bridge during page load, and a lazy check is immune to load-order races. */
+function nativeBridge() {
+  if (window.webview && typeof window.webview.postMessage === 'function') return window.webview;
+  if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') return window.ReactNativeWebView;
+  return null;
+}
+
+let reelsWin = null;           // side-window (full feed) handle
+let reelsFeed = 'instagram';   // active feed in the in-app panel
+const reelsLinks = {};         // last pasted link per feed
+
+function showReelsPill(label) {
+  const pill = $('reels-pill');
+  if (!pill) return;
+  pill.querySelector('span').textContent = `◧ ${label}`;
+  pill.classList.remove('hidden');
+}
+function hideReelsPill() {
+  const pill = $('reels-pill');
+  if (pill) pill.classList.add('hidden');
+}
+
+/* Build an official embed URL from a pasted share link. */
+function embedUrlFor(feed, raw) {
+  const u = (raw || '').trim();
+  if (!u) return null;
+  let m;
+  if (feed === 'youtube') {
+    m = u.match(/(?:youtube\.com\/(?:shorts|embed|live)\/|youtu\.be\/|youtube\.com\/watch\?(?:[^&]*&)*v=)([A-Za-z0-9_-]{6,20})/);
+    return m ? `https://www.youtube.com/embed/${m[1]}?autoplay=1` : null;
+  }
+  if (feed === 'instagram') {
+    m = u.match(/instagram\.com\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/);
+    return m ? `https://www.instagram.com/reel/${m[1]}/embed/` : null;
+  }
+  if (feed === 'tiktok') {
+    m = u.match(/tiktok\.com\/.*\/video\/(\d+)/);
+    return m ? `https://www.tiktok.com/embed/v2/${m[1]}` : null;
+  }
+  return null;
+}
+
+function setReelsFeed(feed) {
+  reelsFeed = feed;
+  for (const b of $('reels-tabs').querySelectorAll('.rtab'))
+    b.classList.toggle('active', b.dataset.feed === feed);
+  $('reels-link').value = reelsLinks[feed] || '';
+  const link = reelsLinks[feed];
+  const src = link ? embedUrlFor(feed, link) : null;
+  // In the app the panel is backed by a real browser surface, so switching tab
+  // just repoints it -- no iframe, no popup.
+  if (nativeFeedOpen) { openNativeFeed(feed); return; }
+  if (src) loadReelsVideo(src);
+  else {
+    const v = $('reels-video');
+    v.innerHTML = '';
+    const ph = el('div', 'reels-placeholder');
+    ph.innerHTML = `<p>Paste a ${SHORTS_FEEDS[feed].label} link above to play it right here — no new tab.</p>` +
+      `<p class="hint">The full infinite feed needs its own browsing context: the sites send <code>X-Frame-Options: DENY</code>, so an iframe is refused. <b>Open the feed</b> below and it loads for real, docked beside the app.</p>` +
+      `<div class="reels-placeholder-actions"><button class="btn small primary" data-reels-open="feed">open ${SHORTS_FEEDS[feed].label} feed</button></div>`;
+    v.appendChild(ph);
+    const openBtn = ph.querySelector('[data-reels-open="feed"]');
+    if (openBtn) openBtn.onclick = () => openReelsWindow(feed);
+  }
+}
+
+function loadReelsVideo(src) {
+  const v = $('reels-video');
+  v.innerHTML = '';
+  const iframe = document.createElement('iframe');
+  iframe.src = src;
+  iframe.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
+  iframe.allowFullscreen = true;
+  iframe.referrerPolicy = 'no-referrer';
+  v.appendChild(iframe);
+}
+
+/* Browser 'panel' mode: the same toggle the Reels button uses, kept as a named
+ * entry point because the reels pill and the settings menu call it too. */
+function toggleReelsPanel() {
+  const panel = $('reels-panel');
+  if (panel.classList.contains('hidden')) {
+    setReelsFeed(SHORTS_FEEDS[SET.shortsProvider || 'instagram'] ? (SET.shortsProvider || 'instagram') : 'instagram');
+    $('reels-link').focus();
+    showReels(reelsFeed);
+  } else {
+    hideReels();
+  }
+}
+
+/* ── docked native feed (Windows app) ──────────────────────────────
+ *
+ * In the app the page runs inside WebView2, which gives us something a browser
+ * cannot: a second real browser surface we can place anywhere in the window.
+ * So instead of iframing a feed (Instagram and TikTok refuse that with
+ * X-Frame-Options: DENY) or opening a popup, we park a genuine Chromium surface
+ * exactly over this panel's rectangle. The panel stays the layout -- drag the
+ * splitter and the feed follows -- and the site sees a top-level browsing
+ * context, so the infinite feed loads normally.
+ *
+ * Messages go to windows/PiAgent/WebView2Module.h as
+ *   piagent|shorts|open|x|y|w|h|url
+ *   piagent|shorts|rect|x|y|w|h
+ *   piagent|shorts|close
+ * with x/y relative to the panel (straight from getBoundingClientRect).
+ */
+function webView2Host() {
+  const c = window.chrome;
+  return c && c.webview && typeof c.webview.postMessage === 'function' ? c.webview : null;
+}
+
+let nativeFeedOpen = false;
+
+function panelRect() {
+  const r = $('reels-panel').getBoundingClientRect();
+  return {
+    x: Math.round(r.left),
+    y: Math.round(r.top),
+    w: Math.round(r.width),
+    h: Math.round(r.height),
+  };
+}
+
+function openNativeFeed(feed) {
+  const host = webView2Host();
+  if (!host) return false;
+  const f = SHORTS_FEEDS[feed] || SHORTS_FEEDS.instagram;
+  const r = panelRect();
+  if (r.w < 40 || r.h < 40) return false;
+  host.postMessage(`piagent|shorts|open|${r.x}|${r.y}|${r.w}|${r.h}|${f.url}`);
+  nativeFeedOpen = true;
+  $('reels-video').classList.add('native-feed');
+  return true;
+}
+
+function syncNativeFeed() {
+  const host = webView2Host();
+  if (!host || !nativeFeedOpen) return;
+  if ($('reels-panel').classList.contains('hidden')) { closeNativeFeed(); return; }
+  const r = panelRect();
+  if (r.w < 40 || r.h < 40) return;
+  host.postMessage(`piagent|shorts|rect|${r.x}|${r.y}|${r.w}|${r.h}`);
+}
+
+function closeNativeFeed() {
+  if (!nativeFeedOpen) return;
+  nativeFeedOpen = false;
+  const host = webView2Host();
+  if (host) host.postMessage('piagent|shorts|close');
+  const v = $('reels-video');
+  if (v) v.classList.remove('native-feed');
+}
+
+/* Side window for the full infinite feed: docked flush against the right
+ * edge of the app window (same height, zero gap) so it reads like a split
+ * pane. A top-bar pill tracks it. Falls back to a tab when blocked. */
+function openReelsWindow(feed) {
+  const f = SHORTS_FEEDS[feed] || SHORTS_FEEDS.instagram;
+  const w = Math.min(460, Math.max(360, Math.round(window.outerWidth * 0.42)));
+  const h = Math.max(480, Math.min(window.outerHeight, window.screen.height));
+  const left = Math.max(0, window.screenX + window.outerWidth - w);
+  const top = Math.max(0, window.screenY);
+  if (reelsWin && !reelsWin.closed) {
+    try {
+      const cur = reelsWin.location.href || '';
+      if (!cur.startsWith(f.url.slice(0, 25))) reelsWin.location.href = f.url;
+    } catch { reelsWin.location.href = f.url; }
+    reelsWin.focus();
+  } else {
+    reelsWin = window.open(f.url, 'pi_reels_feed',
+      'popup=yes,width=' + w + ',height=' + h + ',left=' + left + ',top=' + top);
+    if (!reelsWin) { // popup blocked by the browser
+      window.open(f.url, '_blank');
+      toast('Popup blocked — opened in a tab instead', 'warning');
+      return;
+    }
+  }
+  showReelsPill(f.label);
+  toast(`${f.label} feed opened in the side window`);
+}
+
+function showReels(provider) {
+  const panel = $('reels-panel');
+  panel.classList.remove('hidden');
+  setReelsFeed(provider || 'instagram');
+  // Windows app: back the panel with a real Chromium surface instead of the
+  // placeholder. No-op in a plain browser.
+  openNativeFeed(reelsFeed);
+}
+
+function hideReels() {
+  $('reels-panel').classList.add('hidden');
+  closeNativeFeed();
+}
+
+/* The Reels button is a TOGGLE: first press docks the feed, second press puts it
+ * away. It used to re-open (and therefore reload) the feed on every press. */
+function toggleReels() {
+  const panel = $('reels-panel');
+  if (panel.classList.contains('hidden')) showReels(SET.shortsProvider || 'instagram');
+  else hideReels();
+}
+
+function openShorts() {
+  const provider = SET.shortsProvider || 'instagram';
+  // Native (React Native) mode: open the app's native shorts sheet.
+  const bridge = nativeBridge();
+  if (bridge) {
+    bridge.postMessage(JSON.stringify({ type: 'openShorts', provider }));
+    return;
+  }
+  // WebView2 app: dock the feed inside the window, next to the chat.
+  if (webView2Host()) { toggleReels(); return; }
+  const mode = SET.shortsMode || 'panel';
+  if (mode === 'tab') { window.open((SHORTS_FEEDS[provider] || SHORTS_FEEDS.instagram).url, '_blank'); return; }
+  if (mode === 'window') { openReelsWindow(provider); return; }
+  toggleReelsPanel();
+}
+
+$('btn-reels').onclick = openShorts;
+$('btn-reels-close').addEventListener('click', hideReels);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('reels-panel').classList.contains('hidden')) hideReels();
+});
+for (const b of $('reels-tabs').querySelectorAll('.rtab'))
+  b.addEventListener('click', () => setReelsFeed(b.dataset.feed));
+
+function playReelsLink() {
+  const link = $('reels-link').value;
+  const src = embedUrlFor(reelsFeed, link);
+  if (!src) { toast('Couldn\'t find a video id in that link', 'error'); return; }
+  reelsLinks[reelsFeed] = link;
+  loadReelsVideo(src);
+}
+$('btn-reels-play').addEventListener('click', playReelsLink);
+$('reels-link').addEventListener('keydown', (e) => { if (e.key === 'Enter') playReelsLink(); });
+$('btn-reels-feed').addEventListener('click', () => {
+  if (openNativeFeed(reelsFeed)) return;
+  openReelsWindow(reelsFeed);
+});
+// Same action from the placeholder inside the panel, so "I want the real feed"
+// is one tap from where the user actually is.
+const reelsFeedInline = $('btn-reels-feed-inline');
+if (reelsFeedInline) {
+  reelsFeedInline.addEventListener('click', () => {
+    if (openNativeFeed(reelsFeed)) return;
+    openReelsWindow(reelsFeed);
+  });
+}
+
+/* Drag the panel's left edge to resize it. The feed is a real window surface,
+ * so it has to be told the new rectangle -- that is what syncNativeFeed() is
+ * for, and a ResizeObserver below catches every other layout change too. */
+const reelsResize = $('reels-resize');
+if (reelsResize) {
+  let dragging = false;
+  reelsResize.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    try { reelsResize.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    reelsResize.classList.add('dragging');
+    e.preventDefault();
+  });
+  const move = (e) => {
+    if (!dragging) return;
+    const panel = $('reels-panel');
+    const max = Math.max(320, window.innerWidth - 360);
+    const w = Math.max(320, Math.min(max, window.innerWidth - e.clientX));
+    panel.style.width = w + 'px';
+    syncNativeFeed();
+  };
+  reelsResize.addEventListener('pointermove', move);
+  window.addEventListener('pointermove', move);
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    reelsResize.classList.remove('dragging');
+    syncNativeFeed();
+  };
+  reelsResize.addEventListener('pointerup', stop);
+  window.addEventListener('pointerup', stop);
+}
+
+if (typeof ResizeObserver !== 'undefined') {
+  const ro = new ResizeObserver(() => syncNativeFeed());
+  ro.observe($('reels-panel'));
+}
+window.addEventListener('resize', () => syncNativeFeed());
+
+// The docked feed is a window this page does not own, so a reload would leave it
+// behind. Clear any orphan on startup, and try to close ours on the way out.
+if (webView2Host()) {
+  webView2Host().postMessage('piagent|shorts|close');
+  window.addEventListener('beforeunload', () => {
+    try { webView2Host().postMessage('piagent|shorts|close'); } catch { /* going away */ }
+  });
+}
+
+$('reels-pill').addEventListener('click', () => {
+  if (reelsWin && !reelsWin.closed) { try { reelsWin.close(); } catch { /* ignore */ } }
+  reelsWin = null;
+  hideReelsPill();
+});
+/* Watchdog: hide the pill when the side window is closed from its own UI. */
+setInterval(() => {
+  if (reelsWin && reelsWin.closed) { reelsWin = null; hideReelsPill(); }
+}, 1000);
 
 /* ───────────────────────── boot ───────────────────────── */
 
 applySettings();
 populateTtsVoiceSelect();
-loadServerSettings();
+loadServerSettings().then(() => maybeShowSetup());
 connect();
