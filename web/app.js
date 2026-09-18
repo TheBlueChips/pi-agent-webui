@@ -174,6 +174,7 @@ const DEFAULT_SETTINGS = {
   themeBg: null,          // background image (URL or dataURL) or video URL
   onboarded: false,       // first-launch setup completed
   shortsProvider: 'instagram', // 'instagram' | 'tiktok' | 'youtube' | 'none'
+  shortsAutoOpen: false,  // open the feed while the agent runs, close it when the run finishes
   shortsMode: 'panel',    // 'panel' (in-app split) | 'window' (side window, full feed) | 'tab' — legacy 'split'='panel', 'popup'='window'
   autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
   fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
@@ -297,6 +298,7 @@ const S = {
   autoTts: false,
   speaking: false,
   stickToBottom: true,
+  userScrolling: false,    // true during an active wheel/touch gesture (never pin then)
   live: null,              // in-flight assistant render {root, text, thinking, tools}
   toolCards: new Map(),    // toolCallId -> {card, body, stateEl}
   viewSession: null,       // session path being viewed (null = the agent's own session)
@@ -516,6 +518,8 @@ function applyState(d) {
     if (d.model && d.model.id) syncSelect($('model-select'), `${d.model.provider}||${d.model.id}`);
     if (d.thinkingLevel) syncSelect($('thinking-select'), d.thinkingLevel);
     updateStreamUi();
+    // Reconnect while a run is already going: the feed should be open too.
+    if (d.isStreaming) autoOpenShortsIfEnabled();
   }
 }
 
@@ -772,8 +776,12 @@ function setCtxRing(cu, store = true) {
 function liveCtxRing(extraTokens) {
   if (!S.ctxStats) return;
   const b = S.ctxStats;
-  const base = Math.max(b.tokens || 0, S.ctxDisplayTokens || 0);
-  const tokens = base + (extraTokens || 0);
+  // Estimate on top of the AUTHORITATIVE count. Basing it on the previously
+  // displayed value instead would compound: every tick added the whole message
+  // again, so the ring and the label filled up within seconds.
+  const estimate = (b.tokens || 0) + (extraTokens || 0);
+  // ...but the display must not move backwards while a turn is in flight.
+  const tokens = Math.max(estimate, S.ctxDisplayTokens || 0);
   setCtxRing({ ...b, tokens, percent: b.contextWindow ? (tokens / b.contextWindow) * 100 : null }, false);
 }
 
@@ -786,21 +794,59 @@ function updateTotals(extraUsage) {
 
 /* ───────────────────────── chat rendering ───────────────────────── */
 
+function atBottom(slack = 60) {
+  return chat.scrollHeight - chat.scrollTop - chat.clientHeight < slack;
+}
+
 function scrollBottom(force) {
   if (!force && S.liveDetached) return; // the live view is parked; don't scroll the visible session
+  if (!force && S.userScrolling) return; // never pin from under an active wheel/touch gesture
   if (force || S.stickToBottom) {
     lastProgrammaticScroll = Date.now();
     chat.scrollTop = chat.scrollHeight;
   }
 }
 let lastProgrammaticScroll = 0;
+let userScrollIdle = 0;
 chat.addEventListener('scroll', () => {
-  // Ignore scroll events caused by our own pinning: a burst of content that
-  // lands between the programmatic pin and the (async) scroll event would
-  // otherwise flip stickToBottom off and let the view drift up mid-generation.
-  if (Date.now() - lastProgrammaticScroll < 150) return;
+  // Only an explicit wheel/touch gesture is trusted as "the user left the
+  // bottom". A scroll event that lands just after we pinned is normally the
+  // browser reacting to content being inserted above the viewport (the chat
+  // grows between our pin and the next layout pass), and treating that as a
+  // user scroll is what stopped auto-follow when a thinking block or tool card
+  // appeared mid-turn. Real gestures set S.userScrolling and are always
+  // honoured, so the guard can be strict here.
+  if (!S.userScrolling && Date.now() - lastProgrammaticScroll < 250) return;
   S.stickToBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
 });
+/* Re-pin once the newly inserted content has been laid out. scrollHeight read
+ * in the same frame as an insert is stale, so the first pin can land short and
+ * leave the view a few pixels off the bottom. */
+function pinSoon() {
+  if (!S.stickToBottom || S.userScrolling || S.liveDetached) return;
+  requestAnimationFrame(() => {
+    if (S.stickToBottom && !S.userScrolling && !S.liveDetached) scrollBottom();
+  });
+}
+/* Explicit intent beats the guard above: a wheel-up or a touch drag is
+ * unambiguous, so stop pinning before the browser even fires the scroll event.
+ * Scrollbar drags are covered by the "dist < 4" check in the scroll handler. */
+chat.addEventListener('wheel', (e) => {
+  if (e.deltaY < 0) S.stickToBottom = false;
+  else if (atBottom()) S.stickToBottom = true;
+  S.userScrolling = true;
+  clearTimeout(userScrollIdle);
+  userScrollIdle = setTimeout(() => {
+    S.userScrolling = false;
+    if (atBottom()) S.stickToBottom = true; // settled back at the bottom → follow again
+  }, 180);
+}, { passive: true });
+chat.addEventListener('touchstart', () => { S.userScrolling = true; }, { passive: true });
+chat.addEventListener('touchmove', () => { S.stickToBottom = atBottom(); }, { passive: true });
+chat.addEventListener('touchend', () => {
+  S.userScrolling = false;
+  S.stickToBottom = atBottom();
+}, { passive: true });
 
 function messageBlock(content) {
   // user message content may be a string or a block array
@@ -1169,20 +1215,46 @@ function renderCompactionBlock(result, reason) {
   if (S.stickToBottom) scrollBottom();
 }
 
+// Read a session transcript from the bridge (messages + the compaction
+// entries, which are not messages and so are absent from get_messages).
+async function fetchSession(sessionPath) {
+  const r = await fetch(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
+  return {
+    messages: d.messages || [],
+    compactions: (d.compactions || []).map((c) => ({
+      ...c,
+      at: c.timestamp ? Date.parse(c.timestamp) : null,
+    })),
+  };
+}
+
 async function refreshMessages() {
   let msgs;
+  let fileMarks = [];
   if (S.viewSession) {
     // Viewing another session while the agent runs in its own: read it
     // read-only from the file (the get_messages RPC only knows the agent's
     // own session).
-    const r = await fetch(`/api/session-messages?path=${encodeURIComponent(S.viewSession)}`);
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
-    msgs = d.messages || [];
+    const d = await fetchSession(S.viewSession);
+    msgs = d.messages;
+    fileMarks = d.compactions;
   } else {
     const d = await rpc({ type: 'get_messages' });
     msgs = asArray(d, 'messages');
+    // Compactions are stored as their own entries in the session file and are
+    // not part of get_messages, so re-read them — otherwise every "conversation
+    // compacted" marker disappears on reload.
+    if (S.state.sessionFile) {
+      try { fileMarks = (await fetchSession(S.state.sessionFile)).compactions; } catch { /* file may be gone */ }
+    }
   }
+  // Markers we watched happen in this page session, plus the ones already in
+  // the file. Deduped by summary text so a watched compaction is not doubled.
+  const marks = [...S.compactionMarks];
+  const markSeen = new Set(marks.map((k) => k.summary));
+  for (const k of fileMarks) if (k.summary && !markSeen.has(k.summary)) marks.push(k);
   // Keep the reading position (distance from the bottom) across the re-render.
   const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
   chat.innerHTML = '';
@@ -1222,7 +1294,7 @@ async function refreshMessages() {
       // A compaction we watched happen gets placed at its anchor below, so the
       // marker does not jump. One that came back with the session (page reload)
       // belongs right here in the transcript.
-      if (!S.compactionMarks.some((k) => k.summary === m.summary)) renderCompactionSummary(m);
+      if (!marks.some((k) => k.summary === m.summary)) renderCompactionSummary(m);
     }
     // Stamp whatever node(s) this message produced, so a compaction marker can
     // be anchored to a point in time instead of a shifting position.
@@ -1237,7 +1309,7 @@ async function refreshMessages() {
   // they don't belong in a read-only render of another session.)
   if (!S.viewSession) {
     const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
-    for (const k of S.compactionMarks) {
+    for (const k of marks) {
       let target = null;
       if (k.at != null) {
         for (const n of plain) {
@@ -1245,7 +1317,7 @@ async function refreshMessages() {
           if (ts && ts <= k.at) target = n;
         }
       }
-      const node = buildCompactionSummary(k, { live: true, count: S.compactionMarks.length });
+      const node = buildCompactionSummary(k, { live: true, count: marks.length });
       if (target) target.after(node);
       else if (plain.length) plain[0].before(node);
       else chat.appendChild(node);
@@ -1301,11 +1373,13 @@ function handleEvent(msg) {
     case 'agent_start':
       S.isStreaming = true;
       updateStreamUi();
+      autoOpenShortsIfEnabled();
       break;
     case 'agent_end':
     case 'agent_settled':
       if (msg.type === 'agent_settled') {
         S.isStreaming = false;
+        autoCloseShortsIfOurs();
         // After a compaction the session history no longer matches the chat
         // DOM (older messages were summarized away and the "compacted" marker
         // is missing) — re-render from the session so the marker shows up.
@@ -1438,11 +1512,15 @@ function startLive() {
   bubble.appendChild(md);
   const statsEl = el('span', 'agent-stats');
   root.querySelector('.who').insertBefore(statsEl, tools);
-  // The "…" dots bob up and down while the agent generates/reads.
-  root.querySelector('.who-text').replaceChildren(
-    document.createTextNode(' · '), el('span', 'streaming-dots', '…'));
+  // The "..." dots bob up and down in a wave (each dot delayed) while the
+  // agent generates/reads.
+  const dots = el('span', 'streaming-dots');
+  for (let i = 0; i < 3; i++) dots.appendChild(el('span', 'dot', '.'));
+  root.querySelector('.who-text').replaceChildren(document.createTextNode(' · '), dots);
   chat.appendChild(root);
   S.live = { root, md, text: '', thinking: '', thinkingEl: null, caret: el('span', 'streaming-caret'),
+    toolByIndex: new Map(),   // contentIndex -> tool card while a call is streaming
+    toolArgChars: new Map(),  // contentIndex -> argument characters streamed so far
              startTs: Date.now(), lastUsage: null, statsEl };
   scrollBottom();
 }
@@ -1454,26 +1532,58 @@ function applyDelta(ev) {
   else if (ev.type === 'text_start') { /* noop */ }
   else if (ev.type === 'text_end') { /* noop */ }
   else if (ev.type === 'thinking_delta') { if (!L.firstDeltaTs) L.firstDeltaTs = Date.now(); L.thinking += ev.delta || ''; }
-  else if (ev.type === 'toolcall_start' && ev.id) {
-    startToolCard({ toolCallId: ev.id, toolName: ev.toolName });
+  else if (ev.type === 'toolcall_start') {
+    // pi streams tool calls keyed by contentIndex and only sends {type,
+    // contentIndex} at the start — the id, name and arguments arrive with the
+    // deltas/end (assistantMessageEvent.partial is stripped by the RPC layer).
+    // Track the card by contentIndex so it can appear and grow while the model
+    // is still writing the call, instead of popping in fully formed.
+    if (L.toolByIndex.has(ev.contentIndex)) {
+      // duplicate start for the same block — keep the card we already have
+    } else {
+      const card = makeToolCard(ev.toolName || 'tool', { toolCallId: ev.id || `stream-${ev.contentIndex}` });
+      card.toolName = ev.toolName || '';
+      card._rawArgs = '';
+      card._contentIndex = ev.contentIndex;
+      L.root.querySelector('.bubble').appendChild(card.card);
+      startCardTimer(card);
+      L.toolByIndex.set(ev.contentIndex, card);
+      if (ev.id) S.toolCards.set(ev.id, card);
+      pinSoon();   // a new card above the caret — keep following
+    }
   }
-  else if (ev.type === 'toolcall_delta' && ev.id) {
-    // stream partial tool arguments so "write" shows the file as it is written
-    const c = S.toolCards.get(ev.id);
+  else if (ev.type === 'toolcall_delta') {
+    // Stream the arguments as they are written (a `write` shows the file, a
+    // `bash` shows the command) — this is the "tool call being generated".
+    const c = (ev.contentIndex != null && L.toolByIndex.get(ev.contentIndex)) || (ev.id && S.toolCards.get(ev.id));
     if (c) {
       c._rawArgs = (c._rawArgs || '') + (ev.delta || ev.argumentsDelta || ev.partial || ev.partialArgs || '');
+      const named = toolNameFromJson(c._rawArgs);
+      if (named && named !== c.toolName) {
+        c.toolName = named;
+        c.card.querySelector('.tool-name').textContent = named;
+      }
       c.body.classList.remove('hidden');
       c.body.textContent = liveToolPreview(c.toolName, c._rawArgs);
+      if (!L.toolArgChars) L.toolArgChars = new Map();
+      L.toolArgChars.set(ev.contentIndex, c._rawArgs.length);
+      scrollBottom();
     }
   }
   else if (ev.type === 'toolcall_end' && ev.toolCall) {
-    const existing = S.toolCards.get(ev.toolCall.id);
+    const byIndex = ev.contentIndex != null ? L.toolByIndex.get(ev.contentIndex) : null;
+    const existing = byIndex || S.toolCards.get(ev.toolCall.id);
     if (existing) {
       // Reuse the card created by toolcall_start (it already has the live
       // preview and the elapsed timer) instead of appending a duplicate.
       existing.toolName = ev.toolCall.name;
       existing.card.querySelector('.tool-name').textContent = ev.toolCall.name;
       fillToolBody(existing, ev.toolCall.name, ev.toolCall.arguments);
+      // Re-key to the real tool-call id so the tool_execution_* events (which
+      // are keyed by it) find this card.
+      if (existing._contentIndex != null) L.toolByIndex.delete(existing._contentIndex);
+      existing.toolCallId = ev.toolCall.id;
+      S.toolCards.set(ev.toolCall.id, existing);
     } else {
       const card = makeToolCard(ev.toolCall.name, { toolCallId: ev.toolCall.id });
       fillToolBody(card, ev.toolCall.name, ev.toolCall.arguments);
@@ -1482,6 +1592,13 @@ function applyDelta(ev) {
     }
   }
   renderLive();
+}
+
+/* The streamed argument JSON sometimes carries the tool name (providers differ);
+ * pull it out early so the card can be labelled while it is still being written. */
+function toolNameFromJson(raw) {
+  const m = /"(?:name|tool|toolName|tool_name)"\s*:\s*"([A-Za-z0-9_.-]{1,40})"/.exec(raw || '');
+  return m ? m[1] : null;
 }
 
 /* Live preview while a tool call's arguments stream in: for write-like tools
@@ -1509,6 +1626,7 @@ function renderLive() {
     if (L.thinking && !L.thinkingEl) {
       L.thinkingEl = makeThinking('');
       L.md.before(L.thinkingEl);
+      pinSoon();   // the block is inserted above the caret — follow it
     }
     if (L.thinkingEl) L.thinkingEl.querySelector('.th-body').textContent = L.thinking;
     L.md.innerHTML = renderMarkdown(L.text);
@@ -1526,10 +1644,23 @@ function renderLive() {
         (sec > 0.2 ? ` @ ${(est / sec).toFixed(1)} t/s` : '') : '';
     }
     if (stats) L.statsEl.textContent = ` (${stats})`;
-    // Live context ring: last authoritative token count + what's streamed so far.
-    liveCtxRing(Math.round((L.text.length + L.thinking.length) / 4));
+    // Live context ring: pi's last authoritative count + the in-flight message,
+    // estimated the same way pi itself does (chars/4).
+    liveCtxRing(liveExtraTokens());
     scrollBottom();
   });
+}
+
+/* Estimate the tokens the in-flight message will add, mirroring pi's own
+ * `estimateTokens` (text + thinking + tool-call arguments, chars/4). Using the
+ * same heuristic is what keeps the live number close to the authoritative one,
+ * so the ring does not jump backwards the moment the real usage lands. */
+function liveExtraTokens() {
+  const L = S.live;
+  if (!L) return 0;
+  let chars = L.text.length + L.thinking.length;
+  if (L.toolArgChars) for (const n of L.toolArgChars.values()) chars += n;
+  return Math.round(chars / 4);
 }
 
 function finalizeLive(finalMsg) {
@@ -1589,6 +1720,7 @@ function startToolCard(msg) {
   parent.appendChild(card.card);
   S.toolCards.set(msg.toolCallId, card);
   scrollBottom();
+  pinSoon();
   return card;
 }
 
@@ -1705,6 +1837,7 @@ const input = $('input');
 function autoSize() {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+  syncComposerText();
 }
 input.addEventListener('input', () => { autoSize(); updateSlashMenu(); });
 
@@ -1927,7 +2060,16 @@ function resetComposer() {
   clearAttachments();
   closeSlashMenu();
   updateEditBanner();
+  syncComposerText();
   input.focus();
+}
+
+/* The ring around the typed text stays visible whenever the composer has
+ * content, not only while it is focused, so the box never looks empty. */
+function syncComposerText() {
+  const row = document.querySelector('.composer-row');
+  if (!row) return;
+  row.classList.toggle('has-text', !!input.value.trim() || S.attachments.length > 0);
 }
 
 $('btn-send').onclick = sendCurrent;
@@ -2104,6 +2246,7 @@ function renderAttachments() {
   const wrap = $('attachments');
   wrap.innerHTML = '';
   wrap.classList.toggle('hidden', !S.attachments.length);
+  syncComposerText();
   S.attachments.forEach((a, i) => {
     const box = el('div', `attachment${a.type === 'file' ? ' file' : ''}`);
     if (a.type === 'image') {
@@ -2135,6 +2278,7 @@ function renderAttachments() {
 function clearAttachments() {
   S.attachments = [];
   renderAttachments();
+  syncComposerText();
 }
 
 $('btn-attach').onclick = () => $('file-input').click();
@@ -2648,10 +2792,8 @@ async function switchToSession(sessionPath) {
 // Read-only render of another session's transcript straight from its file.
 async function renderSessionFromDisk(sessionPath) {
   try {
-    const r = await fetch(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`);
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
-    const msgs = d.messages || [];
+    const d = await fetchSession(sessionPath);
+    const msgs = d.messages;
     const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
     chat.innerHTML = '';
     for (const m of msgs) {
@@ -2660,6 +2802,21 @@ async function renderSessionFromDisk(sessionPath) {
       else if (m.role === 'toolResult') renderToolResult(m);
       else if (m.role === 'bashExecution') renderBashExecution(m);
       else if (m.role === 'compactionSummary') renderCompactionSummary(m);
+    }
+    // Put the file's compaction markers back where they happened.
+    if (d.compactions.length) {
+      const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
+      for (const k of d.compactions) {
+        let target = null;
+        for (const n of plain) {
+          const ts = Number(n.dataset.ts);
+          if (k.at && ts && ts <= k.at) target = n;
+        }
+        const node = buildCompactionSummary(k, { live: true, count: d.compactions.length });
+        if (target) target.after(node);
+        else if (plain.length) plain[0].before(node);
+        else chat.appendChild(node);
+      }
     }
     if (S.stickToBottom) scrollBottom(true);
     else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
@@ -2927,6 +3084,7 @@ function openSettings() {
   $('set-chat-opacity').value = SET.chatOpacity == null ? 100 : Number(SET.chatOpacity);
   $('set-chat-opacity-val').textContent = `${SET.chatOpacity == null ? 100 : Number(SET.chatOpacity)}%`;
   $('set-shorts-provider').value = SHORTS_FEEDS[SET.shortsProvider] ? SET.shortsProvider : 'none';
+  $('set-shorts-auto').checked = SET.shortsAutoOpen === true;
   const legacyMode = { split: 'panel', popup: 'window' }[SET.shortsMode] || SET.shortsMode;
   $('set-shorts-mode').value = (legacyMode === 'tab' || legacyMode === 'window') ? legacyMode : 'panel';
   $('set-auto-continue').checked = SET.autoContinueAfterCompaction !== false;
@@ -3115,6 +3273,7 @@ $('set-chat-opacity').onchange = () => saveSettings();
 
 /* shorts feed */
 $('set-shorts-provider').onchange = (e) => { SET.shortsProvider = e.target.value; saveSettings(); };
+$('set-shorts-auto').onchange = (e) => { SET.shortsAutoOpen = e.target.checked; saveSettings(); };
 $('set-shorts-mode').onchange = (e) => { SET.shortsMode = e.target.value; saveSettings(); };
 $('set-auto-continue').onchange = (e) => { SET.autoContinueAfterCompaction = e.target.checked; saveSettings(); };
 
@@ -3292,56 +3451,99 @@ $('btn-prov-add').onclick = async () => {
 // Credentials pi's /login saves: ~/.pi/agent/auth.json, keyed by provider id.
 // "login" = store an API key, "logout" = remove it. The agent restarts after
 // either, because it reads auth.json at startup.
+//
+// The old UI listed all ~33 known providers at once, which buried the two or
+// three that actually matter. Now it is a searchable picker: type (or pick from
+// the suggestions) and the state of that one provider is shown below.
+let authProviders = {};
+
 async function loadAuthProviders() {
-  const list = $('auth-providers-list');
   const dl = $('auth-provider-ids');
-  if (!list || !dl) return;
-  list.innerHTML = '';
+  const status = $('auth-status');
+  const list = $('auth-logged-in');
+  if (!dl || !status || !list) return;
   try {
     const d = await fetch('/api/auth-providers').then((r) => r.json());
-    const provs = Object.entries(d.providers || {});
+    authProviders = d.providers || {};
     dl.innerHTML = '';
-    for (const [id] of provs) dl.appendChild(el('option', null, id));
-    if (!provs.length) {
-      list.appendChild(el('div', 'prov-empty', 'no providers found'));
-      return;
-    }
-    for (const [id, p] of provs) {
-      const row = el('div', 'prov-row');
-      const info = el('div', 'prov-info');
-      info.appendChild(el('div', 'prov-id', p.name || id));
-      const status = p.auth === 'key'
-        ? `key ${p.keyMasked || ''} ✓`
-        : p.auth === 'oauth' ? 'OAuth ✓'
-        : p.auth === 'other' ? 'configured (not an API key login)'
-        : 'no credentials';
-      info.appendChild(el('div', 'prov-meta', `${id} · ${status}${p.custom ? ' · custom' : ''}`));
-      const btn = el('button', 'btn small', p.auth === 'none' ? 'login' : p.auth === 'other' ? 'no login' : 'logout');
-      btn.title = p.auth === 'none'
-        ? `Fill the Provider field with "${id}" and save a key below`
-        : p.auth === 'other'
-          ? `"${id}" is configured in auth.json but is not an API key/OAuth login — remove it by hand`
-          : `Remove "${id}" credentials from auth.json (like /logout)`;
-      if (p.auth === 'other') {
-        btn.disabled = true;
-        btn.style.opacity = '.5';
-        btn.style.cursor = 'default';
-      } else {
-        btn.onclick = () => {
-          if (p.auth === 'none') {
-            $('auth-provider').value = id;
-            $('auth-key').focus();
-          } else {
-            authLogout(id);
-          }
-        };
-      }
-      row.append(info, btn);
-      list.appendChild(row);
-    }
+    for (const id of Object.keys(authProviders)) dl.appendChild(el('option', null, id));
+    renderAuthStatus();
+    renderAuthLoggedIn();
   } catch {
+    authProviders = {};
+    status.className = 'auth-status';
+    status.textContent = 'bridge offline';
     list.innerHTML = '';
-    list.appendChild(el('div', 'prov-empty', 'bridge offline'));
+  }
+}
+
+// State of the provider currently in the input (if any).
+function renderAuthStatus() {
+  const status = $('auth-status');
+  if (!status) return;
+  const id = ($('auth-provider').value || '').trim();
+  status.className = 'auth-status';
+  status.textContent = '';
+  if (!id) {
+    const n = Object.keys(authProviders).length;
+    status.textContent = n
+      ? 'Type or pick a provider — suggestions appear as you type.'
+      : '';
+    return;
+  }
+  const p = authProviders[id];
+  if (!p) {
+    status.textContent = `${id}: not a known pi provider id (any id is accepted) — no credentials stored.`;
+    status.classList.add('warn');
+  } else if (p.auth === 'key') {
+    status.textContent = `${p.name || id} — logged in with an API key ${p.keyMasked || ''}`;
+    status.classList.add('ok');
+  } else if (p.auth === 'oauth') {
+    status.textContent = `${p.name || id} — logged in via OAuth / subscription`;
+    status.classList.add('ok');
+  } else if (p.auth === 'other') {
+    status.textContent = `${p.name || id} — configured in auth.json, but not an API key login (cannot be removed here)`;
+    status.classList.add('warn');
+  } else {
+    status.textContent = `${p.name || id} — no credentials stored yet${p.custom ? ' (custom provider)' : ''}`;
+  }
+}
+
+// Only the providers that actually have credentials — usually a short list.
+function renderAuthLoggedIn() {
+  const list = $('auth-logged-in');
+  if (!list) return;
+  list.innerHTML = '';
+  const ids = Object.keys(authProviders).filter((id) => authProviders[id].auth !== 'none');
+  if (!ids.length) {
+    list.appendChild(el('div', 'prov-empty', 'no credentials stored yet'));
+    return;
+  }
+  for (const id of ids) {
+    const p = authProviders[id];
+    const row = el('div', 'prov-row');
+    const info = el('div', 'prov-info');
+    info.appendChild(el('div', 'prov-id', p.name || id));
+    const what = p.auth === 'key' ? `API key ${p.keyMasked || ''}`
+      : p.auth === 'oauth' ? 'OAuth / subscription'
+      : 'other configuration (protected)';
+    info.appendChild(el('div', 'prov-meta', `${id} · ${what}`));
+    const btn = el('button', 'btn small', p.auth === 'other' ? 'protected' : 'logout');
+    if (p.auth === 'other') {
+      btn.disabled = true;
+      btn.title = `"${id}" holds configuration beyond a login (an env block, for example) — remove it by hand if you really mean to`;
+    } else {
+      btn.title = `Remove "${id}" credentials from auth.json (like /logout)`;
+      btn.onclick = () => authLogout(id);
+    }
+    row.append(info, btn);
+    row.onclick = (e) => {
+      if (e.target === btn) return;
+      $('auth-provider').value = id;
+      renderAuthStatus();
+      $('auth-key').focus();
+    };
+    list.appendChild(row);
   }
 }
 
@@ -3369,6 +3571,9 @@ async function authLogout(id) {
     toast(e.message, 'error');
   }
 }
+
+$('auth-provider').addEventListener('input', renderAuthStatus);
+$('auth-provider').addEventListener('change', renderAuthStatus);
 
 $('btn-auth-login').onclick = async () => {
   const id = $('auth-provider').value.trim();
@@ -3614,8 +3819,41 @@ function showReels(provider) {
 }
 
 function hideReels() {
+  autoShortsOpened = false;   // the user (or the auto-hook) took it down
   $('reels-panel').classList.add('hidden');
   closeNativeFeed();
+}
+
+/* ── auto-open the feed while the agent works (settings → shorts) ──
+ * Only closes what it opened itself, so a feed the user opened by hand is
+ * never yanked away. Keyed off agent_start/agent_settled: settled means pi
+ * will not continue on its own (no retry, compaction or queued follow-up), so
+ * "the run is finished" really means finished. */
+let autoShortsOpened = false;
+
+function reelsHidden() {
+  const panel = $('reels-panel');
+  if (panel && !panel.classList.contains('hidden')) return false;
+  if (reelsWin && !reelsWin.closed) return false;
+  return true;
+}
+
+function autoOpenShortsIfEnabled() {
+  if (!SET.shortsAutoOpen || autoShortsOpened) return;
+  if (!SHORTS_FEEDS[SET.shortsProvider || 'instagram']) return; // 'none' → nothing to show
+  if (!reelsHidden()) return;                                   // already open
+  autoShortsOpened = true;
+  openShorts();
+}
+
+function autoCloseShortsIfOurs() {
+  if (!autoShortsOpened) return;
+  autoShortsOpened = false;
+  hideReels();
+  if (reelsWin && !reelsWin.closed) {
+    try { reelsWin.close(); } catch { /* ignore */ }
+    reelsWin = null;
+  }
 }
 
 /* The Reels button is a TOGGLE: first press docks the feed, second press puts it
@@ -3637,7 +3875,7 @@ function openShorts() {
   // WebView2 app: dock the feed inside the window, next to the chat.
   if (webView2Host()) { toggleReels(); return; }
   const mode = SET.shortsMode || 'panel';
-  if (mode === 'tab') { window.open((SHORTS_FEEDS[provider] || SHORTS_FEEDS.instagram).url, '_blank'); return; }
+  if (mode === 'tab') { reelsWin = window.open((SHORTS_FEEDS[provider] || SHORTS_FEEDS.instagram).url, '_blank'); return; }
   if (mode === 'window') { openReelsWindow(provider); return; }
   toggleReelsPanel();
 }

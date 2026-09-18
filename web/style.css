@@ -378,6 +378,16 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
 .prov-empty { font-size: 12px; color: var(--text-dim); }
 .prov-actions { margin-top: 10px; }
 
+/* State of the provider picked in the /login picker. */
+.auth-status { font-size: 12px; color: var(--text-dim); margin: 8px 0 0; min-height: 15px; }
+.auth-status.ok { color: var(--green); }
+.auth-status.warn { color: var(--yellow); }
+.auth-logged-in { margin-top: 10px; margin-bottom: 0; }
+.auth-logged-in .prov-row {
+  cursor: pointer; padding: 4px 6px; border-radius: 6px; border: 1px solid transparent;
+}
+.auth-logged-in .prov-row:hover { background: var(--bg-hover); border-color: var(--border); }
+
 /* "Viewing another session" banner (the agent keeps running in its own). */
 .view-banner {
   padding: 6px 14px; font-size: 12px; color: var(--accent);
@@ -388,7 +398,15 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
 .view-banner .btn { margin-left: auto; flex: none; }
 
 /* ───────────────────────── chat ───────────────────────── */
-#chat { flex: 1; overflow-y: auto; padding: 16px 12px 8px; font-family: var(--chat-font); font-size: var(--chat-size); }
+#chat {
+  flex: 1; overflow-y: auto; padding: 16px 12px 8px;
+  font-family: var(--chat-font); font-size: var(--chat-size);
+  /* Content lands above the caret constantly (thinking blocks, tool cards,
+   * rendered markdown). Chromium's scroll anchoring would move scrollTop on
+   * its own, which reads as the user leaving the bottom and silently kills
+   * auto-follow mid-turn. */
+  overflow-anchor: none;
+}
 .msg { max-width: 860px; margin: 0 auto 14px; }
 .msg .who {
   font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
@@ -459,12 +477,13 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .tool-card .tool-state.done { color: var(--green); }
 .tool-card .tool-state.error { color: var(--red); }
 /* "running…" bobs gently up and down so a live tool card reads as active
- * instead of a frozen label. */
-/* "running…" / streaming dots bob up and down while work is in progress.
- * One shared keyframe for both: the "…" in the live message header and the
- * "running…" label on tool cards (the elapsed time next to it stays still). */
+ * instead of a frozen label, and the three "..." dots in a live message header
+ * are staggered so they travel as a wave instead of jumping together. */
 @keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
-.msg .who .streaming-dots { display: inline-block; color: var(--accent); animation: bob 1.1s ease-in-out infinite; }
+.msg .who .streaming-dots { display: inline-flex; color: var(--accent); }
+.msg .who .streaming-dots .dot { animation: bob 1.1s ease-in-out infinite; }
+.msg .who .streaming-dots .dot:nth-child(2) { animation-delay: .16s; }
+.msg .who .streaming-dots .dot:nth-child(3) { animation-delay: .32s; }
 .tool-card .tool-state.running .tool-state-label { display: inline-block; animation: bob 1.1s ease-in-out infinite; }
 .tool-card .tool-body {
   border-top: 1px solid var(--border); padding: 8px 10px;
@@ -532,7 +551,15 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
   -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
 }
-.composer-row:focus-within { border-color: var(--accent-dim); }
+/* Only ONE blue outline: the ring around what you typed. The row keeps a
+ * neutral border on focus, so a second accent layer does not wrap the empty
+ * space around the input. */
+.composer-row:focus-within { border-color: var(--border); }
+.composer-row.has-text #input,
+#input:focus {
+  border-radius: 7px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 38%, transparent);
+}
 #input {
   flex: 1; resize: none; border: none; outline: none;
   background: transparent; color: var(--text);

@@ -469,6 +469,26 @@ const MODEL_FIELDS = ['id', 'name', 'api', 'baseUrl', 'reasoning', 'input',
   'contextWindow', 'maxTokens', 'cost', 'compat', 'thinkingLevelMap', 'headers'];
 const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
+// Classify an auth.json entry. Only *pure* credential entries count as a login
+// (and may therefore be removed from the UI). Anything carrying extra
+// configuration is protected: the pi-llama-cpp extension's `llama.cpp` entry is
+// `{type:"api_key", env:{...}}` — no key at all — and deleting it would wipe a
+// working server URL.
+const AUTH_KEY_FIELDS = new Set(['type', 'key']);
+const AUTH_OAUTH_FIELDS = new Set([
+  'type', 'access', 'accessToken', 'refresh', 'refreshToken', 'token', 'idToken',
+  'expires', 'expiresAt', 'expiresIn', 'expires_at', 'scope', 'tokenType',
+  'account', 'accountId', 'email', 'label', 'createdAt', 'updatedAt',
+]);
+function authEntryKind(a) {
+  if (!a || typeof a !== 'object') return 'none';
+  const fields = Object.keys(a);
+  if (a.type === 'api_key' && typeof a.key === 'string' && a.key.trim()
+      && fields.every((f) => AUTH_KEY_FIELDS.has(f))) return 'key';
+  if (a.type === 'oauth' && fields.every((f) => AUTH_OAUTH_FIELDS.has(f))) return 'oauth';
+  return 'other';
+}
+
 function maskKey(k) {
   if (!k) return null;
   const s = String(k);
@@ -539,15 +559,27 @@ const server = http.createServer(async (req, res) => {
     }
     try {
       const messages = [];
+      const compactions = [];
       for (const line of fs.readFileSync(resolved, 'utf8').split('\n')) {
         if (!line.trim()) continue;
         let e; try { e = JSON.parse(line); } catch { continue; }
         if (e && e.type === 'message' && e.message) {
           messages.push({ ...e.message, timestamp: e.message.timestamp ?? e.timestamp });
+        } else if (e && e.type === 'compaction' && e.summary) {
+          // Compactions are their own entry type (not messages), so they are
+          // missing from get_messages — without these the "conversation
+          // compacted" markers vanished as soon as the page was reloaded.
+          compactions.push({
+            summary: e.summary,
+            tokensBefore: e.tokensBefore != null ? e.tokensBefore : null,
+            estimatedTokensAfter: e.estimatedTokensAfter != null ? e.estimatedTokensAfter : null,
+            id: e.id || null,
+            timestamp: e.timestamp || null,
+          });
         }
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ path: p, messages }));
+      res.end(JSON.stringify({ path: p, messages, compactions }));
     } catch (e) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `read failed: ${e.message}` }));
@@ -912,7 +944,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   // pi custom providers: read / upsert / remove entries in ~/.pi/agent/models.json
-  // ── pi /login equivalent: credentials in ~/.pi/agent/auth.json ──
   // pi's /login stores API keys (and OAuth tokens) in auth.json, keyed by
   // provider id. Storing a key here logs the provider in; removing it logs
   // out. The agent must restart to pick up credential changes (the client
@@ -945,7 +976,7 @@ const server = http.createServer(async (req, res) => {
         // Only api_key/oauth entries are logins. Other shapes (e.g. the
         // pi-llama-cpp extension's `llama.cpp` env block) must NOT be offered
         // as "logout", or removing them would delete real configuration.
-        auth: a ? (a.type === 'api_key' ? 'key' : a.type === 'oauth' ? 'oauth' : 'other') : 'none',
+        auth: authEntryKind(a),
         keyMasked: a && typeof a.key === 'string' && a.key.length >= 4 ? `•••${a.key.slice(-4)}` : null,
         custom: !!custom,
       };
@@ -995,12 +1026,12 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: `no credentials for "${id}" in auth.json` }));
         return;
       }
-      // Refuse to delete entries that are not logins (env blocks, etc.) —
-      // deleting those would silently remove working configuration.
-      const t = auth[id] && auth[id].type;
-      if (t !== 'api_key' && t !== 'oauth') {
+      // Refuse to delete entries that are not plain credentials (env blocks,
+      // extra config) — deleting those would silently remove working setup.
+      const kind = authEntryKind(auth[id]);
+      if (kind !== 'key' && kind !== 'oauth') {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `"${id}" is not an API key or OAuth login (auth.json entry type: ${t || 'none'}) — remove it by hand if you really mean to` }));
+        res.end(JSON.stringify({ error: `"${id}" is not an API key or OAuth login (it holds other configuration) — remove it by hand if you really mean to` }));
         return;
       }
       delete auth[id];

@@ -97,7 +97,7 @@ export function ShortsPanel({ provider, onProviderChange, onClose, compact, expa
             onPress={onAutoOpenToggle}
             accessibilityLabel="Auto-open shorts while the agent is running"
             style={[styles.tab, autoOpen && { borderBottomColor: '#5b9dff' }]}>
-            <Text style={[styles.tabText, autoOpen && { color: '#5b9dff' }]}>⚡ auto</Text>
+            <Text style={[styles.tabText, autoOpen && { color: '#5b9dff' }]}>auto</Text>
           </TouchableOpacity>
         ) : null}
         <View style={{ flex: 1 }} />

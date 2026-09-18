@@ -265,6 +265,7 @@
         <option value="tab">New browser tab</option>
       </select>
     </div>
+    <label class="check-label"><input id="set-shorts-auto" type="checkbox"> open it automatically while the agent runs (closes when the run finishes)</label>
     <p class="hint">One tap opens your feed. The in-app panel plays single videos inside the website (paste a link). The infinite feed can't be embedded in a browser — the side window docks flush to the right edge, and the Pi mobile app (React Native) shows it as a true native panel.</p>
   </div>
 
@@ -299,19 +300,20 @@
 
     <!-- pi /login: credentials in ~/.pi/agent/auth.json -->
     <div class="prov-section" style="margin-top:14px; border-top:1px solid var(--border); padding-top:10px">
-      <p class="hint" style="margin-top:2px">Credentials in <code>~/.pi/agent/auth.json</code> — what pi's <code>/login</code> saves. “login” stores an API key (logs the provider in), “logout” removes it. The agent restarts to pick up the change.</p>
-      <div id="auth-providers-list" class="prov-list"></div>
+      <p class="hint" style="margin-top:2px">Log in to a provider — this writes to <code>~/.pi/agent/auth.json</code>, the same file pi's <code>/login</code> uses. The agent restarts to pick up the change.</p>
       <div class="settings-grid">
         <label>Provider</label>
-        <input id="auth-provider" type="text" list="auth-provider-ids" placeholder="anthropic" autocomplete="off">
+        <input id="auth-provider" type="text" list="auth-provider-ids" placeholder="search or type a provider id…" autocomplete="off">
         <datalist id="auth-provider-ids"></datalist>
         <label>API key</label>
         <input id="auth-key" type="password" placeholder="sk-…" autocomplete="off">
       </div>
+      <div id="auth-status" class="auth-status"></div>
       <div class="rate-row prov-actions">
         <button id="btn-auth-login" class="btn small primary" title="Store the key in auth.json — same as /login → Use an API key">login (save key)</button>
         <button id="btn-auth-logout" class="btn small" title="Remove the provider's credentials from auth.json — same as /logout">logout (remove)</button>
       </div>
+      <div id="auth-logged-in" class="prov-list auth-logged-in"></div>
       <p class="hint">Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
     </div>
   </div>
