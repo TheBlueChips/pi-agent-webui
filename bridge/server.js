@@ -469,6 +469,21 @@ const MODEL_FIELDS = ['id', 'name', 'api', 'baseUrl', 'reasoning', 'input',
   'contextWindow', 'maxTokens', 'cost', 'compat', 'thinkingLevelMap', 'headers'];
 const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
+// Built-in provider ids, i.e. the keys pi accepts in auth.json. Sourced from
+// docs/providers.md (API-key table) plus the OAuth/subscription providers.
+const BUILTIN_PROVIDER_IDS = [
+  'anthropic', 'ant-ling', 'amazon-bedrock', 'azure-openai-responses', 'baseten',
+  'cerebras', 'cloudflare-ai-gateway', 'cloudflare-workers-ai', 'deepseek',
+  'fireworks', 'google', 'groq', 'huggingface', 'kimi-coding', 'minimax',
+  'minimax-cn', 'mistral', 'nvidia', 'openai', 'openrouter', 'opencode',
+  'opencode-go', 'qwen-token-plan', 'qwen-token-plan-cn',
+  'qwen-token-plan-individual', 'radius', 'together', 'vercel-ai-gateway',
+  'xiaomi', 'xiaomi-token-plan-ams', 'xiaomi-token-plan-cn',
+  'xiaomi-token-plan-sgp', 'xai', 'zai', 'zai-coding-cn',
+  // subscriptions (/login -> browser flow, stored in auth.json as oauth)
+  'claude-code', 'github-copilot', 'openai-codex',
+];
+
 // Classify an auth.json entry. Only *pure* credential entries count as a login
 // (and may therefore be removed from the UI). Anything carrying extra
 // configuration is protected: the pi-llama-cpp extension's `llama.cpp` entry is
@@ -948,22 +963,19 @@ const server = http.createServer(async (req, res) => {
   // provider id. Storing a key here logs the provider in; removing it logs
   // out. The agent must restart to pick up credential changes (the client
   // does that after a successful login/logout).
-  const BUILTIN_PROVIDER_IDS = [
-    'anthropic', 'ant-ling', 'amazon-bedrock', 'azure-openai-responses', 'baseten',
-    'cerebras', 'cloudflare-ai-gateway', 'cloudflare-workers-ai', 'deepseek',
-    'fireworks', 'github-copilot', 'google', 'groq', 'huggingface', 'kimi-coding',
-    'minimax', 'minimax-cn', 'mistral', 'nvidia', 'openai', 'openrouter',
-    'opencode', 'opencode-go', 'qwen-token-plan', 'qwen-token-plan-individual',
-    'radius', 'together', 'vercel-ai-gateway', 'xai', 'zai', 'zai-coding-cn',
-  ];
   if (req.url.startsWith('/api/auth-providers')) {
     if (req.method !== 'GET') { res.writeHead(405).end(); return; }
     const auth = readJsonSafe(PI_AUTH_FILE) || {};
+    // models-store.json is keyed by provider id directly (no wrapper object),
+    // and mirrors the catalogs pi has cached: { "deepseek": { models: [...],
+    // checkedAt, etag }, ... }. Reading it as store.providers found nothing, so
+    // known providers showed up as raw ids with no catalog behind them.
     const store = readJsonSafe(path.join(PI_AGENT_DIR, 'models-store.json')) || {};
     const modelsFile = readJsonSafe(PI_MODELS_FILE) || {};
+    const cached = (store && typeof store === 'object' && !Array.isArray(store)) ? store : {};
     const ids = new Set([
       ...Object.keys(auth),
-      ...Object.keys(store.providers || {}),
+      ...Object.keys(cached),
       ...Object.keys(modelsFile.providers || {}),
       ...BUILTIN_PROVIDER_IDS,
     ]);
@@ -972,10 +984,8 @@ const server = http.createServer(async (req, res) => {
       const a = auth[id];
       const custom = (modelsFile.providers || {})[id];
       const entry = {
-        name: (custom && custom.name) || (store.providers && store.providers[id] && store.providers[id].name) || null,
-        // Only api_key/oauth entries are logins. Other shapes (e.g. the
-        // pi-llama-cpp extension's `llama.cpp` env block) must NOT be offered
-        // as "logout", or removing them would delete real configuration.
+        name: (custom && custom.name) || (cached[id] && cached[id].name) || null,
+        models: (cached[id] && Array.isArray(cached[id].models)) ? cached[id].models.length : null,
         auth: authEntryKind(a),
         keyMasked: a && typeof a.key === 'string' && a.key.length >= 4 ? `•••${a.key.slice(-4)}` : null,
         custom: !!custom,

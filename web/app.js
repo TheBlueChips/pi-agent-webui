@@ -312,6 +312,8 @@ const S = {
   compactionMarks: [],     // [{ summary, tokensBefore, estimatedTokensAfter, at }]  (at = ms)
   ctxStats: null,          // last authoritative contextUsage from get_session_stats
   ctxDisplayTokens: null,  // high-water mark: the largest token count the ring has shown
+  ctxBaseTokens: null,     // authoritative count when the current turn started
+  tokPerChar: null,        // measured output-tokens-per-character for this session
   bashCards: new Map(),    // bash req id -> {body}
   initialized: false,
   totals: { read: 0, write: 0 },  // session token totals
@@ -718,11 +720,15 @@ async function refreshStats() {
       ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`
       : '';
     let cu = d && d.contextUsage;
-    // While streaming, the live estimate (liveCtxRing) is ahead of the
-    // authoritative number, which only moves when the agent reports usage.
-    // Without this clamp the 1s poll would pull the ring back to the stale
-    // base every second (the "jumping back" sawtooth), so the displayed
-    // count only ever climbs while the model writes.
+    const rawTokens = cu && cu.tokens != null ? cu.tokens : null;
+    // While a turn is in flight the live number is anchored to the last real
+    // count; let that anchor advance as pi reports usage between messages.
+    if (S.isStreaming && rawTokens != null) {
+      S.ctxBaseTokens = Math.max(S.ctxBaseTokens || 0, rawTokens);
+    }
+    // The 1s poll would otherwise pull the ring back to a stale base every tick
+    // (the "jumping back" sawtooth), so the displayed count only climbs while a
+    // turn is in flight and the authoritative value settles it at the end.
     if (S.isStreaming && cu && cu.tokens != null && S.ctxDisplayTokens != null && cu.tokens < S.ctxDisplayTokens) {
       cu = { ...cu, tokens: S.ctxDisplayTokens, percent: cu.contextWindow ? (S.ctxDisplayTokens / cu.contextWindow) * 100 : null };
     }
@@ -773,16 +779,60 @@ function setCtxRing(cu, store = true) {
  * base is the high-water mark, not the raw authoritative number: when a new
  * assistant message starts its estimate restarts at 0, and using the raw
  * base would visibly snap the ring back down. */
-function liveCtxRing(extraTokens) {
+/* Character count of a message's content, mirroring pi's own estimator
+ * (text + thinking + tool-call name and arguments). */
+function messageChars(m) {
+  if (!m || !Array.isArray(m.content)) return 0;
+  let chars = 0;
+  for (const block of m.content) {
+    if (block.type === 'text' && block.text) chars += block.text.length;
+    else if (block.type === 'thinking' && block.thinking) chars += block.thinking.length;
+    else if (block.type === 'toolCall') chars += (block.name || '').length + JSON.stringify(block.arguments || {}).length;
+  }
+  return chars;
+}
+
+/* Total tokens a usage record implies - the same sum pi's
+ * calculateContextTokens() does (totalTokens when the provider sends it). */
+function usageContextTokens(u) {
+  if (!u) return null;
+  if (u.totalTokens) return u.totalTokens;
+  const sum = (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+  return sum > 0 ? sum : null;
+}
+
+/* The context ring during a turn.
+ *
+ * Prefer real numbers: once the provider reports usage for the message in
+ * flight, its prompt count is the context, so base + output is exact (pi will
+ * report the same value when the message ends). Only while no usage has
+ * arrived yet do we fall back to an estimate, and that estimate is calibrated
+ * from the tokens-per-character the session has actually shown so far instead
+ * of a fixed chars/4 guess. Both paths are clamped so the ring never walks
+ * backwards mid-turn. */
+function liveCtxRing(estimatedExtra) {
   if (!S.ctxStats) return;
   const b = S.ctxStats;
-  // Estimate on top of the AUTHORITATIVE count. Basing it on the previously
-  // displayed value instead would compound: every tick added the whole message
-  // again, so the ring and the label filled up within seconds.
-  const estimate = (b.tokens || 0) + (extraTokens || 0);
-  // ...but the display must not move backwards while a turn is in flight.
-  const tokens = Math.max(estimate, S.ctxDisplayTokens || 0);
+  let tokens;
+  const real = usageContextTokens(S.live && S.live.lastUsage);
+  if (real != null) {
+    tokens = Math.max(real, S.ctxBaseTokens || 0, S.ctxDisplayTokens || 0);
+  } else {
+    const estimate = (S.ctxBaseTokens != null ? S.ctxBaseTokens : (b.tokens || 0)) + (estimatedExtra || 0);
+    tokens = Math.max(estimate, S.ctxDisplayTokens || 0);
+  }
   setCtxRing({ ...b, tokens, percent: b.contextWindow ? (tokens / b.contextWindow) * 100 : null }, false);
+}
+
+/* Tokens per character, measured from messages that already have real usage.
+ * Used only for the first moments of a message, before usage arrives. */
+function noteTokenRatio(usage, chars) {
+  if (!usage || !chars || chars < 200) return;
+  const out = usage.output || 0;
+  if (!out) return;
+  const ratio = out / chars;
+  if (!(ratio > 0.05 && ratio < 2)) return;   // nonsense values stay out
+  S.tokPerChar = S.tokPerChar ? S.tokPerChar * 0.7 + ratio * 0.3 : ratio;
 }
 
 /* session totals (↑ read / ↓ write) summed from assistant message usage */
@@ -1651,16 +1701,15 @@ function renderLive() {
   });
 }
 
-/* Estimate the tokens the in-flight message will add, mirroring pi's own
- * `estimateTokens` (text + thinking + tool-call arguments, chars/4). Using the
- * same heuristic is what keeps the live number close to the authoritative one,
- * so the ring does not jump backwards the moment the real usage lands. */
+/* Estimate the tokens the in-flight message will add, using the ratio the
+ * session has actually shown (pi itself falls back to chars/4). */
 function liveExtraTokens() {
   const L = S.live;
   if (!L) return 0;
   let chars = L.text.length + L.thinking.length;
   if (L.toolArgChars) for (const n of L.toolArgChars.values()) chars += n;
-  return Math.round(chars / 4);
+  const ratio = S.tokPerChar || 0.25;
+  return Math.round(chars * ratio);
 }
 
 function finalizeLive(finalMsg) {
@@ -1679,6 +1728,7 @@ function finalizeLive(finalMsg) {
       if (usage) {
         S.totals.read += (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0);
         S.totals.write += usage.output || 0;
+        noteTokenRatio(usage, messageChars(finalMsg));
       }
       renderAssistantMessage(usage && !finalMsg.usage ? { ...finalMsg, usage } : finalMsg,
         { elapsedSec, prefillSec });
@@ -1730,9 +1780,13 @@ function updateStreamUi() {
   $('btn-stop').classList.toggle('hidden', !S.isStreaming);
   setConn(S.isStreaming ? 'busy' : 'on');
   // Reset the ring's high-water mark on every streaming transition so the
-  // final authoritative total can settle (even if the estimate overshot).
+  // final authoritative total can settle (even if the estimate overshot), and
+  // remember where this turn started so the live number can be anchored to it.
+  if (S.isStreaming && S.ctxBaseTokens == null) {
+    S.ctxBaseTokens = (S.ctxStats && S.ctxStats.tokens) || 0;
+  }
   S.ctxDisplayTokens = null;
-  if (S.isStreaming) startCtxPoll(); else stopCtxPoll();
+  if (S.isStreaming) startCtxPoll(); else { stopCtxPoll(); S.ctxBaseTokens = null; }
   renderQueue();
   updateLiveDot();
   updateViewBanner();
@@ -2712,6 +2766,21 @@ async function refreshSessions() {
 function renderSessions(sessions) {
   const list = $('session-list');
   const filter = ($('session-filter').value || '').toLowerCase();
+  // pi only writes the session file once something happens in it, so a brand
+  // new session is missing from /api/sessions until the first message. Show the
+  // one the agent is actually on, otherwise "new session" looks like it did
+  // nothing until a reload.
+  const cur = S.state.sessionFile;
+  if (cur && !sessions.some((s) => s.path === cur || s.fileName === cur.split(/[\\/]/).pop())) {
+    sessions = [{
+      path: cur,
+      fileName: cur.split(/[\\/]/).pop(),
+      name: (S.state.sessionName || '').trim() || 'new session',
+      mtime: Date.now(),
+      size: 0,
+      pending: true,
+    }, ...sessions];
+  }
   list.innerHTML = '';
   S.sessionsList = sessions;
   const current = S.state.sessionFile;
@@ -2829,6 +2898,10 @@ $('btn-new-session').onclick = async () => {
   try {
     await rpc({ type: 'new_session' });
     await initSession(false);
+    // The file for a fresh session does not exist yet, so the list has nothing
+    // to show. Re-check shortly (and after the first message lands) as well.
+    refreshSessions().catch(() => {});
+    setTimeout(() => refreshSessions().catch(() => {}), 700);
     toast('New session started');
   } catch (e) { toast(e.message, 'error'); }
 };
@@ -3492,20 +3565,21 @@ function renderAuthStatus() {
     return;
   }
   const p = authProviders[id];
+  const cat = p && p.models ? ` · ${p.models} models in its catalog` : '';
   if (!p) {
     status.textContent = `${id}: not a known pi provider id (any id is accepted) — no credentials stored.`;
     status.classList.add('warn');
   } else if (p.auth === 'key') {
-    status.textContent = `${p.name || id} — logged in with an API key ${p.keyMasked || ''}`;
+    status.textContent = `${p.name || id} — logged in with an API key ${p.keyMasked || ''}${cat}`;
     status.classList.add('ok');
   } else if (p.auth === 'oauth') {
-    status.textContent = `${p.name || id} — logged in via OAuth / subscription`;
+    status.textContent = `${p.name || id} — logged in via OAuth / subscription${cat}`;
     status.classList.add('ok');
   } else if (p.auth === 'other') {
-    status.textContent = `${p.name || id} — configured in auth.json, but not an API key login (cannot be removed here)`;
+    status.textContent = `${p.name || id} — configured in auth.json, but not an API key login (cannot be removed here)${cat}`;
     status.classList.add('warn');
   } else {
-    status.textContent = `${p.name || id} — no credentials stored yet${p.custom ? ' (custom provider)' : ''}`;
+    status.textContent = `${p.name || id} — no credentials stored yet${cat}${p.custom ? ' (custom provider)' : ''}`;
   }
 }
 

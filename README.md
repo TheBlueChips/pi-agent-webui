@@ -34,7 +34,7 @@ Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-
 
 > This machine runs Forgejo on port 3000, so the WebUI uses **http://localhost:3080**.
 
-There are two clients: the **browser UI** (`start-webui.bat`) and the **native mobile app** (`start-app.bat`, source in `pi-desktop/`).
+There are three ways in: the **browser UI** (`start-webui.bat`), the same UI in **its own window** with no build step (`start-app-window.bat`, Edge/Chrome app mode), or the **native Windows app** (`start-app.bat`, source in `pi-desktop/`).
 
 ### Choosing the agent source (first run)
 
@@ -74,33 +74,42 @@ npm start                # serves http://localhost:3080 by default (set PORT to 
 
 Env vars for the bridge: `PORT` (3000), `PI_COMMAND` (default `pi --mode rpc`), `WORKSPACE_DIR` (agent cwd), `PI_SESSION_DIR` (default `~/.pi/agent/sessions`).
 
+### App window, no toolchain (start-app-window.bat)
+
+```
+start-app-window.bat
+```
+
+Opens the same web UI as its own window instead of a browser tab, using
+Edge/Chrome app mode (no tabs, no address bar), and starts the bridge first if
+nothing is listening on port 3080. Nothing to install and nothing to compile;
+the default browser is used when no Chromium browser is found.
+
+This is the recommended way to run it as an app. The native shell below looks
+slightly more native but needs the C++ toolchain described there.
+
 ### Native desktop app (pi-desktop/)
 
-The `pi-desktop/` folder is a standalone **React Native** app targeting **Windows**
-(as well as Android/iOS from the same code) — the same bridge, the same RPC
-protocol, plus the one thing a browser cannot do: play the real Instagram /
-TikTok / YouTube Shorts feeds in-app (a native `WebView` is a top-level browser
-context, so `X-Frame-Options: DENY` does not apply).
+The `pi-desktop/` folder is a **React Native for Windows** app: a WebView2 host
+around the same `web/` UI, plus native extras the browser cannot do — the
+Instagram / TikTok / YouTube Shorts feed renders in a real WebView2 surface, so
+`X-Frame-Options: DENY` does not apply, and the feed can auto-open while the
+agent runs.
 
 ```
 start-app.bat
 ```
 
-That checks the bridge is up, builds the app if needed, and launches it:
+That starts the bridge if needed, installs the app's npm dependencies, builds it
+when there is no build yet, and launches it. The first build compiles the C++
+React Native Windows runtime and takes 5-20 minutes; afterwards
+`pi-desktop\windows\x64\Release\PiAgent.exe` starts directly.
 
-- `start-webui.bat` must be running (the app talks to that bridge)
-- enter your PC's IP and port `3080` in the app's setup screen (`localhost`
-  works on Windows)
-
-The first run compiles the C++ React Native Windows runtime and takes 5-20
-minutes; afterwards `pi-desktop\windows\x64\Release\PiAgent.exe` starts directly.
-
-On Windows the shorts panel opens feeds in a real browser window, because
-React Native Windows has no WebView component and `react-native-webview`'s
-Windows target is legacy UWP-only. The seamless in-app feed is mobile-only today.
-See `pi-desktop/README.md` for the full build notes and the WebView2 route.
-
-### Try it without any agent (UI smoke test)
+Building needs **Visual Studio 2022 with the "Desktop development with C++"
+workload and the Windows 11 SDK (10.0.26100)**, which is a few gigabytes of
+download — that is the reason `start-app-window.bat` exists. The project files
+are committed (only build output is ignored), so a clone builds as-is once the
+toolchain is present; see `pi-desktop/README.md` for the details.
 
 ### Try it without any agent (UI smoke test)
 
@@ -125,6 +134,8 @@ $env:PI_COMMAND="node mock_agent.js"; npm start
 
 ```
 start-webui.bat         launcher: pick native pi or a Docker container, then serve :3080
+start-app-window.bat    same UI in its own app window (Edge/Chrome app mode), no toolchain needed
+start-app.bat           native React Native for Windows app (builds pi-desktop/, needs Visual Studio)
 switch_pi_agent_source.bat  re-run the source picker, then launch
 Dockerfile              container image (node + pi CLI + bridge + web)
 docker-compose.yml      alternative: dedicated container with bundled pi, port 3080

@@ -37,13 +37,9 @@ if not defined BRIDGE_UP (
 )
 :bridge_ok
 
-rem --- built already? --------------------------------------------------------
-if exist "%EXE%" goto launch
-
-echo.
-echo   The app has not been built yet.
+rem --- dependencies present? -------------------------------------------------
 if not exist "%PROJ%\node_modules" (
-  echo   Installing dependencies first (first run only)...
+  echo   Installing the app's dependencies first (first run only)...
   pushd "%PROJ%"
   call npm install --no-fund --no-audit
   set "INSTALL_RC=!errorlevel!"
@@ -55,6 +51,12 @@ if not exist "%PROJ%\node_modules" (
     exit /b 1
   )
 )
+
+rem --- built already? --------------------------------------------------------
+if exist "%EXE%" goto launch
+
+echo.
+echo   The app has not been built yet.
 echo   Building it now. This can take 5-20 minutes the first time.
 echo.
 pushd "%PROJ%"

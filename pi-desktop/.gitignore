@@ -41,10 +41,6 @@ node_modules/
 npm-debug.log
 yarn-error.log
 
-# build output
-/dist/
-/windows/
-
 # fastlane
 #
 # It is recommended to not store the screenshots in the git repo. Instead, use fastlane to re-generate the
@@ -77,3 +73,10 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Build output. The Windows project files (windows/PiAgent.sln, *.vcxproj,
+# PiAgent.cpp, the WebView2 module, package assets) are committed on purpose -
+# without them a fresh clone has nothing to compile. windows/.gitignore already
+# covers the Visual Studio junk; these are the restore/build products.
+/windows/packages/
+/windows/PiAgent/Bundle/

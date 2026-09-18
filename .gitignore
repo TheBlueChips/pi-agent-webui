@@ -1,9 +1,6 @@
 # dependencies and runtime artifacts (all auto-installed/downloaded on launch)
 bridge/node_modules/
 bridge/whisper/
-pi-desktop/node_modules/
-pi-desktop/dist/
-pi-desktop/windows/
 uploads/
 workspace/
 
