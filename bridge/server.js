@@ -54,6 +54,64 @@ const WEB_DIR = path.join(__dirname, '..', 'web');
 let whisperUrl = null; // set once the local whisper STT server (if any) is up
 const fontsCache = { list: null, at: 0 }; // GET /api/system-fonts cache
 
+/* Decode a UTF-16 name-table string. Node has no utf16be decoder, and in
+ * practice name records are found in both byte orders, so try both and pick
+ * the one that yields printable text (a wrong order turns ASCII into
+ * characters with a zero low byte). */
+function decodeUtf16Name(raw) {
+  const be = [], le = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    be.push((raw[i] << 8) | raw[i + 1]);
+    le.push((raw[i + 1] << 8) | raw[i]);
+  }
+  const bad = (arr) => arr.filter((c) => c === 0 || (c >= 0x100 && (c & 0xff) === 0)).length;
+  const codes = bad(be) <= bad(le) ? be : le;
+  return codes.map((c) => String.fromCharCode(c)).join('');
+}
+
+/* Read the family name (nameID 1) from a TTF/OTF buffer. This is the name
+ * CSS font-family actually matches against, and it can differ from the
+ * Windows font-registry label — e.g. a font registered as
+ * "RWBY-Z-Regular (TrueType)" has family "RWBY-Z", so using the label makes
+ * the browser silently fall back to sans-serif. Returns null for WOFF/TTC
+ * collections or malformed files. */
+function ttfFamilyName(buf) {
+  try {
+    if (!buf || buf.length < 12) return null;
+    const version = buf.readUInt32BE(0);
+    // 0x00010000 = TTF, 'true' = legacy TTF, 'OTTO' = CFF/OTF; WOFF/TTC differ.
+    if (version !== 0x00010000 && version !== 0x74727565 && version !== 0x4f54544f) return null;
+    const numTables = buf.readUInt16BE(4);
+    let off = 12;
+    for (let i = 0; i < numTables; i++) {
+      const tag = buf.toString('ascii', off, off + 4);
+      const tOff = buf.readUInt32BE(off + 8);
+      off += 16;
+      if (tag !== 'name') continue;
+      const count = buf.readUInt16BE(tOff + 2);
+      const strBase = tOff + buf.readUInt16BE(tOff + 4);
+      const candidates = [];
+      for (let j = 0; j < count; j++) {
+        const r = tOff + 6 + j * 12;
+        const pid = buf.readUInt16BE(r);
+        const nid = buf.readUInt16BE(r + 6);
+        const len = buf.readUInt16BE(r + 8);
+        const sOff = buf.readUInt16BE(r + 10);
+        if (nid !== 1 || len < 2 || len % 2) continue;
+        const raw = buf.subarray(strBase + sOff, strBase + sOff + len);
+        const text = decodeUtf16Name(raw).trim();
+        if (text) candidates.push({ pid, text });
+      }
+      // Prefer the Windows (pid 3) record, then Unicode (1), then Mac (0).
+      const pick = candidates.find((c) => c.pid === 3)
+        || candidates.find((c) => c.pid === 1)
+        || candidates[0];
+      return pick ? pick.text : null;
+    }
+  } catch { /* malformed */ }
+  return null;
+}
+
 function parseSessionDir() {
   if (SESSION_DIR.startsWith('docker:')) {
     const rest = SESSION_DIR.slice('docker:'.length);
@@ -554,25 +612,24 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(fontsCache.list));
       return;
     }
-    // A font-registry line is "NAME    REG_SZ    VALUE". Two layouts exist:
-    //   standard:  "arial.ttf   REG_SZ   Arial, version 7.00"  → family in value
-    //   reversed:  "Arial (TrueType)   REG_SZ   arial.ttf"     → family in key
-    const parseFontLine = (line) => {
-      const m = line.trim().match(/^(.+?)\s+REG_SZ\s+(.+)$/);
-      if (!m) return null;
-      const key = m[1], val = m[2];
-      if (val.includes(',')) {
-        const fam = val.split(',')[0].trim();
-        if (fam && !/\.(ttf|otf|ttc|woff2?)$/i.test(fam)) return fam;
-      }
-      if (/^\S[\w .()_-]*$/.test(key)) {
-        const fam = key.replace(/\s*\([^)]*\)\s*$/i, '').trim();
-        if (fam && !/\.(ttf|otf|ttc|woff2?)$/i.test(fam)) return fam;
-      }
-      return null;
-    };
     (async () => {
       const families = new Set();
+      const addFamily = (fam) => {
+        if (fam && !/\.(ttf|otf|ttc|woff2?)$/i.test(fam)) families.add(fam.trim());
+      };
+      // Prefer the family name from the font file's own name table (what the
+      // browser matches on); fall back to the registry-derived label.
+      const familyOf = (file, fallback) => {
+        let fam = null;
+        if (file) {
+          try {
+            if (fs.statSync(file).size < 10 * 1024 * 1024) fam = ttfFamilyName(fs.readFileSync(file));
+          } catch { /* unreadable */ }
+        }
+        addFamily(fam || fallback);
+      };
+      const windowsFonts = path.win32.join(process.env.WINDIR || 'C:\\Windows', 'Fonts');
+      const userFonts = path.win32.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows', 'Fonts');
       const regKey = 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
       const regUser = 'HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
       for (const key of [regKey, regUser]) {
@@ -582,19 +639,27 @@ const server = http.createServer(async (req, res) => {
             execFile('reg', ['query', key], { timeout: 8000 }, (e, stdout) => e ? reject(e) : resolve(stdout || ''));
           });
           for (const line of out.split('\n')) {
-            const fam = parseFontLine(line);
-            if (fam) families.add(fam);
+            const m = line.trim().match(/^(.+?)\s+REG_SZ\s+(.+)$/);
+            if (!m) continue;
+            const label = m[1], val = m[2];
+            if (val.includes(',')) {
+              // Standard layout (machine fonts): key = file name, value =
+              // "Family, version".
+              familyOf(path.win32.join(windowsFonts, label), val.split(',')[0].trim());
+            } else if (/\.(ttf|otf|ttc|woff2?)$/i.test(val)) {
+              // Reversed layout (user fonts): key = "Label (TrueType)",
+              // value = full file path.
+              familyOf(val.trim(), label.replace(/\s*\([^)]*\)\s*$/i, '').trim());
+            }
           }
         } catch { /* registry unavailable / no user fonts */ }
       }
       if (!families.size) {
         // Fallback: scan font directories (family ≈ file base name)
-        const dirs = [path.win32.join(process.env.WINDIR || 'C:\\Windows', 'Fonts'),
-          path.win32.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows', 'Fonts')];
-        for (const dir of dirs) {
+        for (const dir of [windowsFonts, userFonts]) {
           try {
             for (const f of fs.readdirSync(dir)) {
-              if (/\.(ttf|otf|ttc|woff2?)$/i.test(f)) families.add(f.replace(/\.[^.]+$/, ''));
+              if (/\.(ttf|otf|ttc|woff2?)$/i.test(f)) familyOf(path.join(dir, f), f.replace(/\.[^.]+$/, ''));
             }
           } catch { /* dir missing */ }
         }
@@ -960,7 +1025,9 @@ function killTree(child) {
 }
 
 function wsSend(ws, obj) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  if (ws.readyState === ws.OPEN) {
+    try { ws.send(JSON.stringify(obj)); } catch { /* dead socket; keepalive reaps it */ }
+  }
 }
 
 function startAgent() {
@@ -1031,6 +1098,16 @@ function startAgent() {
 
 wss.on('connection', (ws) => {
   clients.add(ws);
+  // Keepalive bookkeeping: the bridge pings every 30s (see below) and a dead
+  // client is terminated once it misses a round. Without this, half-open
+  // connections (sleep/wake, WebView2 network hiccups) linger in `clients`
+  // forever, so "last one out turns off the lights" never fires for a client
+  // that is actually gone.
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  // A client socket error must not take the bridge down — an unhandled
+  // 'error' event would crash the process and drop every other client.
+  ws.on('error', () => { /* 'close' follows */ });
   startAgent();
   // Tell the newcomer where it is, and let it pull the current state itself.
   wsSend(ws, {
@@ -1080,6 +1157,20 @@ wss.on('connection', (ws) => {
     }
   });
 });
+
+// Keepalive: ping every client every 30s and terminate any that miss a round.
+// The browser/WebView answers pings automatically, so a pong proves the whole
+// path (page -> WebView -> bridge) is alive. This is what lets both ends
+// notice a half-open connection: the client side runs its own liveness
+// heartbeat (web/app.js) and auto-reconnects.
+setInterval(() => {
+  for (const ws of clients) {
+    if (ws.readyState !== ws.OPEN) continue;
+    if (!ws.isAlive) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { /* socket already closing */ }
+  }
+}, 30000);
 
 // A failed listen() (usually EADDRINUSE from an older bridge still running)
 // must produce a readable message instead of a stack trace.

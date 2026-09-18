@@ -108,12 +108,21 @@ function startCardTimer(card) {
   card._timer = setInterval(tick, 1000);
 }
 function stopCardTimer(card, stateText) {
-  if (!card._timer) return;
-  clearInterval(card._timer);
-  card._timer = null;
-  const elapsed = fmtElapsed(Date.now() - card._start);
-  card.timerEl.textContent = elapsed;
-  card.stateEl.textContent = `${stateText} · ${elapsed}`;
+  if (card._timer) {
+    clearInterval(card._timer);
+    card._timer = null;
+  }
+  // Always update the state text, even when no timer was running (the card
+  // may have been created without one) — otherwise it stays stuck on
+  // "running…" while the class already shows done/error.
+  if (card._start) {
+    const elapsed = fmtElapsed(Date.now() - card._start);
+    card.timerEl.textContent = elapsed;
+    card.stateEl.textContent = `${stateText} · ${elapsed}`;
+  } else {
+    card.stateEl.textContent = stateText;
+  }
+  card.stateEl.classList.remove('running');
 }
 
 /* "↑ 8.8k read @ 312 t/s · ↓ 89 write @ 18.6 t/s · $0.0012"
@@ -302,12 +311,18 @@ const chat = $('chat');
 
 /* ───────────────────────── websocket / rpc ───────────────────────── */
 
+let reconnectTimer = null;  // auto-reconnect after a dropped connection
+let reconnectDelay = 1000;  // backoff per failed attempt, capped at 15s
+
 function connect() {
+  if (S.ws && S.ws.readyState === WebSocket.OPEN) return; // already connected
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
 
   ws.onopen = () => {
+    reconnectDelay = 1000; // a healthy connection resets the backoff
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     setConn('on');
     hideBanner();
     initSession(true);
@@ -327,11 +342,47 @@ function connect() {
     // don't sit on "running…" forever.
     markStuckToolCards('connection lost');
     removeCompactionLive();
+    // In-flight RPCs will never get a response — fail them now instead of
+    // making callers wait out their full timeout.
+    for (const [id, p] of [...S.pending]) {
+      S.pending.delete(id);
+      p.reject(new Error('connection lost'));
+    }
     updateStreamUi();
-    showBanner('error', 'Connection to the bridge lost.', 'Retry now', () => connect());
+    showBanner('error', 'Connection to the bridge lost — reconnecting…', 'Retry now', () => connect());
+    scheduleReconnect();
   };
   ws.onerror = () => { /* onclose follows */ };
 }
+
+/* Reconnect automatically with backoff — a manual page reload used to be the
+ * only way to recover from a dropped connection. onopen re-runs initSession,
+ * which re-syncs the whole UI from the bridge, so the desync heals itself. */
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (S.ws && S.ws.readyState === WebSocket.OPEN) return;
+    connect();
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  }, reconnectDelay);
+}
+
+/* Liveness heartbeat: a half-open WebSocket (sleep/wake, WebView2 network
+ * hiccup) may never fire onclose on its own, leaving the UI frozen on a dead
+ * connection. A cheap get_state with a short timeout detects that — if it
+ * never answers, force a close so the onclose path can reconnect. */
+setInterval(() => {
+  const ws = S.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    rpc({ type: 'get_state' }, 10000).catch((e) => {
+      // Only a timeout means the connection is dead; an error response
+      // (e.g. agent restarting) means the bridge is alive.
+      if (!/timed out/.test(e.message)) return;
+      try { ws.close(); } catch { /* already closing */ }
+    });
+  }
+}, 25000);
 
 function send(obj) {
   if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send(JSON.stringify(obj));
@@ -388,9 +439,8 @@ function handleRpcMessage(msg) {
  * exited or the connection dropped, so the command can no longer be running. */
 function markStuckToolCards(label) {
   for (const card of S.toolCards.values()) {
-    if (card._timer) stopCardTimer(card, label);
-    else if (card.stateEl.textContent.startsWith('running')) {
-      card.stateEl.textContent = label;
+    if (card._timer || card.stateEl.textContent.startsWith('running')) {
+      stopCardTimer(card, label);
       card.stateEl.className = 'tool-state error';
     }
   }
@@ -535,7 +585,7 @@ function showLlamaMismatch(srv) {
     ? `pi is configured for ${llamaConfiguredUrl.replace(/^https?:\/\//, '')} (unreachable)`
     : 'pi has not registered it yet';
   showBanner('warn',
-    `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it.`,
+    `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it. pi needs the pi-llama-cpp extension to register it (install with: pi install npm:pi-llama-cpp), then point pi at this server and restart.`,
     'Point pi here & reload',
     () => fixLlamaConfig(srv.url));
   llamaMismatchBanner = true;
@@ -713,9 +763,17 @@ function updateTotals(extraUsage) {
 /* ───────────────────────── chat rendering ───────────────────────── */
 
 function scrollBottom(force) {
-  if (force || S.stickToBottom) chat.scrollTop = chat.scrollHeight;
+  if (force || S.stickToBottom) {
+    lastProgrammaticScroll = Date.now();
+    chat.scrollTop = chat.scrollHeight;
+  }
 }
+let lastProgrammaticScroll = 0;
 chat.addEventListener('scroll', () => {
+  // Ignore scroll events caused by our own pinning: a burst of content that
+  // lands between the programmatic pin and the (async) scroll event would
+  // otherwise flip stickToBottom off and let the view drift up mid-generation.
+  if (Date.now() - lastProgrammaticScroll < 150) return;
   S.stickToBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
 });
 
@@ -801,7 +859,8 @@ function renderAssistantMessage(msg, timing) {
     const s = el('span', 'agent-stats', ` (${stats})`);
     s.title = 'token usage: input+cache read / output written' +
       (timing && timing.elapsedSec ? ` over ${timing.elapsedSec.toFixed(1)}s of streaming` : '');
-    root.querySelector('.who').append(s);
+    // Stats before the action buttons: "Pi · 04:30 PM (↑ 43.6K read · ↓ 523 write) [copy] [speak]"
+    root.querySelector('.who').insertBefore(s, tools);
   }
   addCopyButton(tools, () => textBlocks.join('\n\n'));
   addSpeakButton(tools, () => stripMarkdown(textBlocks.join('\n\n')));
@@ -839,7 +898,8 @@ function makeToolCard(name, opts = {}) {
   const card = el('div', `tool-card${name === 'bash' ? ' bash-card' : ''}`);
   const head = el('div', 'tool-head');
   head.appendChild(el('span', 'tool-name', `${name}`));
-  const stateEl = el('span', 'tool-state', opts.state || 'running…');
+  const state = opts.state || 'running…';
+  const stateEl = el('span', `tool-state${state === 'running…' ? ' running' : ''}`, state);
   head.appendChild(stateEl);
   const timerEl = el('span', 'tool-timer hidden');
   head.appendChild(timerEl);
@@ -1309,7 +1369,7 @@ function startLive() {
   const md = el('div', 'md');
   bubble.appendChild(md);
   const statsEl = el('span', 'agent-stats');
-  root.querySelector('.who').appendChild(statsEl);
+  root.querySelector('.who').insertBefore(statsEl, tools);
   chat.appendChild(root);
   S.live = { root, md, text: '', thinking: '', thinkingEl: null, caret: el('span', 'streaming-caret'),
              startTs: Date.now(), lastUsage: null, statsEl };
@@ -1336,10 +1396,19 @@ function applyDelta(ev) {
     }
   }
   else if (ev.type === 'toolcall_end' && ev.toolCall) {
-    const card = makeToolCard(ev.toolCall.name, { toolCallId: ev.toolCall.id });
-    fillToolBody(card, ev.toolCall.name, ev.toolCall.arguments);
-    L.root.querySelector('.bubble').appendChild(card.card);
-    S.toolCards.set(ev.toolCall.id, card);
+    const existing = S.toolCards.get(ev.toolCall.id);
+    if (existing) {
+      // Reuse the card created by toolcall_start (it already has the live
+      // preview and the elapsed timer) instead of appending a duplicate.
+      existing.toolName = ev.toolCall.name;
+      existing.card.querySelector('.tool-name').textContent = ev.toolCall.name;
+      fillToolBody(existing, ev.toolCall.name, ev.toolCall.arguments);
+    } else {
+      const card = makeToolCard(ev.toolCall.name, { toolCallId: ev.toolCall.id });
+      fillToolBody(card, ev.toolCall.name, ev.toolCall.arguments);
+      L.root.querySelector('.bubble').appendChild(card.card);
+      S.toolCards.set(ev.toolCall.id, card);
+    }
   }
   renderLive();
 }
@@ -1455,6 +1524,24 @@ function updateStreamUi() {
   setConn(S.isStreaming ? 'busy' : 'on');
   if (S.isStreaming) startCtxPoll(); else stopCtxPoll();
   renderQueue();
+  updateLiveDot();
+}
+
+/* Keep the green "live" dot in the session list in sync with streaming state
+ * immediately. A full refreshSessions only runs on session changes or while
+ * idle, so without this the dot would appear late or not at all mid-stream
+ * (it used to only show up after a page reload). */
+function updateLiveDot() {
+  const list = $('session-list');
+  if (!list) return;
+  for (const item of list.querySelectorAll('.session-item.active')) {
+    item.classList.toggle('live', S.isStreaming);
+    const nameRow = item.querySelector('.s-name');
+    if (!nameRow) continue;
+    const dot = nameRow.querySelector('.live-dot');
+    if (S.isStreaming && !dot) nameRow.prepend(el('span', 'live-dot', ''));
+    else if (!S.isStreaming && dot) dot.remove();
+  }
 }
 
 /* Live context ring: while the agent is streaming, poll session stats so the
@@ -1740,15 +1827,18 @@ $('btn-stop').onclick = stopAgent;
 async function stopAgent() {
   if (speechSynthesis.speaking) { speechSynthesis.cancel(); S.speaking = false; return; }
   try {
-    const d = await rpc({ type: 'clear_queue' });
-    const restored = [...((d && d.steering) || []), ...((d && d.followUp) || [])]
-      .map((m) => (typeof m.message === 'string' ? m.message : ''))
+    // pi's RPC has no clear_queue command — the pending queue is tracked
+    // client-side via queue_update events, so restore it from there.
+    const restored = [...S.queue.steering, ...S.queue.followUp]
+      .map((m) => (typeof m === 'string' ? m : ''))
       .filter(Boolean);
+    await rpc({ type: 'abort' });
+    S.queue = { steering: [], followUp: [] };
+    renderQueue();
     if (restored.length) {
       input.value = restored.join('\n---\n') + (input.value ? '\n' + input.value : '');
       autoSize();
     }
-    await rpc({ type: 'abort' });
     toast('Aborted');
   } catch (e) { toast(e.message, 'error'); }
 }

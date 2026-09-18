@@ -398,9 +398,13 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
   background: color-mix(in srgb, #1a2231 calc(var(--ui-alpha) * 100%), transparent);
   border-color: #2a3b57;
 }
-.msg .msg-tools { float: right; margin-left: 8px; }
-.msg .msg-tools .btn { font-size: 11px; padding: 1px 7px; opacity: 0; }
-.msg:hover .msg-tools .btn { opacity: 1; }
+.msg .msg-tools { display: inline-flex; gap: 6px; margin-left: 8px; }
+.msg .msg-tools .btn {
+  font-size: 11px; padding: 1px 8px;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.msg .msg-tools .btn:hover { background: color-mix(in srgb, var(--accent) 18%, var(--bg-hover)); }
 
 .md p { margin: 0 0 8px; }
 .md p:last-child { margin-bottom: 0; }
@@ -444,6 +448,10 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .tool-card .tool-state { margin-left: auto; font-size: 11px; color: var(--text-dim); }
 .tool-card .tool-state.done { color: var(--green); }
 .tool-card .tool-state.error { color: var(--red); }
+/* "running…" bobs gently up and down so a live tool card reads as active
+ * instead of a frozen label. */
+@keyframes tool-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
+.tool-card .tool-state.running { animation: tool-bob 1.1s ease-in-out infinite; }
 .tool-card .tool-body {
   border-top: 1px solid var(--border); padding: 8px 10px;
   font-family: var(--mono); font-size: 12px; white-space: pre-wrap;
