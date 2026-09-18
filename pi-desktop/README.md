@@ -46,19 +46,19 @@ first build takes a while (it compiles the C++ React Native Windows runtime).
 Or by hand:
 
 ```bat
-cd pi-mobile
+cd pi-desktop
 npm install
 npm run windows:release     :: Release + JS bundle, runs standalone
 npm run windows             :: Debug, needs "npm start" (Metro) in another shell
 ```
 
-The Release build lands in `pi-mobile\windows\x64\Release\PiAgent.exe` and
+The Release build lands in `pi-desktop\windows\x64\Release\PiAgent.exe` and
 embeds the JS bundle (`Bundle\index.windows.bundle`), so it needs no dev server.
 
 ### Android / iOS
 
 ```bash
-cd pi-mobile
+cd pi-desktop
 npm start                   # Metro, then press "a" for Android
 npm run android
 npm run ios                 # macOS only
@@ -164,7 +164,7 @@ the ▤ button in the header.
 ## Project layout
 
 ```
-pi-mobile/
+pi-desktop/
 ├── App.js                     # app shell, chat, modals, event wiring
 ├── index.js                   # AppRegistry entry
 ├── app.json                   # app name / display name

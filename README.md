@@ -34,7 +34,7 @@ Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-
 
 > This machine runs Forgejo on port 3000, so the WebUI uses **http://localhost:3080**.
 
-There are two clients: the **browser UI** (`start-webui.bat`) and the **native mobile app** (`start-app.bat`, source in `pi-mobile/`).
+There are two clients: the **browser UI** (`start-webui.bat`) and the **native mobile app** (`start-app.bat`, source in `pi-desktop/`).
 
 ### Choosing the agent source (first run)
 
@@ -74,9 +74,9 @@ npm start                # serves http://localhost:3080 by default (set PORT to 
 
 Env vars for the bridge: `PORT` (3000), `PI_COMMAND` (default `pi --mode rpc`), `WORKSPACE_DIR` (agent cwd), `PI_SESSION_DIR` (default `~/.pi/agent/sessions`).
 
-### Native desktop app (pi-mobile/)
+### Native desktop app (pi-desktop/)
 
-The `pi-mobile/` folder is a standalone **React Native** app targeting **Windows**
+The `pi-desktop/` folder is a standalone **React Native** app targeting **Windows**
 (as well as Android/iOS from the same code) — the same bridge, the same RPC
 protocol, plus the one thing a browser cannot do: play the real Instagram /
 TikTok / YouTube Shorts feeds in-app (a native `WebView` is a top-level browser
@@ -93,12 +93,12 @@ That checks the bridge is up, builds the app if needed, and launches it:
   works on Windows)
 
 The first run compiles the C++ React Native Windows runtime and takes 5-20
-minutes; afterwards `pi-mobile\windows\x64\Release\PiAgent.exe` starts directly.
+minutes; afterwards `pi-desktop\windows\x64\Release\PiAgent.exe` starts directly.
 
 On Windows the shorts panel opens feeds in a real browser window, because
 React Native Windows has no WebView component and `react-native-webview`'s
 Windows target is legacy UWP-only. The seamless in-app feed is mobile-only today.
-See `pi-mobile/README.md` for the full build notes and the WebView2 route.
+See `pi-desktop/README.md` for the full build notes and the WebView2 route.
 
 ### Try it without any agent (UI smoke test)
 

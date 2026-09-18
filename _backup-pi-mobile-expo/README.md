@@ -25,7 +25,7 @@ chat. No new tabs, no popups, no "open in app" round-trips.
 ## Running it
 
 ```bash
-cd pi-mobile
+cd pi-desktop
 npm install
 npx expo start          # then scan the QR with Expo Go, or press "a" for Android
 ```
@@ -96,7 +96,7 @@ allow inbound TCP on the bridge port.
 ## Project layout
 
 ```
-pi-mobile/
+pi-desktop/
 ├── App.js                 # app shell, chat, modals, event wiring
 ├── index.js               # Expo entry (registerRootComponent)
 ├── app.json               # Expo config (cleartext + local networking enabled)

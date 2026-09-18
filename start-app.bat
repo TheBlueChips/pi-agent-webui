@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 title Pi Agent - Desktop App (React Native for Windows)
 rem ---------------------------------------------------------------------------
-rem  Launches the native Pi Agent app (the React Native one in pi-mobile\).
+rem  Launches the native Pi Agent app (the React Native one in pi-desktop\).
 rem
 rem  This is the Windows build of the same app that runs on Android/iOS - one
 rem  React Native codebase, three targets. It talks to the same bridge as the
@@ -12,8 +12,8 @@ rem  The first run builds the app, which takes a while: it compiles the C++
 rem  React Native Windows runtime and the native modules.
 rem ---------------------------------------------------------------------------
 
-set "EXE=%~dp0pi-mobile\windows\x64\Release\PiAgent.exe"
-set "PROJ=%~dp0pi-mobile"
+set "EXE=%~dp0pi-desktop\windows\x64\Release\PiAgent.exe"
+set "PROJ=%~dp0pi-desktop"
 
 rem --- is the bridge up? -----------------------------------------------------
 set "BRIDGE_UP="
@@ -63,7 +63,7 @@ set "BUILD_RC=!errorlevel!"
 popd
 if not "!BUILD_RC!"=="0" (
   echo.
-  echo   Build failed. See pi-mobile\README.md ^> "Building for Windows".
+  echo   Build failed. See pi-desktop\README.md ^> "Building for Windows".
   pause
   exit /b 1
 )
