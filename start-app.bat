@@ -42,6 +42,19 @@ if exist "%EXE%" goto launch
 
 echo.
 echo   The app has not been built yet.
+if not exist "%PROJ%\node_modules" (
+  echo   Installing dependencies first (first run only)...
+  pushd "%PROJ%"
+  call npm install --no-fund --no-audit
+  set "INSTALL_RC=!errorlevel!"
+  popd
+  if not "!INSTALL_RC!"=="0" (
+    echo.
+    echo   npm install failed - check your network / npm registry.
+    pause
+    exit /b 1
+  )
+)
 echo   Building it now. This can take 5-20 minutes the first time.
 echo.
 pushd "%PROJ%"
