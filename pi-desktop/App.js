@@ -641,6 +641,8 @@ export default function App() {
               <ShortsPanel
                 provider={shortsProvider}
                 onProviderChange={setShortProvider}
+                autoOpen={autoOpenShorts}
+                onAutoOpenToggle={toggleAutoOpenShorts}
                 onClose={() => { autoShortsRef.current = false; setShortsOpen(false); }}
                 compact={!landscape}
                 expanded={shortsExpanded}
@@ -680,10 +682,6 @@ export default function App() {
               placeholderTextColor={C.dim}
               keyboardType="number-pad"
             />
-            <TouchableOpacity style={[styles.modalRow, { marginTop: 14 }]} onPress={toggleAutoOpenShorts}>
-              <Text style={styles.modalRowText}>Auto-open Shorts while the agent is running</Text>
-              {autoOpenShorts ? <Text style={{ color: C.accent }}>✓</Text> : null}
-            </TouchableOpacity>
             </ScrollView>
             <TouchableOpacity style={styles.primaryBtn} onPress={applyConnection}>
               <Text style={styles.primaryBtnText}>Connect</Text>

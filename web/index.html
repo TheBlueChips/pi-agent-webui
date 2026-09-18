@@ -38,6 +38,9 @@
 
     <div id="banner" class="banner hidden"></div>
 
+    <!-- "Viewing another session" banner (the agent runs in its own). -->
+    <div id="view-banner" class="view-banner hidden"></div>
+
     <div id="chat"></div>
 
     <div id="queue-bar" class="queue-bar hidden"></div>
@@ -292,6 +295,24 @@
       <button id="btn-prov-discover" class="btn small" title="Fetch the model list from the base URL above and fill the Models field">discover models</button>
       <button id="btn-prov-test" class="btn small" title="Send a minimal completion to verify the URL + API + key actually work (catches misconfigured endpoints that return empty replies)">test connection</button>
       <button id="btn-prov-add" class="btn small primary">add / update in pi</button>
+    </div>
+
+    <!-- pi /login: credentials in ~/.pi/agent/auth.json -->
+    <div class="prov-section" style="margin-top:14px; border-top:1px solid var(--border); padding-top:10px">
+      <p class="hint" style="margin-top:2px">Credentials in <code>~/.pi/agent/auth.json</code> — what pi's <code>/login</code> saves. “login” stores an API key (logs the provider in), “logout” removes it. The agent restarts to pick up the change.</p>
+      <div id="auth-providers-list" class="prov-list"></div>
+      <div class="settings-grid">
+        <label>Provider</label>
+        <input id="auth-provider" type="text" list="auth-provider-ids" placeholder="anthropic" autocomplete="off">
+        <datalist id="auth-provider-ids"></datalist>
+        <label>API key</label>
+        <input id="auth-key" type="password" placeholder="sk-…" autocomplete="off">
+      </div>
+      <div class="rate-row prov-actions">
+        <button id="btn-auth-login" class="btn small primary" title="Store the key in auth.json — same as /login → Use an API key">login (save key)</button>
+        <button id="btn-auth-logout" class="btn small" title="Remove the provider's credentials from auth.json — same as /logout">logout (remove)</button>
+      </div>
+      <p class="hint">Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
     </div>
   </div>
   <div class="dialog-buttons">

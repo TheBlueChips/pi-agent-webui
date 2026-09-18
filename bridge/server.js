@@ -514,6 +514,46 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ sessionDir: SESSION_DIR, sessions: await scanSessions() }));
     return;
   }
+  // Read-only transcript of a session file. Lets the WebUI browse other
+  // sessions while the shared agent keeps running in its own session
+  // (the live view of the running session stays in the UI's DOM cache).
+  // Local session dirs only — docker dirs would need `docker exec cat`.
+  if (req.url.startsWith('/api/session-messages')) {
+    const p = new URL(req.url, 'http://x').searchParams.get('path') || '';
+    if (!p) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing path' }));
+      return;
+    }
+    if (parseSessionDir()) {
+      res.writeHead(501, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'docker session dirs are not supported here' }));
+      return;
+    }
+    const root = path.resolve(SESSION_DIR);
+    const resolved = path.resolve(root, p);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'path must stay inside the session dir' }));
+      return;
+    }
+    try {
+      const messages = [];
+      for (const line of fs.readFileSync(resolved, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        let e; try { e = JSON.parse(line); } catch { continue; }
+        if (e && e.type === 'message' && e.message) {
+          messages.push({ ...e.message, timestamp: e.message.timestamp ?? e.timestamp });
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ path: p, messages }));
+    } catch (e) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `read failed: ${e.message}` }));
+    }
+    return;
+  }
   if (req.url.startsWith('/api/config')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -872,6 +912,113 @@ const server = http.createServer(async (req, res) => {
   }
 
   // pi custom providers: read / upsert / remove entries in ~/.pi/agent/models.json
+  // ── pi /login equivalent: credentials in ~/.pi/agent/auth.json ──
+  // pi's /login stores API keys (and OAuth tokens) in auth.json, keyed by
+  // provider id. Storing a key here logs the provider in; removing it logs
+  // out. The agent must restart to pick up credential changes (the client
+  // does that after a successful login/logout).
+  const BUILTIN_PROVIDER_IDS = [
+    'anthropic', 'ant-ling', 'amazon-bedrock', 'azure-openai-responses', 'baseten',
+    'cerebras', 'cloudflare-ai-gateway', 'cloudflare-workers-ai', 'deepseek',
+    'fireworks', 'github-copilot', 'google', 'groq', 'huggingface', 'kimi-coding',
+    'minimax', 'minimax-cn', 'mistral', 'nvidia', 'openai', 'openrouter',
+    'opencode', 'opencode-go', 'qwen-token-plan', 'qwen-token-plan-individual',
+    'radius', 'together', 'vercel-ai-gateway', 'xai', 'zai', 'zai-coding-cn',
+  ];
+  if (req.url.startsWith('/api/auth-providers')) {
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    const auth = readJsonSafe(PI_AUTH_FILE) || {};
+    const store = readJsonSafe(path.join(PI_AGENT_DIR, 'models-store.json')) || {};
+    const modelsFile = readJsonSafe(PI_MODELS_FILE) || {};
+    const ids = new Set([
+      ...Object.keys(auth),
+      ...Object.keys(store.providers || {}),
+      ...Object.keys(modelsFile.providers || {}),
+      ...BUILTIN_PROVIDER_IDS,
+    ]);
+    const providers = {};
+    for (const id of ids) {
+      const a = auth[id];
+      const custom = (modelsFile.providers || {})[id];
+      const entry = {
+        name: (custom && custom.name) || (store.providers && store.providers[id] && store.providers[id].name) || null,
+        // Only api_key/oauth entries are logins. Other shapes (e.g. the
+        // pi-llama-cpp extension's `llama.cpp` env block) must NOT be offered
+        // as "logout", or removing them would delete real configuration.
+        auth: a ? (a.type === 'api_key' ? 'key' : a.type === 'oauth' ? 'oauth' : 'other') : 'none',
+        keyMasked: a && typeof a.key === 'string' && a.key.length >= 4 ? `•••${a.key.slice(-4)}` : null,
+        custom: !!custom,
+      };
+      providers[id] = entry;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ file: PI_AUTH_FILE, providers }));
+    return;
+  }
+  if (req.url.startsWith('/api/auth-login')) {
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const b = JSON.parse(body || '{}');
+          const id = String(b.provider || '').trim();
+          const key = String(b.key || '').trim();
+          if (!PROVIDER_ID_RE.test(id)) throw new Error('provider id must be 1-64 chars: letters, digits, . _ -');
+          if (!key) throw new Error('API key is empty');
+          const auth = readJsonSafe(PI_AUTH_FILE) || {};
+          auth[id] = { type: 'api_key', key };
+          try {
+            fs.writeFileSync(PI_AUTH_FILE, JSON.stringify(auth, null, 2));
+          } catch (e) {
+            throw new Error(`write failed: ${e.message}`);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, file: PI_AUTH_FILE, provider: id }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    if (req.method === 'DELETE') {
+      const id = new URL(req.url, 'http://x').searchParams.get('provider') || '';
+      if (!PROVIDER_ID_RE.test(id)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid provider id' }));
+        return;
+      }
+      const auth = readJsonSafe(PI_AUTH_FILE) || {};
+      if (!(id in auth)) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `no credentials for "${id}" in auth.json` }));
+        return;
+      }
+      // Refuse to delete entries that are not logins (env blocks, etc.) —
+      // deleting those would silently remove working configuration.
+      const t = auth[id] && auth[id].type;
+      if (t !== 'api_key' && t !== 'oauth') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `"${id}" is not an API key or OAuth login (auth.json entry type: ${t || 'none'}) — remove it by hand if you really mean to` }));
+        return;
+      }
+      delete auth[id];
+      try {
+        fs.writeFileSync(PI_AUTH_FILE, JSON.stringify(auth, null, 2));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, provider: id }));
+      return;
+    }
+    res.writeHead(405).end();
+    return;
+  }
+
   if (req.url.startsWith('/api/pi-providers')) {
     if (req.method === 'GET') {
       const file = readJsonSafe(PI_MODELS_FILE) || {};

@@ -114,13 +114,17 @@ function stopCardTimer(card, stateText) {
   }
   // Always update the state text, even when no timer was running (the card
   // may have been created without one) — otherwise it stays stuck on
-  // "running…" while the class already shows done/error.
-  if (card._start) {
-    const elapsed = fmtElapsed(Date.now() - card._start);
-    card.timerEl.textContent = elapsed;
-    card.stateEl.textContent = `${stateText} · ${elapsed}`;
+  // "running…" while the class already shows done/error. The label lives in
+  // its own span so the "running…" text can bob while the elapsed time sits
+  // still next to it.
+  const label = card.stateEl.querySelector('.tool-state-label');
+  const suffix = card._start ? ` · ${fmtElapsed(Date.now() - card._start)}` : '';
+  if (card._start) card.timerEl.textContent = fmtElapsed(Date.now() - card._start);
+  if (label) {
+    label.textContent = stateText;
+    card.stateEl.replaceChildren(...(suffix ? [label, document.createTextNode(suffix)] : [label]));
   } else {
-    card.stateEl.textContent = stateText;
+    card.stateEl.textContent = stateText + suffix;
   }
   card.stateEl.classList.remove('running');
 }
@@ -295,6 +299,9 @@ const S = {
   stickToBottom: true,
   live: null,              // in-flight assistant render {root, text, thinking, tools}
   toolCards: new Map(),    // toolCallId -> {card, body, stateEl}
+  viewSession: null,       // session path being viewed (null = the agent's own session)
+  liveDetached: null,      // { path, frag } — running session's live DOM, parked while viewing another
+  sessionsList: [],        // last /api/sessions payload (path -> name lookup for the view banner)
   compactionLive: null,    // live "compacting…" block {root, t}
   lastCompaction: null,    // last compaction_end result (for the marker's "after" count)
   // Compactions we watched happen in this page session. Each is anchored to the
@@ -302,6 +309,7 @@ const S = {
   // bottom of the transcript on every turn.
   compactionMarks: [],     // [{ summary, tokensBefore, estimatedTokensAfter, at }]  (at = ms)
   ctxStats: null,          // last authoritative contextUsage from get_session_stats
+  ctxDisplayTokens: null,  // high-water mark: the largest token count the ring has shown
   bashCards: new Map(),    // bash req id -> {body}
   initialized: false,
   totals: { read: 0, write: 0 },  // session token totals
@@ -452,6 +460,7 @@ function onAgentExit(msg) {
   // Any tool card still showing "running…" is stuck — the agent is gone.
   markStuckToolCards('interrupted');
   removeCompactionLive();
+  updateStreamUi(); // live dot, Stop button, ctx poll, view banner
   if (msg.error) {
     showBanner('error', msg.error, 'Retry', () => send({ bridge: 'restart' }));
   } else {
@@ -704,7 +713,16 @@ async function refreshStats() {
     $('stat-cost').textContent = cost != null
       ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`
       : '';
-    setCtxRing(d && d.contextUsage);
+    let cu = d && d.contextUsage;
+    // While streaming, the live estimate (liveCtxRing) is ahead of the
+    // authoritative number, which only moves when the agent reports usage.
+    // Without this clamp the 1s poll would pull the ring back to the stale
+    // base every second (the "jumping back" sawtooth), so the displayed
+    // count only ever climbs while the model writes.
+    if (S.isStreaming && cu && cu.tokens != null && S.ctxDisplayTokens != null && cu.tokens < S.ctxDisplayTokens) {
+      cu = { ...cu, tokens: S.ctxDisplayTokens, percent: cu.contextWindow ? (S.ctxDisplayTokens / cu.contextWindow) * 100 : null };
+    }
+    setCtxRing(cu);
   } catch { /* ignore */ }
   updateTotals();
 }
@@ -731,11 +749,13 @@ function setCtxRing(cu, store = true) {
     wrap.title = 'Context unknown — waiting for the next response';
     wrap.classList.remove('warn', 'critical');
     if (label) label.textContent = '–';
+    S.ctxDisplayTokens = null;
     return;
   }
   const p = cu.percent != null
     ? Math.max(0, Math.min(100, cu.percent))
     : Math.max(0, Math.min(100, (tokens / max) * 100));
+  S.ctxDisplayTokens = tokens;
   fg.setAttribute('stroke-dasharray', `${(C * p / 100).toFixed(1)} ${C.toFixed(1)}`);
   txt.textContent = p >= 10 ? String(Math.round(p)) : p.toFixed(1);
   wrap.title = `Context: ${formatTok(tokens)} / ${formatTok(max)} tokens (${p.toFixed(1)}%)`;
@@ -745,11 +765,15 @@ function setCtxRing(cu, store = true) {
 }
 
 /* Estimate the in-flight context growth (≈4 chars/token) and add it to the
- * last authoritative stats so the ring climbs while the model writes. */
+ * last authoritative stats so the ring climbs while the model writes. The
+ * base is the high-water mark, not the raw authoritative number: when a new
+ * assistant message starts its estimate restarts at 0, and using the raw
+ * base would visibly snap the ring back down. */
 function liveCtxRing(extraTokens) {
   if (!S.ctxStats) return;
   const b = S.ctxStats;
-  const tokens = (b.tokens || 0) + (extraTokens || 0);
+  const base = Math.max(b.tokens || 0, S.ctxDisplayTokens || 0);
+  const tokens = base + (extraTokens || 0);
   setCtxRing({ ...b, tokens, percent: b.contextWindow ? (tokens / b.contextWindow) * 100 : null }, false);
 }
 
@@ -763,6 +787,7 @@ function updateTotals(extraUsage) {
 /* ───────────────────────── chat rendering ───────────────────────── */
 
 function scrollBottom(force) {
+  if (!force && S.liveDetached) return; // the live view is parked; don't scroll the visible session
   if (force || S.stickToBottom) {
     lastProgrammaticScroll = Date.now();
     chat.scrollTop = chat.scrollHeight;
@@ -797,9 +822,9 @@ function makeMsgShell(role, who) {
       head.appendChild(av);
     }
     head.appendChild(el('span', 'agent-name-label', SET.agentName || 'pi'));
-    head.appendChild(document.createTextNode(` · ${who}`));
+    head.appendChild(el('span', 'who-text', ` · ${who}`));
   } else {
-    head.appendChild(document.createTextNode(who));
+    head.appendChild(el('span', 'who-text', who));
   }
   const tools = el('span', 'msg-tools');
   head.appendChild(tools);
@@ -874,7 +899,9 @@ function renderAssistantMessage(msg, timing) {
     } else if (block.type === 'thinking') {
       bubble.appendChild(makeThinking(block.thinking || ''));
     } else if (block.type === 'toolCall') {
-      const card = makeToolCard(block.name, { toolCallId: block.id });
+      // History cards are finished — a "running…" label (with its bob
+      // animation) on a completed message would read as a stuck live card.
+      const card = makeToolCard(block.name, { toolCallId: block.id, state: 'done' });
       fillToolBody(card, block.name, block.arguments);
       bubble.appendChild(card.card);
       S.toolCards.set(block.id, card);
@@ -899,7 +926,8 @@ function makeToolCard(name, opts = {}) {
   const head = el('div', 'tool-head');
   head.appendChild(el('span', 'tool-name', `${name}`));
   const state = opts.state || 'running…';
-  const stateEl = el('span', `tool-state${state === 'running…' ? ' running' : ''}`, state);
+  const stateEl = el('span', `tool-state${state === 'running…' ? ' running' : ''}`);
+  stateEl.appendChild(el('span', 'tool-state-label', state));
   head.appendChild(stateEl);
   const timerEl = el('span', 'tool-timer hidden');
   head.appendChild(timerEl);
@@ -1142,14 +1170,40 @@ function renderCompactionBlock(result, reason) {
 }
 
 async function refreshMessages() {
-  const d = await rpc({ type: 'get_messages' });
-  const msgs = asArray(d, 'messages');
+  let msgs;
+  if (S.viewSession) {
+    // Viewing another session while the agent runs in its own: read it
+    // read-only from the file (the get_messages RPC only knows the agent's
+    // own session).
+    const r = await fetch(`/api/session-messages?path=${encodeURIComponent(S.viewSession)}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
+    msgs = d.messages || [];
+  } else {
+    const d = await rpc({ type: 'get_messages' });
+    msgs = asArray(d, 'messages');
+  }
   // Keep the reading position (distance from the bottom) across the re-render.
   const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
   chat.innerHTML = '';
-  for (const card of S.toolCards.values()) if (card._timer) stopCardTimer(card, 'done');
-  S.toolCards.clear();
-  removeCompactionLive();
+  if (!S.viewSession) {
+    // Only the agent's own session owns the live tool cards; a read-only
+    // render of another session must not touch them. Normally this re-render
+    // wipes the cards (they are rebuilt from the message content below), but
+    // if a live message is in flight its cards must survive: they keep
+    // receiving tool_execution_update/end events and are re-attached with
+    // S.live below.
+    const liveCards = S.live
+      ? [...S.toolCards.entries()].filter(([, c]) => S.live.root.contains(c.card))
+      : [];
+    const liveIds = new Set(liveCards.map(([id]) => id));
+    for (const [id, card] of S.toolCards) {
+      if (!liveIds.has(id) && card._timer) stopCardTimer(card, 'done');
+    }
+    S.toolCards.clear();
+    for (const [id, card] of liveCards) S.toolCards.set(id, card);
+    removeCompactionLive();
+  }
   // session token totals summed from per-message usage
   let read = 0, write = 0;
   for (const m of msgs) {
@@ -1179,29 +1233,39 @@ async function refreshMessages() {
   // Put each compaction we watched happen back where it happened: after the last
   // message that already existed when it ran. Messages produced later have a
   // newer timestamp, so they render after the marker and it stays put instead of
-  // being re-appended to the bottom on every turn.
-  const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
-  for (const k of S.compactionMarks) {
-    let target = null;
-    if (k.at != null) {
-      for (const n of plain) {
-        const ts = Number(n.dataset.ts);
-        if (ts && ts <= k.at) target = n;
+  // being re-appended to the bottom on every turn. (Agent-session markers only —
+  // they don't belong in a read-only render of another session.)
+  if (!S.viewSession) {
+    const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
+    for (const k of S.compactionMarks) {
+      let target = null;
+      if (k.at != null) {
+        for (const n of plain) {
+          const ts = Number(n.dataset.ts);
+          if (ts && ts <= k.at) target = n;
+        }
       }
+      const node = buildCompactionSummary(k, { live: true, count: S.compactionMarks.length });
+      if (target) target.after(node);
+      else if (plain.length) plain[0].before(node);
+      else chat.appendChild(node);
     }
-    const node = buildCompactionSummary(k, { live: true, count: S.compactionMarks.length });
-    if (target) target.after(node);
-    else if (plain.length) plain[0].before(node);
-    else chat.appendChild(node);
+    // A compaction still in flight keeps its "compacting…" indicator: the
+    // re-render above wiped the DOM node it lived in.
+    if (S.compacting && !S.compactionLive) S.compactionLive = renderCompactionLive();
   }
-  // A compaction still in flight keeps its "compacting…" indicator: the
-  // re-render above wiped the DOM node it lived in.
-  if (S.compacting && !S.compactionLive) S.compactionLive = renderCompactionLive();
   S.totals = { read, write };
   updateTotals();
   // Re-wire fork indexes for user messages in order.
   const userEls = [...chat.querySelectorAll('.msg.user')];
   userEls.forEach((e, i) => e.dataset.forkIdx = String(i));
+  // Back on the agent's own session mid-stream: re-attach the in-flight live
+  // message (it was parked in S.liveDetached while viewing elsewhere). Only
+  // when the agent is still in the session the live view belongs to.
+  if (!S.viewSession && S.liveDetached && S.live && S.liveDetached.path === S.state.sessionFile) {
+    chat.appendChild(S.liveDetached.frag);
+  }
+  S.liveDetached = null;
   if (S.stickToBottom) scrollBottom(true);
   else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
 }
@@ -1374,6 +1438,9 @@ function startLive() {
   bubble.appendChild(md);
   const statsEl = el('span', 'agent-stats');
   root.querySelector('.who').insertBefore(statsEl, tools);
+  // The "…" dots bob up and down while the agent generates/reads.
+  root.querySelector('.who-text').replaceChildren(
+    document.createTextNode(' · '), el('span', 'streaming-dots', '…'));
   chat.appendChild(root);
   S.live = { root, md, text: '', thinking: '', thinkingEl: null, caret: el('span', 'streaming-caret'),
              startTs: Date.now(), lastUsage: null, statsEl };
@@ -1472,7 +1539,11 @@ function finalizeLive(finalMsg) {
     const prefillSec = L.firstDeltaTs ? (L.firstDeltaTs - L.startTs) / 1000 : null;
     S.live.root.remove();
     S.live = null;
-    if (finalMsg && finalMsg.role === 'assistant') {
+    if (S.liveDetached) {
+      // Viewing another session: the final message is already in the session
+      // file, so the read-only render will show it. Drop the live state; the
+      // agent session's totals refresh when the user switches back.
+    } else if (finalMsg && finalMsg.role === 'assistant') {
       const usage = finalMsg.usage || L.lastUsage;
       if (usage) {
         S.totals.read += (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0);
@@ -1526,9 +1597,34 @@ function updateStreamUi() {
   // agent is generating, so you can stop generation or steer/queue a message.
   $('btn-stop').classList.toggle('hidden', !S.isStreaming);
   setConn(S.isStreaming ? 'busy' : 'on');
+  // Reset the ring's high-water mark on every streaming transition so the
+  // final authoritative total can settle (even if the estimate overshot).
+  S.ctxDisplayTokens = null;
   if (S.isStreaming) startCtxPoll(); else stopCtxPoll();
   renderQueue();
   updateLiveDot();
+  updateViewBanner();
+}
+
+// Banner shown while the user is viewing a session other than the agent's own.
+function updateViewBanner() {
+  const b = $('view-banner');
+  if (!b) return;
+  if (!S.viewSession) {
+    b.classList.add('hidden');
+    b.textContent = '';
+    return;
+  }
+  const base = S.viewSession.split(/[\\/]/).pop();
+  const s = (S.sessionsList || []).find((x) => x.path === S.viewSession || x.fileName === base);
+  const name = (s && s.name) || base.replace(/\.jsonl$/, '');
+  b.classList.remove('hidden');
+  b.textContent = S.isStreaming
+    ? `Viewing “${name}” — the agent is still running in its own session (green dot in the list) and keeps going in the background. `
+    : `Viewing “${name}” — read-only. The agent is in its own session; click it in the list to switch back. `;
+  const btn = el('button', 'btn small', 'switch back');
+  btn.onclick = () => switchToSession(S.state.sessionFile);
+  b.appendChild(btn);
 }
 
 /* Keep the green "live" dot in the session list in sync with streaming state
@@ -1624,6 +1720,15 @@ async function sendCurrent() {
   if (text.startsWith('!') && text.length > 1) {
     sendBash(text.slice(1).trim());
     resetComposer();
+    return;
+  }
+
+  // Prompts go to the agent's own session — never to the one being viewed.
+  // (!bash above is session-independent and stays allowed.)
+  if (S.viewSession && !text.startsWith('/')) {
+    toast(S.isStreaming
+      ? 'The agent is running in another session — click it in the list (green dot) to switch back before sending'
+      : 'You are viewing another session — switch back before sending');
     return;
   }
 
@@ -2464,6 +2569,7 @@ function renderSessions(sessions) {
   const list = $('session-list');
   const filter = ($('session-filter').value || '').toLowerCase();
   list.innerHTML = '';
+  S.sessionsList = sessions;
   const current = S.state.sessionFile;
   // Fill the topbar name from the session's derived title (first user message)
   // when pi hasn't set an explicit session name and we're showing the raw
@@ -2482,7 +2588,10 @@ function renderSessions(sessions) {
   for (const s of shown) {
     const item = el('div', 'session-item');
     const isCurrent = current && (s.path === current || s.fileName === current.split(/[\\/]/).pop());
-    if (isCurrent) item.classList.add('active');
+    const isViewed = S.viewSession
+      ? (s.path === S.viewSession || s.fileName === S.viewSession.split(/[\\/]/).pop())
+      : false;
+    if (isCurrent || isViewed) item.classList.add('active');
     if (isCurrent && S.isStreaming) item.classList.add('live');
     const nameRow = el('div', 's-name');
     if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
@@ -2498,18 +2607,65 @@ $('session-filter').oninput = () => refreshSessions();
 $('btn-refresh-sessions').onclick = () => refreshSessions();
 
 async function switchToSession(sessionPath) {
-  if (S.isStreaming && sessionPath !== S.state.sessionFile) {
-    const ok = window.confirm('The agent is still running in this session.\nSwitching will stop the current run. Continue?');
-    if (!ok) return;
-    try { await rpc({ type: 'abort' }); } catch { /* best effort */ }
+  const agentSession = S.state.sessionFile;
+  if (sessionPath === agentSession) {
+    if (!S.viewSession) return; // already here
+    // Coming back to the agent's own session: re-render it and re-attach the
+    // live view (if the agent is still running).
+    S.viewSession = null;
+    await refreshMessages();
+    updateViewBanner();
+    return;
   }
+  if (S.isStreaming) {
+    // The agent is running in its own session. Keep it running in the
+    // background: park the live DOM (deltas keep landing in it) and view the
+    // target session read-only from its file. The green dot in the session
+    // list shows which session is still running.
+    if (S.live) {
+      const frag = document.createDocumentFragment();
+      frag.appendChild(S.live.root); // detaches it from the visible chat
+      S.liveDetached = { path: agentSession, frag };
+    }
+    S.viewSession = sessionPath;
+    await renderSessionFromDisk(sessionPath);
+    updateViewBanner();
+    return;
+  }
+  // Agent is idle: move it to the selected session so input works there.
   try {
     await rpc({ type: 'switch_session', sessionPath });
     S.state.sessionFile = sessionPath;
+    S.viewSession = null;
     $('session-name').value = '';
     await initSession(false);
     toast('Session switched');
-  } catch (e) { toast(`Switch failed: ${e.message}`, 'error'); }
+  } catch (e) {
+    toast(`Switch failed: ${e.message}`, 'error');
+  }
+}
+
+// Read-only render of another session's transcript straight from its file.
+async function renderSessionFromDisk(sessionPath) {
+  try {
+    const r = await fetch(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
+    const msgs = d.messages || [];
+    const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+    chat.innerHTML = '';
+    for (const m of msgs) {
+      if (m.role === 'user') renderUserMessage(m);
+      else if (m.role === 'assistant') renderAssistantMessage(m);
+      else if (m.role === 'toolResult') renderToolResult(m);
+      else if (m.role === 'bashExecution') renderBashExecution(m);
+      else if (m.role === 'compactionSummary') renderCompactionSummary(m);
+    }
+    if (S.stickToBottom) scrollBottom(true);
+    else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
+  } catch (e) {
+    toast(`Could not load session: ${e.message}`, 'error');
+  }
 }
 
 $('btn-new-session').onclick = async () => {
@@ -2776,6 +2932,7 @@ function openSettings() {
   $('set-auto-continue').checked = SET.autoContinueAfterCompaction !== false;
   populateTtsVoiceSelect();
   loadPiProviders();
+  loadAuthProviders();
   $('settings-dialog').showModal();
 }
 
@@ -3128,6 +3285,117 @@ $('btn-prov-add').onclick = async () => {
   } finally {
     btn.disabled = false;
   }
+};
+
+/* ───────────────────────── pi /login (auth.json) ───────────────────────── */
+
+// Credentials pi's /login saves: ~/.pi/agent/auth.json, keyed by provider id.
+// "login" = store an API key, "logout" = remove it. The agent restarts after
+// either, because it reads auth.json at startup.
+async function loadAuthProviders() {
+  const list = $('auth-providers-list');
+  const dl = $('auth-provider-ids');
+  if (!list || !dl) return;
+  list.innerHTML = '';
+  try {
+    const d = await fetch('/api/auth-providers').then((r) => r.json());
+    const provs = Object.entries(d.providers || {});
+    dl.innerHTML = '';
+    for (const [id] of provs) dl.appendChild(el('option', null, id));
+    if (!provs.length) {
+      list.appendChild(el('div', 'prov-empty', 'no providers found'));
+      return;
+    }
+    for (const [id, p] of provs) {
+      const row = el('div', 'prov-row');
+      const info = el('div', 'prov-info');
+      info.appendChild(el('div', 'prov-id', p.name || id));
+      const status = p.auth === 'key'
+        ? `key ${p.keyMasked || ''} ✓`
+        : p.auth === 'oauth' ? 'OAuth ✓'
+        : p.auth === 'other' ? 'configured (not an API key login)'
+        : 'no credentials';
+      info.appendChild(el('div', 'prov-meta', `${id} · ${status}${p.custom ? ' · custom' : ''}`));
+      const btn = el('button', 'btn small', p.auth === 'none' ? 'login' : p.auth === 'other' ? 'no login' : 'logout');
+      btn.title = p.auth === 'none'
+        ? `Fill the Provider field with "${id}" and save a key below`
+        : p.auth === 'other'
+          ? `"${id}" is configured in auth.json but is not an API key/OAuth login — remove it by hand`
+          : `Remove "${id}" credentials from auth.json (like /logout)`;
+      if (p.auth === 'other') {
+        btn.disabled = true;
+        btn.style.opacity = '.5';
+        btn.style.cursor = 'default';
+      } else {
+        btn.onclick = () => {
+          if (p.auth === 'none') {
+            $('auth-provider').value = id;
+            $('auth-key').focus();
+          } else {
+            authLogout(id);
+          }
+        };
+      }
+      row.append(info, btn);
+      list.appendChild(row);
+    }
+  } catch {
+    list.innerHTML = '';
+    list.appendChild(el('div', 'prov-empty', 'bridge offline'));
+  }
+}
+
+// Restart the shared agent so it re-reads auth.json (same mechanism the
+// llama.cpp fix uses).
+async function authRestartAgent() {
+  toast('Restarting the agent to pick up the new credentials…');
+  const wait = waitForAgentReady(60000);
+  send({ bridge: 'restart' });
+  await wait;
+  await initSession(true);
+}
+
+async function authLogout(id) {
+  if (!confirm(`Log out "${id}"?\nRemoves its credentials from auth.json (like /logout).`)) return;
+  try {
+    const r = await fetch(`/api/auth-login?provider=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const out = await r.json();
+    if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
+    await authRestartAgent();
+    toast(`Logged out "${id}"`);
+    loadAuthProviders();
+    refreshModels();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+$('btn-auth-login').onclick = async () => {
+  const id = $('auth-provider').value.trim();
+  const key = $('auth-key').value.trim();
+  if (!id) { toast('Enter the provider id first', 'warning'); return; }
+  if (!key) { toast('Enter the API key', 'warning'); return; }
+  try {
+    const r = await fetch('/api/auth-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: id, key }),
+    });
+    const out = await r.json();
+    if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
+    $('auth-key').value = '';
+    await authRestartAgent();
+    toast(`Logged in "${id}" — key saved to auth.json`);
+    loadAuthProviders();
+    refreshModels();
+  } catch (e) {
+    toast(`Login failed: ${e.message}`, 'error');
+  }
+};
+$('btn-auth-logout').onclick = () => {
+  const id = $('auth-provider').value.trim();
+  if (!id) { toast('Enter the provider id first', 'warning'); return; }
+  authLogout(id);
 };
 
 /* ───────────────────────── shorts feed (one-tap) ───────────────────────── */

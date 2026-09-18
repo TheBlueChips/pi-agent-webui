@@ -16,7 +16,7 @@ import { View, Text, TouchableOpacity, StyleSheet, Linking, AppState } from 'rea
 import { FEEDS, FEED_ORDER, userAgentFor } from './feeds';
 import * as WV from './webview2';
 
-export function ShortsPanel({ provider, onProviderChange, onClose, compact, expanded, onToggleExpand }) {
+export function ShortsPanel({ provider, onProviderChange, onClose, compact, expanded, onToggleExpand, autoOpen = false, onAutoOpenToggle }) {
   const feed = FEEDS[provider] || FEEDS[FEED_ORDER[0]];
   const hostRef = useRef(null);
   const [bounds, setBounds] = useState(null);
@@ -89,6 +89,17 @@ export function ShortsPanel({ provider, onProviderChange, onClose, compact, expa
             </TouchableOpacity>
           );
         })}
+        {onAutoOpenToggle ? (
+          /* "auto" = auto-open/close this feed while the agent runs. The
+             setting lives here, next to the feed it controls, instead of the
+             main settings dialog (where nobody could find it). */
+          <TouchableOpacity
+            onPress={onAutoOpenToggle}
+            accessibilityLabel="Auto-open shorts while the agent is running"
+            style={[styles.tab, autoOpen && { borderBottomColor: '#5b9dff' }]}>
+            <Text style={[styles.tabText, autoOpen && { color: '#5b9dff' }]}>⚡ auto</Text>
+          </TouchableOpacity>
+        ) : null}
         <View style={{ flex: 1 }} />
         {WV.hasNativeWebView ? (
           <>
