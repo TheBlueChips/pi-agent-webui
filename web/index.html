@@ -14,6 +14,7 @@
   <!-- ══════════ Sidebar ══════════ -->
   <aside id="sidebar">
     <div class="sidebar-head">
+      <span id="sidebar-avatar" class="avatar-wrap" hidden></span>
       <span class="logo" id="agent-title">pi agent</span>
       <button id="btn-new-session" class="btn primary" title="Start a new session">+ New</button>
     </div>
@@ -79,8 +80,15 @@
         <span id="stat-cost" title="session cost"></span>
         <span class="stats-spacer"></span>
         <select id="model-select" title="Model"></select>
+        <button id="model-btn" class="btn pill" title="Model">no model</button>
         <select id="thinking-select" title="Thinking level"></select>
       </div>
+    </div>
+
+    <!-- Searchable model list (the hidden select above stays the source of truth) -->
+    <div id="model-menu" class="model-menu hidden">
+      <input id="model-search" type="search" placeholder="Search models…" autocomplete="off" spellcheck="false">
+      <div id="model-list" class="model-list"></div>
     </div>
   </main>
 
@@ -114,6 +122,32 @@
     </div>
   </aside>
 </div>
+
+<!-- Manual crop for the background and the agent's profile image -->
+<dialog id="crop-dialog">
+  <h3 id="crop-title">Crop</h3>
+  <div id="crop-stage" class="crop-stage">
+    <div id="crop-media" class="crop-media"></div>
+  </div>
+  <div class="settings-grid">
+    <label>Zoom</label>
+    <div class="rate-row">
+      <input id="crop-zoom" type="range" min="1" max="6" step="0.01" value="1">
+      <span id="crop-zoom-val">1.00×</span>
+    </div>
+    <label>Position</label>
+    <div class="rate-row">
+      <input id="crop-x" type="range" min="-1" max="1" step="0.01" value="0" title="horizontal">
+      <input id="crop-y" type="range" min="-1" max="1" step="0.01" value="0" title="vertical">
+    </div>
+  </div>
+  <p class="hint" id="crop-hint"></p>
+  <div class="dialog-buttons">
+    <button id="crop-reset" class="btn small">reset</button>
+    <button id="crop-cancel" class="btn">cancel</button>
+    <button id="crop-save" class="btn primary">save</button>
+  </div>
+</dialog>
 
 <!-- Extension dialog modal -->
 <dialog id="ext-dialog">
@@ -169,10 +203,16 @@
       <input id="set-agent-name" type="text" placeholder="pi">
       <label>Profile image</label>
       <div class="avatar-row">
-        <img id="set-avatar-preview" class="avatar avatar-big" alt="">
+        <span id="set-avatar-preview" class="avatar-wrap avatar-big"></span>
         <button id="btn-avatar-upload" class="btn small">upload…</button>
+        <button id="btn-avatar-crop" class="btn small">crop…</button>
         <button id="btn-avatar-clear" class="btn small">clear</button>
-        <input id="avatar-input" type="file" accept="image/*" hidden>
+        <input id="avatar-input" type="file" accept="image/*,video/*,.gif,.mp4,.webm,.mov" hidden>
+      </div>
+      <label>Profile image size</label>
+      <div class="rate-row">
+        <input id="set-avatar-size" type="range" min="16" max="96" step="2" value="34">
+        <span id="set-avatar-size-val">34px</span>
       </div>
       <label>Thinking</label>
       <label class="check-label"><input id="set-show-thinking" type="checkbox"> show thinking blocks</label>
@@ -227,6 +267,7 @@
       <div class="rate-row">
         <input id="set-bg-url" type="text" placeholder="image / GIF / video URL">
         <button id="btn-bg-upload" class="btn small">upload…</button>
+        <button id="btn-bg-crop" class="btn small">crop…</button>
         <button id="btn-bg-clear" class="btn small">clear</button>
         <input id="bg-input" type="file" accept="image/*,video/*,.gif,.mp4,.webm,.mov" hidden>
       </div>
@@ -235,6 +276,17 @@
         <input id="set-chat-opacity" type="range" min="0" max="100" step="5">
         <span id="set-chat-opacity-val">100%</span>
       </div>
+      <label>Text outline</label>
+      <div class="rate-row">
+        <label class="check-label"><input id="set-text-outline" type="checkbox"> outline chat text (keeps it readable over the background)</label>
+      </div>
+      <label>Outline color</label>
+      <div class="rate-row">
+        <input id="set-outline-color" type="color" value="#000000">
+        <span class="hint">1px around every glyph</span>
+      </div>
+      <label>Typing</label>
+      <label class="check-label"><input id="set-type-anywhere" type="checkbox"> start typing anywhere in the window (no need to click the box)</label>
       <label>Font</label>
       <div class="font-row">
         <input id="set-font" list="font-list" placeholder="System (Segoe UI)" spellcheck="false" autocomplete="off">

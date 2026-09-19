@@ -39,7 +39,7 @@ if not defined BRIDGE_UP (
 
 rem --- dependencies present? -------------------------------------------------
 if not exist "%PROJ%\node_modules" (
-  echo   Installing the app's dependencies first (first run only)...
+  echo   Installing the app's dependencies first - first run only...
   pushd "%PROJ%"
   call npm install --no-fund --no-audit
   set "INSTALL_RC=!errorlevel!"

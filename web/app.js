@@ -150,6 +150,29 @@ function usageStats(usage, writeSec, readSec) {
   return parts.join(' · ');
 }
 
+/* Same line, but from the character estimate: "↓ ~523 write @ 18.6 t/s". */
+function estStatsText(est, sec) {
+  if (!est) return '';
+  return `↓ ~${formatTok(est) || 0} write` + (sec && sec > 0.2 ? ` @ ${(est / sec).toFixed(1)} t/s` : '');
+}
+
+/* Type anywhere: with the setting on, any printable keystroke while the window
+ * is focused lands in the composer without clicking it first. Focusing on
+ * keydown (rather than blocking the key) lets the browser deliver that same
+ * keystroke to the newly focused box. */
+function wireTypeAnywhere() {
+  window.addEventListener('keydown', (e) => {
+    if (SET.typeAnywhere !== true) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key.length !== 1 && e.key !== 'Backspace' && e.key !== 'Enter') return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+    if (document.querySelector('dialog[open]')) return;
+    if (e.key === 'Enter') { e.preventDefault(); input.focus(); return; }
+    input.focus();
+  });
+}
+
 const asArray = (data, key) =>
   Array.isArray(data) ? data : (data && Array.isArray(data[key]) ? data[key] : []);
 
@@ -179,7 +202,13 @@ const DEFAULT_SETTINGS = {
   autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
   fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
   chatFontSize: 14,       // px — chat + composer text size
-  chatOpacity: 100,       // 0-100 — chat chrome (composer/topbar) opacity
+  chatOpacity: 100,       // 0-100 — chat chrome (composer/topbar/sidebar) opacity
+  textOutline: true,      // outline chat text so it stays readable over a background
+  textOutlineColor: '#000000', // outline colour
+  avatarSize: 34,         // px — agent profile image in the chat
+  avatarCrop: null,       // {x, y, z} — manual crop of the profile image
+  bgCrop: null,           // {x, y, z} — manual crop of the background
+  typeAnywhere: false,    // start typing in the composer without clicking it
 };
 let SET = { ...DEFAULT_SETTINGS };
 try { Object.assign(SET, JSON.parse(localStorage.getItem('piwebui-settings') || '{}')); } catch { /* defaults */ }
@@ -217,20 +246,19 @@ function applySettings() {
   document.querySelectorAll('.msg.assistant .who .agent-name-label').forEach((e) => {
     e.textContent = SET.agentName || 'pi';
   });
-  document.querySelectorAll('.msg.assistant .who .avatar').forEach((e) => {
-    if (SET.avatar) e.src = SET.avatar;
-    else e.remove();
-  });
-  // settings dialog preview
-  const prev = $('set-avatar-preview');
-  if (SET.avatar) { prev.src = SET.avatar; prev.style.visibility = 'visible'; }
-  else prev.style.visibility = 'hidden';
+  refreshAvatars();
   // thinking blocks visibility
   document.body.classList.toggle('hide-thinking', SET.showThinking === false);
   const st = $('set-show-thinking');
   if (st) st.checked = SET.showThinking !== false;
   // theme
   const rootStyle = document.documentElement.style;
+  // text outline: a 4-way shadow keeps glyphs readable when the panels are
+  // translucent and the background image shows through.
+  document.body.classList.toggle('text-outline', SET.textOutline !== false);
+  rootStyle.setProperty('--outline-color', SET.textOutlineColor || '#000000');
+  const avSize = Math.max(16, Math.min(120, Number(SET.avatarSize) || 34));
+  rootStyle.setProperty('--avatar-size', `${avSize}px`);
   if (SET.themeAccent) {
     rootStyle.setProperty('--accent', SET.themeAccent);
     rootStyle.setProperty('--accent-dim', `color-mix(in srgb, ${SET.themeAccent} 35%, #171b22)`);
@@ -295,6 +323,7 @@ const S = {
   attachments: [],         // [{data, mimeType, name}]
   models: [],
   levels: [],
+  msgTiming: new Map(),    // message key -> {elapsedSec, prefillSec, est} for the t/s figure
   autoTts: false,
   speaking: false,
   stickToBottom: true,
@@ -439,7 +468,13 @@ function handleRpcMessage(msg) {
     if (p) {
       S.pending.delete(msg.id);
       msg.success ? p.resolve(msg.data) : p.reject(new Error(msg.error || 'request failed'));
-      if (!msg.success) toast(`Agent error (${msg.command}): ${msg.error}`, 'error');
+      if (!msg.success) {
+        // A session whose recorded folder is gone gets its own dialog in
+        // switchToSession; the raw pi error is not useful on top of that.
+        const handledElsewhere = msg.command === 'switch_session' &&
+          /working directory does not exist/i.test(msg.error || '');
+        if (!handledElsewhere) toast(`Agent error (${msg.command}): ${msg.error}`, 'error');
+      }
     }
     return;
   }
@@ -527,7 +562,106 @@ function applyState(d) {
 
 function syncSelect(sel, value) {
   if (value && [...sel.options].some((o) => o.value === value)) sel.value = value;
+  if (sel && sel.id === 'model-select') updateModelBtn();
 }
+
+/* ── model picker ─────────────────────────────────────────────────────────
+ * A native <select> cannot be searched, and with enough models its popup ran
+ * off the bottom of the screen. This adds a searchable, scrollable list on top
+ * of it. The hidden <select> stays the source of truth (set_model, state sync,
+ * llama.cpp entries) so nothing else had to change. */
+function modelMenuItems() {
+  const sel = $('model-select');
+  const out = [];
+  for (const kid of sel.children) {
+    if (kid.tagName === 'OPTGROUP') {
+      for (const o of kid.children) out.push({ value: o.value, label: o.textContent, group: kid.label || '' });
+    } else if (kid.tagName === 'OPTION') {
+      out.push({ value: kid.value, label: kid.textContent, group: '' });
+    }
+  }
+  return out;
+}
+
+function updateModelBtn() {
+  const btn = $('model-btn');
+  if (!btn) return;
+  const sel = $('model-select');
+  const opt = sel.selectedOptions && sel.selectedOptions[0];
+  const label = opt ? opt.textContent : 'no model';
+  btn.textContent = label;
+  btn.title = `Model: ${label} — click to search and switch`;
+}
+
+function renderModelMenu(query) {
+  const list = $('model-list');
+  if (!list) return;
+  const q = (query || '').trim().toLowerCase();
+  const sel = $('model-select').value;
+  const items = modelMenuItems().filter((it) =>
+    !q || it.label.toLowerCase().includes(q) || it.value.toLowerCase().includes(q) || it.group.toLowerCase().includes(q));
+  list.replaceChildren();
+  if (!items.length) {
+    list.appendChild(el('div', 'model-empty', q ? `No model matches “${query}”` : 'No models reported yet'));
+    return;
+  }
+  let group = null;
+  for (const it of items) {
+    if (it.group && it.group !== group) {
+      group = it.group;
+      list.appendChild(el('div', 'model-group', group));
+    }
+    const row = el('div', 'model-item' + (it.value === sel ? ' sel' : ''));
+    row.appendChild(el('span', 'model-label', it.label));
+    if (!it.group) row.appendChild(el('span', 'model-provider', it.value.split('||')[0]));
+    row.onclick = () => {
+      const s = $('model-select');
+      s.value = it.value;
+      s.dispatchEvent(new Event('change'));
+      toggleModelMenu(false);
+    };
+    list.appendChild(row);
+  }
+}
+
+function toggleModelMenu(open) {
+  const menu = $('model-menu');
+  if (!menu) return;
+  const show = open == null ? menu.classList.contains('hidden') : open;
+  if (!show) { menu.classList.add('hidden'); return; }
+  const btn = $('model-btn');
+  const r = btn.getBoundingClientRect();
+  const width = Math.max(280, Math.min(420, window.innerWidth - 24));
+  menu.style.width = `${width}px`;
+  menu.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - width - 8))}px`;
+  menu.style.bottom = `${window.innerHeight - r.top + 6}px`;
+  $('model-search').value = '';
+  renderModelMenu('');
+  menu.classList.remove('hidden');
+  $('model-search').focus();
+  const cur = menu.querySelector('.model-item.sel');
+  if (cur) cur.scrollIntoView({ block: 'center' });
+}
+
+(function wireModelMenu() {
+  const btn = $('model-btn');
+  const menu = $('model-menu');
+  if (!btn || !menu) return;
+  btn.onclick = (e) => { e.stopPropagation(); refreshLlamaGroupThrottled(); toggleModelMenu(); };
+  // Any change to the select (state sync, llama.cpp entry, a pick from the list)
+  // has to be reflected on the button.
+  $('model-select').addEventListener('change', () => updateModelBtn());
+  $('model-search').oninput = (e) => renderModelMenu(e.target.value);
+  $('model-search').onkeydown = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); toggleModelMenu(false); input.focus(); }
+    if (e.key === 'Enter') {
+      const first = menu.querySelector('.model-item:not(.sel)') || menu.querySelector('.model-item.sel') || menu.querySelector('.model-item');
+      if (first) first.click();
+    }
+  };
+  menu.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => toggleModelMenu(false));
+})();
 
 async function refreshModels() {
   try {
@@ -543,6 +677,7 @@ async function refreshModels() {
     }
     ensureLlamaGroup(); // retried in the background until the server answers
     if (S.state.model) syncSelect(sel, `${S.state.model.provider}||${S.state.model.id}`);
+    updateModelBtn();
   } catch { /* agent may not implement it */ }
 }
 
@@ -672,6 +807,15 @@ $('model-select').addEventListener('focus', () => {
   llamaGroupRefreshAt = now;
   refreshLlamaGroup();
 });
+/* The select is hidden behind the model button now, so the same refresh runs
+ * when the picker is opened. */
+function refreshLlamaGroupThrottled() {
+  const now = Date.now();
+  if (now - llamaGroupRefreshAt < 10000) return;
+  llamaGroupRefreshAt = now;
+  refreshLlamaGroup();
+  updateModelBtn();
+}
 
 async function refreshLevels() {
   try {
@@ -908,15 +1052,80 @@ function messageBlock(content) {
   };
 }
 
+/* ── profile image + manual crop ──────────────────────────────────────────
+ * The avatar and the background can be a still image, a GIF or a video, and
+ * either can be panned and zoomed by hand (openCropper). object-position pans
+ * and transform: scale() zooms about the centre - the crop stage, the chat
+ * avatar and the background all compose the same way, so the preview in the
+ * cropper is what you get. */
+const VIDEO_SRC = /\.(mp4|webm|mov|m4v|ogv|mkv)([?#]|$)/i;
+const IMAGE_SRC = /\.(png|jpe?g|gif|webp|avif|bmp|svg)([?#]|$)/i;
+function isVideoSrc(src) {
+  return /^data:video\//i.test(src || '') || VIDEO_SRC.test(src || '');
+}
+
+function mediaNode(src, cls) {
+  if (!src) return null;
+  let node;
+  if (isVideoSrc(src)) {
+    node = el('video', cls);
+    node.muted = true; node.loop = true; node.autoplay = true; node.playsInline = true;
+    node.setAttribute('playsinline', '');
+  } else {
+    node = el('img', cls);
+  }
+  node.src = src;
+  return node;
+}
+
+/* Old object-position crops are converted by normalizeCrop; the real
+definitions live with the cropper. */
+
+/* Profile image for the chat header, the sidebar and the settings preview.
+ * There is no built-in default: with no image set, only the name is shown. */
+function avatarNode(sizeClass) {
+  if (!SET.avatar) return null;
+  const wrap = el('span', `avatar-wrap${sizeClass ? ' ' + sizeClass : ''}`);
+  const node = attachCrop(mediaNode(SET.avatar, 'avatar'), SET.avatarCrop, 1);
+  wrap.appendChild(node);
+  return wrap;
+}
+
+/* Re-render every avatar after the image, its crop or its size changes. */
+function refreshAvatars() {
+  document.querySelectorAll('.msg.assistant .who').forEach((who) => {
+    const old = who.querySelector('.avatar-wrap');
+    if (old) old.remove();
+    const node = avatarNode();
+    if (node) who.insertBefore(node, who.firstChild);
+  });
+  const side = $('sidebar-avatar');
+  if (side) {
+    const node = avatarNode();
+    if (node) { side.replaceChildren(...node.childNodes); side.hidden = false; }
+    else { side.replaceChildren(); side.hidden = true; }
+  }
+  const prev = $('set-avatar-preview');
+  if (prev) {
+    // Only the user's own image here, so "clear" visibly clears it (the app
+    // icon fallback in the RN shell is not something you can crop or delete).
+    if (SET.avatar) {
+      const node = avatarNode();
+      prev.replaceChildren(...node.childNodes);
+      prev.style.visibility = 'visible';
+    } else {
+      prev.replaceChildren();
+      prev.style.visibility = 'hidden';
+    }
+  }
+}
+
 function makeMsgShell(role, who) {
   const root = el('div', `msg ${role}`);
   const head = el('div', 'who');
   if (role.includes('assistant')) {
-    if (SET.avatar) {
-      const av = el('img', 'avatar');
-      av.src = SET.avatar;
-      head.appendChild(av);
-    }
+    const av = avatarNode();
+    if (av) head.appendChild(av);
     head.appendChild(el('span', 'agent-name-label', SET.agentName || 'pi'));
     head.appendChild(el('span', 'who-text', ` · ${who}`));
   } else {
@@ -972,13 +1181,53 @@ function renderUserMessage(msg) {
   scrollBottom();
 }
 
+/* Estimated written tokens for a live message, used while streaming and as a
+ * fallback when the provider never reports usage. */
+function estWriteTokens(L) {
+  if (!L) return 0;
+  return Math.round((L.text.length + L.thinking.length) / 4);
+}
+
+/* Remember how long a message took so a later re-render (tool cards arriving,
+ * a session re-read, a page reload) keeps the tokens/sec figure instead of
+ * silently dropping it. Keyed by the message timestamp pi stores. */
+function rememberTiming(msg, timing) {
+  const key = msg && (msg.timestamp != null ? `t${msg.timestamp}` : (msg.id ? `i${msg.id}` : null));
+  if (key && timing) S.msgTiming.set(key, timing);
+  return timing;
+}
+
+function timingFor(msg, timing) {
+  if (timing && (timing.elapsedSec || timing.prefillSec || timing.est)) {
+    return rememberTiming(msg, timing);
+  }
+  const key = msg && (msg.timestamp != null ? `t${msg.timestamp}` : (msg.id ? `i${msg.id}` : null));
+  if (key && S.msgTiming.has(key)) return S.msgTiming.get(key);
+  return timing || null;
+}
+
+/* Messages read back from a session file have no live timings. The gap to the
+ * previous message is the turn's duration, which is enough to show a rate - it
+ * includes the prompt read, so the figure is a little conservative. */
+function noteHistoryTiming(msg, prevTs) {
+  const key = msg && msg.timestamp != null ? `t${msg.timestamp}` : null;
+  if (!key || S.msgTiming.has(key)) return;
+  if (prevTs == null || msg.timestamp == null) return;
+  const sec = (msg.timestamp - prevTs) / 1000;
+  if (sec > 0.05 && sec < 3600) S.msgTiming.set(key, { elapsedSec: sec, prefillSec: null });
+}
+
 function renderAssistantMessage(msg, timing) {
+  timing = timingFor(msg, timing);
   const { root, tools, bubble } = makeMsgShell('assistant', timeStr(msg.timestamp));
   const textBlocks = [];
-  const stats = usageStats(msg.usage, timing && timing.elapsedSec, timing && timing.prefillSec);
+  let stats = usageStats(msg.usage, timing && timing.elapsedSec, timing && timing.prefillSec);
+  if (!stats && timing && timing.est) stats = estStatsText(timing.est, timing.elapsedSec);
   if (stats) {
     const s = el('span', 'agent-stats', ` (${stats})`);
-    s.title = 'token usage: input+cache read / output written' +
+    s.title = (msg.usage
+      ? 'token usage: input+cache read / output written'
+      : 'estimated token usage - this provider did not report any') +
       (timing && timing.elapsedSec ? ` over ${timing.elapsedSec.toFixed(1)}s of streaming` : '');
     // Stats before the action buttons: "Pi · 04:30 PM (↑ 43.6K read · ↓ 523 write) [copy] [speak]"
     root.querySelector('.who').insertBefore(s, tools);
@@ -995,9 +1244,19 @@ function renderAssistantMessage(msg, timing) {
     } else if (block.type === 'thinking') {
       bubble.appendChild(makeThinking(block.thinking || ''));
     } else if (block.type === 'toolCall') {
-      // History cards are finished — a "running…" label (with its bob
-      // animation) on a completed message would read as a stuck live card.
-      const card = makeToolCard(block.name, { toolCallId: block.id, state: 'done' });
+      // A call can still be executing when its assistant message is finalised
+      // (message_end arrives before the tool runs), and finalizeLive re-renders
+      // the message from history here. Keep such a card running, timer and all,
+      // instead of showing a finished-looking card for a command that is
+      // literally still executing.
+      const prev = S.toolCards.get(block.id);
+      const wasRunning = !!(prev && prev._timer);
+      const card = makeToolCard(block.name, { toolCallId: block.id, state: wasRunning ? 'running' : 'done' });
+      if (wasRunning) {
+        clearInterval(prev._timer);
+        card._start = prev._start;
+        startCardTimer(card);
+      }
       fillToolBody(card, block.name, block.arguments);
       bubble.appendChild(card.card);
       S.toolCards.set(block.id, card);
@@ -1017,13 +1276,33 @@ function makeThinking(text) {
   return d;
 }
 
+/* Three dots that bob in a wave. Used by the live message header and by the
+ * "running" label on a tool card - the text itself deliberately stays still. */
+function makeDots(cls) {
+  const dots = el('span', cls || 'streaming-dots');
+  for (let i = 0; i < 3; i++) dots.appendChild(el('span', 'dot', '.'));
+  return dots;
+}
+
+/* Put a tool card back into its running state (the label is a bare "running"
+ * with the animated dots after it, so only the dots move). */
+function setCardRunning(card) {
+  if (!card) return;
+  const label = card.stateEl.querySelector('.tool-state-label');
+  if (label) label.textContent = 'running';
+  else card.stateEl.textContent = 'running';
+  if (!card.stateEl.querySelector('.streaming-dots')) card.stateEl.appendChild(makeDots());
+  card.stateEl.className = 'tool-state running';
+}
+
 function makeToolCard(name, opts = {}) {
   const card = el('div', `tool-card${name === 'bash' ? ' bash-card' : ''}`);
   const head = el('div', 'tool-head');
   head.appendChild(el('span', 'tool-name', `${name}`));
-  const state = opts.state || 'running…';
-  const stateEl = el('span', `tool-state${state === 'running…' ? ' running' : ''}`);
+  const state = opts.state || 'running';
+  const stateEl = el('span', `tool-state${state === 'running' ? ' running' : ''}`);
   stateEl.appendChild(el('span', 'tool-state-label', state));
+  if (state === 'running') stateEl.appendChild(makeDots());
   head.appendChild(stateEl);
   const timerEl = el('span', 'tool-timer hidden');
   head.appendChild(timerEl);
@@ -1327,11 +1606,12 @@ async function refreshMessages() {
     removeCompactionLive();
   }
   // session token totals summed from per-message usage
-  let read = 0, write = 0;
+  let read = 0, write = 0, prevTs = null;
   for (const m of msgs) {
     const firstNew = chat.children.length;
     if (m.role === 'user') renderUserMessage(m);
     else if (m.role === 'assistant') {
+      noteHistoryTiming(m, prevTs);
       renderAssistantMessage(m);
       if (m.usage) {
         read += (m.usage.input || 0) + (m.usage.cacheRead || 0) + (m.usage.cacheWrite || 0);
@@ -1350,6 +1630,7 @@ async function refreshMessages() {
     // be anchored to a point in time instead of a shifting position.
     if (m.timestamp != null) {
       for (let i = firstNew; i < chat.children.length; i++) chat.children[i].dataset.ts = String(m.timestamp);
+      prevTs = m.timestamp;
     }
   }
   // Put each compaction we watched happen back where it happened: after the last
@@ -1392,15 +1673,22 @@ async function refreshMessages() {
   else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
 }
 
+/* Full-size view of an image. The old version reused the drag-and-drop overlay,
+ * which is pointer-events: none, so it could never be closed. */
 function zoomImage(src) {
-  const ov = el('div', 'drop-overlay');
-  ov.style.background = 'rgba(0,0,0,.85)';
+  const ov = el('div', 'img-zoom');
   const img = el('img');
   img.src = src;
-  img.style.maxHeight = '90vh';
-  img.style.maxWidth = '90vw';
-  ov.appendChild(img);
-  ov.onclick = () => ov.remove();
+  const close = el('button', 'img-zoom-close', '✕');
+  close.title = 'Close (Esc)';
+  close.onclick = (e) => { e.stopPropagation(); ov.remove(); };
+  ov.append(img, close);
+  ov.onclick = (e) => { if (e.target !== img) ov.remove(); };
+  const onKey = (e) => {
+    if (!document.body.contains(ov)) { document.removeEventListener('keydown', onKey); return; }
+    if (e.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', onKey); }
+  };
+  document.addEventListener('keydown', onKey);
   document.body.appendChild(ov);
 }
 
@@ -1689,9 +1977,7 @@ function renderLive() {
     if (L.lastUsage) {
       stats = usageStats(L.lastUsage, sec, prefill);
     } else {
-      const est = Math.round((L.text.length + L.thinking.length) / 4);
-      stats = est ? `↓ ~${formatTok(est) || 0} write` +
-        (sec > 0.2 ? ` @ ${(est / sec).toFixed(1)} t/s` : '') : '';
+      stats = estStatsText(estWriteTokens(L), sec);
     }
     if (stats) L.statsEl.textContent = ` (${stats})`;
     // Live context ring: pi's last authoritative count + the in-flight message,
@@ -1730,8 +2016,14 @@ function finalizeLive(finalMsg) {
         S.totals.write += usage.output || 0;
         noteTokenRatio(usage, messageChars(finalMsg));
       }
-      renderAssistantMessage(usage && !finalMsg.usage ? { ...finalMsg, usage } : finalMsg,
-        { elapsedSec, prefillSec });
+      const timed = usage && !finalMsg.usage ? { ...finalMsg, usage } : finalMsg;
+      // No usage from the provider (some endpoints never send it): keep the
+      // estimated counter that was on screen while streaming, so the token rate
+      // does not simply vanish when the turn ends.
+      const timing = { elapsedSec, prefillSec };
+      if (!usage) timing.est = estWriteTokens(L);
+      rememberTiming(timed, timing);
+      renderAssistantMessage(timed, timing);
       updateTotals();
       if (S.autoTts) {
         const text = (finalMsg.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(' ');
@@ -1758,6 +2050,9 @@ function startToolCard(msg) {
       existing.toolName = msg.toolName;
       existing.card.querySelector('.tool-name').textContent = msg.toolName;
     }
+    // It may have been rendered as "done" by the message finalise above; the
+    // execution is starting right now, so put the running label back.
+    setCardRunning(existing);
     startCardTimer(existing);
     return existing;
   }
@@ -2406,7 +2701,7 @@ function updateSlashMenu() {
   const q = m[1].toLowerCase();
   const items = allCommands()
     .filter((c) => c.name.toLowerCase().includes(q) || (c.description || '').toLowerCase().includes(q))
-    .slice(0, 12);
+    .slice(0, 300);   // the list scrolls; it used to be cut off at 12, which hid every skill
   if (!items.length) { closeSlashMenu(); return; }
   openSlashMenu(items);
 }
@@ -2427,8 +2722,11 @@ function openSlashMenu(items) {
     menu.appendChild(row);
   });
   document.body.appendChild(menu);
-  const r = input.getBoundingClientRect();
+  // Span the composer: from the "+" button to "send".
+  const row = document.querySelector('.composer-row') || input;
+  const r = row.getBoundingClientRect();
   menu.style.left = r.left + 'px';
+  menu.style.width = r.width + 'px';
   menu.style.bottom = `${window.innerHeight - r.top + 8}px`;
   slash.menu = menu;
 }
@@ -2854,6 +3152,40 @@ async function switchToSession(sessionPath) {
     await initSession(false);
     toast('Session switched');
   } catch (e) {
+    // pi refuses to switch to a session whose recorded working directory is
+    // gone (usually because the project folder was renamed). Offer to put the
+    // folder back so the session can be opened again, instead of dead-ending on
+    // a raw error.
+    const missing = /working directory does not exist:\s*(.+?)\s*$/im.exec(e.message || '');
+    if (missing && missing[1]) {
+      const dir = missing[1].trim();
+      const ok = confirm(
+        `This session was recorded in\n\n${dir}\n\n` +
+        'and that folder does not exist any more - it was renamed or moved.\n\n' +
+        'Create the folder again so the session can be opened?');
+      if (!ok) {
+        toast('Session not opened - its recorded folder is missing', 'warning');
+        return;
+      }
+      try {
+        const r = await fetch('/api/ensure-dir', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: dir }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'could not create it');
+        await rpc({ type: 'switch_session', sessionPath });
+        S.state.sessionFile = sessionPath;
+        S.viewSession = null;
+        $('session-name').value = '';
+        await initSession(false);
+        toast('Session opened - its old folder was recreated');
+      } catch (e2) {
+        toast(`Still could not open it: ${e2.message}`, 'error');
+      }
+      return;
+    }
     toast(`Switch failed: ${e.message}`, 'error');
   }
 }
@@ -3156,6 +3488,17 @@ function openSettings() {
   $('set-font-size-val').textContent = `${Number(SET.chatFontSize) || 14}px`;
   $('set-chat-opacity').value = SET.chatOpacity == null ? 100 : Number(SET.chatOpacity);
   $('set-chat-opacity-val').textContent = `${SET.chatOpacity == null ? 100 : Number(SET.chatOpacity)}%`;
+  const tOut = $('set-text-outline');
+  if (tOut) tOut.checked = SET.textOutline !== false;
+  const tCol = $('set-outline-color');
+  if (tCol) tCol.value = SET.textOutlineColor || '#000000';
+  const avSize = $('set-avatar-size');
+  if (avSize) {
+    avSize.value = String(Number(SET.avatarSize) || 34);
+    $('set-avatar-size-val').textContent = `${Number(SET.avatarSize) || 34}px`;
+  }
+  const ta = $('set-type-anywhere');
+  if (ta) ta.checked = SET.typeAnywhere === true;
   $('set-shorts-provider').value = SHORTS_FEEDS[SET.shortsProvider] ? SET.shortsProvider : 'none';
   $('set-shorts-auto').checked = SET.shortsAutoOpen === true;
   const legacyMode = { split: 'panel', popup: 'window' }[SET.shortsMode] || SET.shortsMode;
@@ -3179,16 +3522,38 @@ $('set-agent-name').addEventListener('change', (e) => {
 $('btn-avatar-upload').onclick = () => $('avatar-input').click();
 $('avatar-input').onchange = async (e) => {
   const f = e.target.files[0];
-  if (!f) return;
-  if (!f.type.startsWith('image/')) { toast('Not an image', 'warning'); return; }
-  const dataUrl = await readAsDataUrl(f);
-  SET.avatar = dataUrl;
-  saveSettings();
-  toast('Profile image updated');
   e.target.value = '';
+  if (!f) return;
+  const isVideo = f.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(f.name);
+  const isImage = f.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(f.name);
+  if (!isVideo && !isImage) { toast('Pick an image, GIF or video file', 'warning'); return; }
+  toast(isVideo ? 'Uploading profile video…' : 'Uploading profile image…');
+  try {
+    // Uploaded like the background rather than inlined: a GIF or a short video
+    // as a data URL would blow the localStorage quota.
+    const up = await uploadFile(f);
+    SET.avatar = `/api/bg-file?name=${encodeURIComponent(up.path.split(/[\\/]/).pop())}`;
+    SET.avatarCrop = null;
+    saveSettings();
+    toast('Profile image updated — adjust the framing if needed');
+    openCropper('avatar');
+  } catch (err) {
+    if (isImage && f.size < 1.5 * 1024 * 1024) {
+      try {
+        SET.avatar = await readAsDataUrl(f);
+        SET.avatarCrop = null;
+        saveSettings();
+        toast('Profile image set for this session (bridge not reachable to store it)');
+        return;
+      } catch { /* fall through */ }
+    }
+    toast(`Upload failed: ${err.message}`, 'error');
+  }
 };
+$('btn-avatar-crop').onclick = () => openCropper('avatar');
 $('btn-avatar-clear').onclick = () => {
   SET.avatar = null;
+  SET.avatarCrop = null;
   saveSettings();
   toast('Profile image removed');
 };
@@ -3249,8 +3614,10 @@ $('bg-input').onchange = async (e) => {
   try {
     const up = await uploadFile(f);
     SET.themeBg = `/api/bg-file?name=${encodeURIComponent(up.path.split(/[\\/]/).pop())}`;
+    SET.bgCrop = null;
     saveSettings();
     toast(isVideo ? 'Video background set' : 'Background set');
+    openCropper('bg');
   } catch (err) {
     // offline bridge: fall back to inlining small images so it still works
     if (isImage && f.size < 1.5 * 1024 * 1024) {
@@ -3264,33 +3631,216 @@ $('bg-input').onchange = async (e) => {
     toast(`Upload failed: ${err.message}`, 'error');
   }
 };
-$('btn-bg-clear').onclick = () => { SET.themeBg = null; saveSettings(); };
+$('btn-bg-clear').onclick = () => { SET.themeBg = null; SET.bgCrop = null; saveSettings(); };
+$('btn-bg-crop').onclick = () => openCropper('bg');
 
-/* Apply SET.themeBg to the page. Static images/GIFs use the body's
- * background-image; videos need a real <video> layer behind everything. */
+/* Apply SET.themeBg to the page. Images, GIFs and videos all render as a real
+ * element behind the app, so one code path (and one crop) covers all three -
+ * a body background-image could not be zoomed or panned by hand. */
 function applyBackgroundMedia() {
   const host = $('bg-media');
   const src = SET.themeBg || '';
-  const isVideo = /^data:video\//i.test(src) || /\.(mp4|webm|mov|m4v|ogv|mkv)(\?|#|$)/i.test(src);
-  if (host) {
-    host.innerHTML = '';
-    if (isVideo) {
-      const v = document.createElement('video');
-      v.src = src;
-      v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
-      v.setAttribute('playsinline', '');
-      v.onerror = () => toast('Background video failed to load', 'error');
-      host.appendChild(v);
-      host.classList.remove('hidden');
-    } else {
-      host.classList.add('hidden');
-    }
-  }
-  document.body.style.backgroundImage = src && !isVideo ? `url("${src}")` : '';
-  document.body.style.backgroundSize = 'cover';
-  document.body.style.backgroundPosition = 'center';
-  document.body.style.backgroundAttachment = 'fixed';
+  if (!host) return;
+  host.innerHTML = '';
+  if (!src) { host.classList.add('hidden'); return; }
+  const frame = window.innerWidth / Math.max(1, window.innerHeight);
+  const node = attachCrop(mediaNode(src, 'bg-node'), SET.bgCrop, frame);
+  node.onerror = () => toast(isVideoSrc(src) ? 'Background video failed to load' : 'Background image failed to load', 'error');
+  host.appendChild(node);
+  host.classList.remove('hidden');
 }
+
+/* The frame aspect is the window's, so a resize changes how much of a cropped
+ * background fits. Re-apply instead of rebuilding - rebuilding would restart a
+ * background video. */
+window.addEventListener('resize', () => {
+  const n = document.querySelector('#bg-media img, #bg-media video');
+  if (n) applyCrop(n, SET.bgCrop, window.innerWidth / Math.max(1, window.innerHeight));
+});
+
+/* ── manual crop ──────────────────────────────────────────────────────────
+ * Drag to move, scroll (or use the slider) to zoom. The crop is stored as an
+ * object-position percentage plus a zoom factor, so it survives reloads and
+ * applies at every size the media is shown at. */
+/* ── manual crop ──────────────────────────────────────────────────────────
+ * Layout is always "cover, centred"; the crop rides on top of it as
+ *   transform: translate(fx · range) scale(z)
+ * Panning used to go through object-position, which can only move the part of a
+ * cover-fitted image that already sticks out - so an image that exactly filled
+ * the frame on one axis could never be moved along that axis, however far you
+ * zoomed. Moving by transform instead means zooming always opens up movement on
+ * both axes.
+ *
+ *   cw = max(1, imageAspect / frameAspect)   content width  ÷ frame width
+ *   ch = max(1, frameAspect / imageAspect)   content height ÷ frame height
+ *   range_x = z·cw − 1                       travel, in frame widths (×100%)
+ * fx/fy are −1..1 fractions of that range, 0 = centred. */
+let cropState = null;
+
+/* Older crops stored object-position percentages; convert them on the way in. */
+function normalizeCrop(crop) {
+  if (!crop) return null;
+  if (crop.v === 2) return crop;
+  const f = (p) => Math.max(-1, Math.min(1, ((p == null ? 50 : Number(p)) - 50) / 50));
+  return { v: 2, fx: f(crop.x), fy: f(crop.y), z: Math.max(1, Number(crop.z) || 1) };
+}
+
+function cropRatios(node, frameAspect) {
+  const nw = node.naturalWidth || node.videoWidth || 0;
+  const nh = node.naturalHeight || node.videoHeight || 0;
+  const a = frameAspect || 1;
+  if (!nw || !nh) return { cw: 1, ch: 1, ready: false };
+  const b = nw / nh;
+  return { cw: Math.max(1, b / a), ch: Math.max(1, a / b), ready: true };
+}
+
+function applyCrop(node, crop, frameAspect) {
+  if (!node) return;
+  const c = normalizeCrop(crop);
+  if (!c) { node.style.objectPosition = ''; node.style.transform = ''; return; }
+  const { cw, ch } = cropRatios(node, frameAspect);
+  const z = Math.max(1, Number(c.z) || 1);
+  const tx = (Number(c.fx) || 0) * 50 * (z * cw - 1);
+  const ty = (Number(c.fy) || 0) * 50 * (z * ch - 1);
+  node.style.objectPosition = '50% 50%';
+  node.style.transform = `translate(${tx}%, ${ty}%) scale(${z})`;
+}
+
+/* The natural size - and with it the pan ranges - only exists after load. */
+function attachCrop(node, crop, frameAspect) {
+  applyCrop(node, crop, frameAspect);
+  const again = () => applyCrop(node, crop, frameAspect);
+  node.addEventListener('load', again);
+  node.addEventListener('loadedmetadata', again);
+  return node;
+}
+
+function paintCrop() {
+  if (!cropState) return;
+  const { node, fx, fy, z, frame } = cropState;
+  applyCrop(node, { v: 2, fx, fy, z }, frame);
+  const zoom = $('crop-zoom');
+  if (zoom) { zoom.value = String(z); $('crop-zoom-val').textContent = `${z.toFixed(2)}×`; }
+  const cx = $('crop-x'); if (cx) cx.value = String(fx);
+  const cy = $('crop-y'); if (cy) cy.value = String(fy);
+}
+
+/* Move the picture by a drag, in pixels, on the (possibly zoomed) stage. */
+function cropDrag(dx, dy) {
+  if (!cropState) return;
+  const stage = $('crop-stage');
+  if (!stage) return;
+  const { node, z, frame } = cropState;
+  const { cw, ch, ready } = cropRatios(node, frame);
+  if (!ready) return;   // not loaded yet
+  const sr = stage.getBoundingClientRect();
+  // Screen pixels available each way: the content is z·cw wide against a frame
+  // one wide, so half of the excess in each direction.
+  const halfX = ((z * cw - 1) * sr.width) / 2;
+  const halfY = ((z * ch - 1) * sr.height) / 2;
+  const clamp = (v) => Math.max(-1, Math.min(1, v));
+  if (halfX > 0.5) cropState.fx = clamp(cropState.fx - dx / halfX);
+  if (halfY > 0.5) cropState.fy = clamp(cropState.fy - dy / halfY);
+  paintCrop();
+}
+
+function openCropper(kind) {
+  const isAvatar = kind === 'avatar';
+  const src = isAvatar ? SET.avatar : SET.themeBg;
+  if (!src) {
+    toast(isAvatar ? 'Upload a profile image first' : 'Upload a background first', 'warning');
+    return;
+  }
+  const saved = normalizeCrop(isAvatar ? SET.avatarCrop : SET.bgCrop) || {};
+  const stage = $('crop-stage');
+  const media = $('crop-media');
+  const node = mediaNode(src, 'crop-node');
+  media.replaceChildren(node);
+  $('crop-title').textContent = isAvatar ? 'Crop profile image' : 'Crop background';
+  $('crop-hint').textContent = isAvatar
+    ? 'Drag the picture inside the circle, scroll or use the slider to zoom. Zooming in is what lets you slide it sideways. What you see here is what the chat shows.'
+    : 'Drag the picture, scroll or use the slider to zoom. Zooming in is what lets you slide it sideways. The frame is your window shape.';
+  stage.classList.toggle('circle', isAvatar);
+  const frame = isAvatar ? 1 : window.innerWidth / Math.max(1, window.innerHeight);
+  stage.style.aspectRatio = isAvatar
+    ? '1 / 1'
+    : `${Math.max(1, window.innerWidth)} / ${Math.max(1, window.innerHeight)}`;
+  cropState = {
+    kind,
+    node,
+    frame,
+    fx: saved.fx == null ? 0 : Number(saved.fx),
+    fy: saved.fy == null ? 0 : Number(saved.fy),
+    z: saved.z == null ? 1 : Math.max(1, Number(saved.z)),
+  };
+  paintCrop();
+  const dlg = $('crop-dialog');
+  if (!dlg.open) dlg.showModal();
+}
+
+function closeCropper() {
+  cropState = null;
+  const dlg = $('crop-dialog');
+  if (dlg && dlg.open) dlg.close();
+}
+
+function saveCrop() {
+  if (!cropState) return closeCropper();
+  const crop = {
+    v: 2,
+    fx: Math.round(cropState.fx * 100) / 100,
+    fy: Math.round(cropState.fy * 100) / 100,
+    z: Math.round(cropState.z * 100) / 100,
+  };
+  if (cropState.kind === 'avatar') SET.avatarCrop = crop; else SET.bgCrop = crop;
+  closeCropper();
+  saveSettings();   // applySettings re-renders the background and every avatar
+  toast('Crop saved');
+}
+
+(function wireCropper() {
+  const stage = $('crop-stage');
+  if (!stage) return;
+  let dragging = null;
+  stage.addEventListener('pointerdown', (e) => {
+    if (!cropState) return;
+    dragging = { x: e.clientX, y: e.clientY };
+    stage.classList.add('dragging');
+    try { stage.setPointerCapture(e.pointerId); } catch { /* not fatal */ }
+    e.preventDefault();
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!dragging || !cropState) return;
+    cropDrag(e.clientX - dragging.x, e.clientY - dragging.y);
+    dragging = { x: e.clientX, y: e.clientY };
+  });
+  const endDrag = () => { dragging = null; stage.classList.remove('dragging'); };
+  stage.addEventListener('pointerup', endDrag);
+  stage.addEventListener('pointercancel', endDrag);
+  stage.addEventListener('wheel', (e) => {
+    if (!cropState) return;
+    e.preventDefault();
+    const z = cropState.z * (e.deltaY > 0 ? 0.92 : 1.08);
+    cropState.z = Math.max(1, Math.min(6, z));
+    paintCrop();
+  }, { passive: false });
+  $('crop-zoom').oninput = (e) => { if (cropState) { cropState.z = Number(e.target.value) || 1; paintCrop(); } };
+  $('crop-x').oninput = (e) => { if (cropState) { cropState.fx = Number(e.target.value); paintCrop(); } };
+  $('crop-y').oninput = (e) => { if (cropState) { cropState.fy = Number(e.target.value); paintCrop(); } };
+  $('crop-reset').onclick = () => {
+    if (!cropState) return;
+    cropState.fx = 0; cropState.fy = 0; cropState.z = 1;
+    paintCrop();
+  };
+  $('crop-cancel').onclick = closeCropper;
+  $('crop-save').onclick = saveCrop;
+  // A close event is queued, not immediate, so one from an earlier close can
+  // land after the dialog was reopened - only clear the state when the dialog
+  // is really shut, or the fresh cropper would go dead.
+  $('crop-dialog').addEventListener('close', () => {
+    if (!$('crop-dialog').open) cropState = null;
+  });
+})();
 
 /* appearance: font + text size */
 /* Searchable system-font picker: enumerate installed fonts via the bridge
@@ -3343,6 +3893,18 @@ $('set-chat-opacity').oninput = (e) => {
   applySettings();
 };
 $('set-chat-opacity').onchange = () => saveSettings();
+
+/* text outline + avatar size + typing */
+$('set-text-outline').onchange = (e) => { SET.textOutline = e.target.checked; saveSettings(); };
+$('set-outline-color').oninput = (e) => { SET.textOutlineColor = e.target.value; applySettings(); };
+$('set-outline-color').onchange = () => saveSettings();
+$('set-avatar-size').oninput = (e) => {
+  SET.avatarSize = parseInt(e.target.value, 10);
+  $('set-avatar-size-val').textContent = `${SET.avatarSize}px`;
+  applySettings();
+};
+$('set-avatar-size').onchange = () => saveSettings();
+$('set-type-anywhere').onchange = (e) => { SET.typeAnywhere = e.target.checked; saveSettings(); };
 
 /* shorts feed */
 $('set-shorts-provider').onchange = (e) => { SET.shortsProvider = e.target.value; saveSettings(); };
@@ -4044,6 +4606,7 @@ setInterval(() => {
 
 /* ───────────────────────── boot ───────────────────────── */
 
+wireTypeAnywhere();
 applySettings();
 populateTtsVoiceSelect();
 loadServerSettings().then(() => maybeShowSetup());

@@ -399,7 +399,10 @@ async function scanSessions() {
   return scanLocalSessions();
 }
 
-const SETTINGS_FILE = path.join(__dirname, '..', 'webui-settings.json');
+// UI settings (appearance, agent name/avatar, voice). PI_WEBUI_SETTINGS lets a
+// second instance - a test bridge, say - keep its own file instead of writing
+// over the real one next to the source.
+const SETTINGS_FILE = process.env.PI_WEBUI_SETTINGS || path.join(__dirname, '..', 'webui-settings.json');
 
 // ---------------------------------------------------------------- llama.cpp + pi config
 
@@ -799,6 +802,33 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'bad request' }));
     }
+    return;
+  }
+
+  // Recreate a directory pi needs. A session stores the working directory it
+  // was recorded in; renaming the project folder leaves that path missing and
+  // pi then refuses to open the session. Allowing the folder to be put back
+  // makes those sessions reachable again. Only absolute paths, and the request
+  // has to come from the local UI.
+  if (req.url.startsWith('/api/ensure-dir')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 8192) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const { path: dir } = JSON.parse(body || '{}');
+        if (typeof dir !== 'string' || !dir.trim()) throw new Error('path is required');
+        const abs = path.resolve(dir.trim());
+        if (!path.isAbsolute(abs)) throw new Error('an absolute path is required');
+        const existed = fs.existsSync(abs);
+        fs.mkdirSync(abs, { recursive: true });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: abs, created: !existed }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
     return;
   }
 
