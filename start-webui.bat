@@ -112,7 +112,10 @@ if defined OLD_PID (
   echo.
   echo  A previous Pi Agent WebUI is still listening on port !PORT! ^(PID !OLD_PID!^).
   choice /c yn /n /m "Stop it and start a fresh one? [y/n]: "
-  if errorlevel 2 (
+  rem Only an explicit "y" stops it: choice returns 255 when there is no input
+  rem (a script launching this with a redirected stdin, say), which must not be
+  rem read as permission to kill a bridge that may be in the middle of a turn.
+  if not "!errorlevel!"=="1" (
     echo  Leaving the running WebUI alone.
     pause
     exit /b 0
@@ -133,7 +136,7 @@ endlocal & (
 )
 echo.
 echo  Pi Agent WebUI is running at  http://localhost:%PORT%
-echo  agent workspace : %ROOT%
+echo  agent workspace : %WORKSPACE_DIR%
 echo.
 echo  To STOP it: press Ctrl+C in this window, or close this window.
 echo  (stopping also kills the pi agent + whisper server - nothing is left running)
