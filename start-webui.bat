@@ -31,13 +31,21 @@ if /i "!SOURCE!"=="native" goto :native
 if /i "!SOURCE!"=="docker" if not "!CONTAINER!"=="" goto :docker
 
 :choose
+set "SOURCE="
 echo.
 echo  Where does your pi agent run?
 echo    1. Natively on Windows  (pi CLI installed, no Docker)
 echo    2. Inside a Docker container
 choice /c 12 /n /m "Select [1/2]: "
-if errorlevel 2 goto :choose_docker
-goto :choose_native
+rem An explicit answer only: choice returns 255 when there is no input at all
+rem (a script or shortcut with a redirected stdin), and "errorlevel 2" would
+rem then send it down the Docker path.
+if "!errorlevel!"=="1" goto :choose_native
+if "!errorlevel!"=="2" goto :choose_docker
+echo.
+echo  No selection made - nothing changed.
+pause
+exit /b 1
 
 :choose_native
 set "SOURCE=native"
@@ -46,6 +54,15 @@ goto :native
 
 :choose_docker
 set "SOURCE=docker"
+where docker >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo  Docker is not installed, or not on PATH.
+  echo  Install Docker Desktop, or run this again and pick 1 to use a pi that is
+  echo  installed on Windows.
+  pause
+  exit /b 1
+)
 echo.
 echo  Containers on this machine:
 set /a i=1
