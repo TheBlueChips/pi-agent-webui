@@ -25,6 +25,9 @@
  * handles static images / GIFs). Kept out of the layout entirely. */
 #bg-media {
   position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
+  /* centred so a cropped picture (which is bigger than the frame) stays put
+   * inside it, and the frame does the clipping */
+  display: flex; align-items: center; justify-content: center;
 }
 #bg-media.hidden { display: none; }
 #bg-media video, #bg-media img {
@@ -955,7 +958,14 @@ body.hide-tools .msg.tool { display: none; }
 .session-item.fork { padding-left: 9px; }
 .session-item.fork .s-name { font-size: 12px; color: var(--text-dim); }
 .session-item.fork .s-name::before { content: '↳ '; color: var(--accent); }
-.session-item .fork-badge {
-  float: right; font-size: 9.5px; color: var(--accent);
-  border: 1px solid var(--accent-dim); border-radius: 999px; padding: 0 5px;
+
+/* forked sessions: a thinner row than a full session, grey text, arrow in front */
+.session-item.fork { padding: 3px 9px 3px 12px; margin-bottom: 1px; }
+.session-item.fork .s-name { font-size: 12px; }
+.session-item.fork .s-meta { font-size: 10px; opacity: .8; }
+.session-item .fork-toggle {
+  float: right; font-size: 10px; color: var(--accent); cursor: pointer;
+  border: 1px solid var(--accent-dim); border-radius: 999px; padding: 0 6px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
+.session-item .fork-toggle:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }

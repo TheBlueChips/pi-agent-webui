@@ -353,6 +353,7 @@ const DEFAULT_SETTINGS = {
   shortsMode: 'panel',    // 'panel' (in-app split) | 'window' (side window, full feed) | 'tab' — legacy 'split'='panel', 'popup'='window'
   reelsWidth: null,       // px — the shorts panel width, remembered across launches
   reelsOpen: false,       // was the shorts panel open? restored on load
+  forkCollapsed: {},      // parent session path -> true while its branches are folded away
   autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
   fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
   chatFontSize: 14,       // px — chat + composer text size
@@ -3581,18 +3582,41 @@ function renderSessions(sessions) {
       nameInput.title = `${match.name} — click to rename`;
     }
   }
-  const shown = sessions.filter((s) => !filter || s.name.toLowerCase().includes(filter) || s.fileName.toLowerCase().includes(filter));
+  // Order the list so a session is followed by the forks it spawned, instead of
+  // everything being sorted by time: a branch belongs under the session it came
+  // from. Forks whose parent is gone stay in the list, just without a parent.
+  const byPath = new Map(sessions.map((s) => [s.path, s]));
+  const ordered = [];
+  const placed = new Set();
+  for (const s of sessions) {
+    if (s.parent && byPath.has(s.parent)) continue;      // rendered with its parent
+    if (placed.has(s.path)) continue;
+    ordered.push(s);
+    placed.add(s.path);
+    const kids = sessions.filter((x) => x.parent === s.path).sort((a, b) => b.mtime - a.mtime);
+    for (const k of kids) { ordered.push(k); placed.add(k.path); }
+  }
+  for (const s of sessions) if (!placed.has(s.path)) ordered.push(s);
+
+  const shown = ordered.filter((s) => !filter || s.name.toLowerCase().includes(filter) || s.fileName.toLowerCase().includes(filter));
   if (!shown.length) list.appendChild(el('div', 'session-item s-meta', 'No sessions found'));
+  const collapsed = SET.forkCollapsed || {};
+  const hiddenForks = new Set();
+  for (const [parentPath, isCollapsed] of Object.entries(collapsed)) {
+    if (!isCollapsed) continue;
+    for (const x of sessions) if (x.parent === parentPath) hiddenForks.add(x.path);
+  }
   for (const s of shown) {
+    if (hiddenForks.has(s.path)) continue;
     const item = el('div', 'session-item');
-    // A session that was forked off another one: small, indented and marked
-    // with an arrow, so the branch structure is visible in the list.
-    const parentName = s.parent ? (sessions.find((x) => x.path === s.parent) || {}).name : null;
+    // A session that was forked off another one: thinner row, smaller grey text
+    // and an arrow in front, so the branch structure is visible in the list.
+    const parentName = s.parent ? (byPath.get(s.parent) || {}).name : null;
     if (s.parent) {
       item.classList.add('fork');
       item.title = parentName ? `branched from "${parentName}"` : `branched from ${s.parent}`;
     }
-    const forks = sessions.filter((x) => x.parent === s.path).length;
+    const kids = sessions.filter((x) => x.parent === s.path);
     const isCurrent = current && (s.path === current || s.fileName === current.split(/[\\/]/).pop());
     const isViewed = S.viewSession
       ? (s.path === S.viewSession || s.fileName === S.viewSession.split(/[\\/]/).pop())
@@ -3605,7 +3629,19 @@ function renderSessions(sessions) {
     const nameRow = el('div', 's-name');
     if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
     nameRow.appendChild(document.createTextNode(s.name));
-    if (forks) nameRow.appendChild(el('span', 'fork-badge', `⑂${forks}`));
+    if (kids.length) {
+      // A toggle, not a badge: the branches fold away under their parent.
+      const isCollapsed = !!(SET.forkCollapsed || {})[s.path];
+      const toggle = el('span', 'fork-toggle', `${isCollapsed ? '▸' : '▾'} ${kids.length}`);
+      toggle.title = isCollapsed ? `show ${kids.length} branch${kids.length > 1 ? 'es' : ''}` : 'hide the branches';
+      toggle.onclick = (e) => {
+        e.stopPropagation();
+        SET.forkCollapsed = { ...(SET.forkCollapsed || {}), [s.path]: !isCollapsed };
+        saveSettings();
+        refreshSessions();
+      };
+      nameRow.appendChild(toggle);
+    }
     item.appendChild(nameRow);
     item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
     item.onclick = () => switchToSession(s.path);
@@ -4198,16 +4234,30 @@ function cropRatios(node, frameAspect) {
 function applyCrop(node, crop, frameAspect) {
   if (!node) return;
   const c = normalizeCrop(crop);
-  if (!c) { node.style.objectPosition = ''; node.style.transform = ''; return; }
+  const nw = node.naturalWidth || node.videoWidth || 0;
+  const nh = node.naturalHeight || node.videoHeight || 0;
+  if (!c || !nw || !nh) {
+    node.style.width = '';
+    node.style.height = '';
+    node.style.objectPosition = '';
+    node.style.transform = '';
+    return;
+  }
   const { cw, ch } = cropRatios(node, frameAspect);
   const z = Math.max(1, Number(c.z) || 1);
-  // Negative: the visible window moves the *other* way from the crop rect's
-  // position inside the picture. With the sign the wrong way round, the saved
-  // image came out mirrored compared to the preview - which is why the cropped
-  // part was never where it had been chosen.
-  const tx = -(Number(c.fx) || 0) * 50 * (z * cw - 1);
-  const ty = -(Number(c.fy) || 0) * 50 * (z * ch - 1);
+  // The element is sized to the cover rect of its frame (E = cw·B) and the frame
+  // wrapper clips it. object-fit content is clipped to the element box, so
+  // translating a box the same size as the frame dragged it away from under its
+  // own picture and left black gaps - the picture has to be bigger than the
+  // frame and move inside it.
+  node.style.width = `${cw * 100}%`;
+  node.style.height = `${ch * 100}%`;
   node.style.objectPosition = '50% 50%';
+  // Pan range at zoom z is (z·E − B)/2, which as a share of the element is
+  // 50·(z − B/E) = 50·(z − 1/cw). Negative because moving the visible window to
+  // the right means moving the picture to the left.
+  const tx = -(Number(c.fx) || 0) * 50 * (z - 1 / cw);
+  const ty = -(Number(c.fy) || 0) * 50 * (z - 1 / ch);
   node.style.transform = `translate(${tx}%, ${ty}%) scale(${z})`;
 }
 
