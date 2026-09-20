@@ -240,16 +240,13 @@ function startCardTimer(card) {
   card._start = Date.now();
   const tick = () => {
     card.timerEl.classList.remove('hidden');
-    // A bash call with a timeout counts down instead of up - "done" while the
-    // command is still running was the confusing part, and a countdown says how
-    // long it has left.
+    // Always counts up: the countdown a bash timeout used to produce looked
+    // like a timer that was running backwards, and "3:00 left" said nothing
+    // about how long the call had already been going.
+    card.timerEl.textContent = fmtElapsed(Date.now() - card._start);
     if (card._timeoutMs) {
-      const left = Math.max(0, card._timeoutMs - (Date.now() - card._start));
-      const s = left / 1000;
-      const mm = Math.floor(s / 60);
-      card.timerEl.textContent = `${mm}:${String(Math.floor(s % 60)).padStart(2, '0')} left`;
-    } else {
-      card.timerEl.textContent = fmtElapsed(Date.now() - card._start);
+      card.timerEl.title = `timeout ${Math.round(card._timeoutMs / 1000)}s`;
+      card.timerEl.classList.toggle('over-timeout', Date.now() - card._start > card._timeoutMs);
     }
   };
   tick();
@@ -641,7 +638,11 @@ function handleRpcMessage(msg) {
         // switchToSession; the raw pi error is not useful on top of that.
         const handledElsewhere = msg.command === 'switch_session' &&
           /working directory does not exist/i.test(msg.error || '');
-        if (!handledElsewhere) toast(`Agent error (${msg.command}): ${msg.error}`, 'error');
+        // An oversized-tree stack overflow here is self-inflicted (leafPath) and
+        // harmless; putting it in the transcript looked like the agent broke.
+        if (/Maximum call stack size exceeded/i.test(String(msg.error))) {
+          console.warn(`handled silently (${msg.command}): ${msg.error}`);
+        } else if (!handledElsewhere) toast(`Agent error (${msg.command}): ${msg.error}`, 'error');
       }
     }
     return;
@@ -742,6 +743,21 @@ let openMenuEl = null;
 function closeMenu() {
   if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; }
 }
+
+/* Only one dropdown may be on screen. Every opener goes through this, and a
+ * capture-phase pointerdown closes whichever menu was not clicked - so the
+ * model menu and the thinking menu can never overlap, whatever route opened
+ * them. */
+function closeAllMenus() {
+  closeMenu();
+  toggleModelMenu(false);
+}
+document.addEventListener('pointerdown', (e) => {
+  const t = e.target;
+  if (!t || !t.closest) return;
+  if (!t.closest('#model-menu') && !t.closest('#model-btn')) toggleModelMenu(false);
+  if (!t.closest('.model-menu')) closeMenu();
+}, true);
 
 function openMenu(anchor, items, opts = {}) {
   const wasOpenFor = openMenuEl && openMenuEl._anchor === anchor;
@@ -1168,17 +1184,23 @@ async function refreshForkable() {
 /* The entries from the root down to the current leaf - the active branch. */
 function leafPath(tree, leafId) {
   if (!Array.isArray(tree)) return [];
-  let found = null;
-  const walk = (nodes, acc) => {
-    for (const n of nodes) {
-      const next = [...acc, n.entry];
-      if (n.entry.id === leafId) { found = next; return true; }
-      if (n.children && n.children.length && walk(n.children, next)) return true;
-    }
-    return false;
-  };
-  walk(tree, []);
-  return found || [];
+  // Iterative on purpose: a long session's branch is one node deep per message,
+  // and the recursive version blew the call stack on big sessions - which pi
+  // reported as "Agent error (get_tree): Maximum call stack size exceeded" at
+  // the start of every turn.
+  const seen = new Set();
+  const stack = [];
+  for (let i = tree.length - 1; i >= 0; i--) stack.push({ node: tree[i], path: [] });
+  while (stack.length) {
+    const { node, path } = stack.pop();
+    if (!node || seen.has(node)) continue;
+    seen.add(node);
+    const next = [...path, node.entry];
+    if (node.entry && node.entry.id === leafId) return next;
+    const kids = node.children || [];
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i], path: next });
+  }
+  return [];
 }
 
 async function refreshStats() {
@@ -1537,8 +1559,9 @@ function renderUserMessage(msg) {
   if (images.length) {
     for (const im of images) {
       const img = el('img', 'msg-img');
-      img.src = `data:${im.mimeType || 'image/png'};base64,${im.data}`;
-      img.onclick = () => zoomImage(img.src);
+      const dataUrl = `data:${im.mimeType || 'image/png'};base64,${im.data}`;
+      lazySrc(img, dataUrl);
+      img.onclick = () => zoomImage(img.dataset.src || dataUrl);
       bubble.appendChild(img);
     }
   }
@@ -1884,6 +1907,42 @@ function buildCompactionSummary(msg, extra) {
   return root;
 }
 
+/* Transcript images are inline data: URLs, and a long session with a few dozen
+ * of them used to keep every one of them decoded for the life of the page -
+ * hundreds of megabytes. The source waits in a data attribute and the element
+ * only gets it while it is near the viewport; far away the bitmap is dropped
+ * again, so scrolling back and forth reloads instead of hoarding. */
+let mediaNear = null;
+let mediaFar = null;
+function lazySrc(node, src) {
+  if (!node || !src) return node;
+  node.dataset.src = src;
+  node.decoding = 'async';
+  node.setAttribute('loading', 'lazy');
+  if (!mediaNear) {
+    mediaNear = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const n = e.target;
+        const want = n.dataset.src;
+        if (!e.isIntersecting || !want) continue;
+        if (n.getAttribute('src') !== want) n.setAttribute('src', want);
+      }
+    }, { rootMargin: '1200px 0px' });
+    mediaFar = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const n = e.target;
+        if (e.isIntersecting) continue;
+        if (n.tagName === 'VIDEO') { try { n.pause(); } catch { } }
+        n.removeAttribute('src');
+        if (n.tagName === 'VIDEO') { try { n.load(); } catch { } }
+      }
+    }, { rootMargin: '3000px 0px' });
+  }
+  mediaNear.observe(node);
+  mediaFar.observe(node);
+  return node;
+}
+
 /* Live "compacting…" marker, shown the moment compaction_start arrives so the
  * user sees compaction happen in real time (with an elapsed timer). Replaced
  * by renderCompactionBlock() when compaction_end arrives. */
@@ -2037,25 +2096,17 @@ async function refreshMessages() {
       prevTs = m.timestamp;
     }
   }
-  // Put each compaction we watched happen back where it happened: after the last
-  // message that already existed when it ran. Messages produced later have a
-  // newer timestamp, so they render after the marker and it stays put instead of
-  // being re-appended to the bottom on every turn. (Agent-session markers only —
-  // they don't belong in a read-only render of another session.)
+  // A compaction marker sits at the end of the transcript, so typing or a new
+  // answer never pushes it out of sight.
   if (!S.viewSession) {
-    const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
     for (const k of marks) {
-      let target = null;
-      if (k.at != null) {
-        for (const n of plain) {
-          const ts = Number(n.dataset.ts);
-          if (ts && ts <= k.at) target = n;
-        }
-      }
-      const node = buildCompactionSummary(k, { live: true, count: marks.length });
-      if (target) target.after(node);
-      else if (plain.length) plain[0].before(node);
-      else chat.appendChild(node);
+      const node = buildCompactionSummary(k, {
+        live: true,
+        count: marks.length,
+        estimatedTokensAfter: k.estimatedTokensAfter,
+      });
+      node.dataset.compaction = '1';
+      chat.appendChild(node);
     }
     // A compaction still in flight keeps its "compacting…" indicator: the
     // re-render above wiped the DOM node it lived in.
@@ -2063,6 +2114,16 @@ async function refreshMessages() {
   }
   S.totals = { read, write };
   updateTotals();
+  // The last turn's total belongs on the last message: bring it back after a
+  // re-render (a settle, a reload, a session re-read).
+  if (S.lastTurn && S.lastTurn.ms) {
+    const bubbles = chat.querySelectorAll('.msg.assistant .bubble');
+    const b = bubbles.length ? bubbles[bubbles.length - 1] : null;
+    if (b) {
+      b.querySelectorAll('.turn-timer').forEach((n) => n.remove());
+      b.appendChild(el('div', 'turn-timer', `turn took ${fmtElapsed(S.lastTurn.ms)}`));
+    }
+  }
   // Re-wire fork indexes for user messages in order.
   const userEls = [...chat.querySelectorAll('.msg.user')];
   userEls.forEach((e, i) => e.dataset.forkIdx = String(i));
@@ -2114,20 +2175,24 @@ function handleEvent(msg) {
     }
     case 'agent_start':
       S.isStreaming = true;
+      // The turn clock starts here (and covers thinking, tool calls and waiting).
+      // It used to be set in a second `case 'agent_start'` label further down -
+      // dead code, because the first matching case wins, so every turn was
+      // measured as 0.0s.
+      S.turnStartTs = Date.now();
       updateStreamUi();
       autoOpenShortsIfEnabled();
       break;
     case 'agent_end':
-    case 'agent_start':
-      // When the turn began: the timer under the last message counts from here,
-      // so it covers everything - thinking, tool calls and waiting.
-      S.turnStartTs = Date.now();
       break;
     case 'agent_settled':
       if (msg.type === 'agent_settled') {
         S.isStreaming = false;
         autoCloseShortsIfOurs();
-        stampTurnTimer();
+        // The turn total is stamped after the transcript has been finalised
+        // below: stamping it here put the number into a bubble that finalizeLive()
+        // then replaced, so the total never showed up.
+        S.turnPendingStamp = true;
         // The turn is in the session file now: (re)attach fork ids to the rows.
         stampForkIds().catch(() => {});
         // After a compaction the session history no longer matches the chat
@@ -2151,11 +2216,27 @@ function handleEvent(msg) {
         refreshForkable().catch(() => {});
         refreshSessions().catch(() => {});
       }
+      // Now that the transcript is settled, write the total time the turn took
+      // (and put the compaction marker back at the end of the list).
+      if (S.turnPendingStamp) {
+        S.turnPendingStamp = false;
+        setTimeout(() => { stampTurnTimer(); pinCompactionMarkers(); }, 0);
+      }
+      // A compaction that never reported back would otherwise leave the status
+      // bar saying "compacting…" for the rest of the session.
+      if (S.compacting) {
+        S.compacting = false;
+        removeCompactionLive();
+        clearCompactLabelSoon();
+      }
       // Send the next message the user queued during compaction, now that the
       // agent is idle (agent_settled). No-op when the queue is empty.
       flushCompactionQueue();
       break;
     case 'message_start':
+      // A turn that begins with a tool call may not fire agent_start in some
+      // versions; make sure the clock is running either way.
+      if (!S.turnStartTs) S.turnStartTs = Date.now();
       startLive();
       break;
     case 'message_update':
@@ -2213,17 +2294,25 @@ function handleEvent(msg) {
       // Live "compacting…" block with an elapsed timer, removed on compaction_end.
       if (!S.compactionLive) S.compactionLive = renderCompactionLive();
       break;
-    case 'compaction_end':
+    case 'compaction_end': {
+      // Declared out here: these used to be consts inside the `else if (msg.result)`
+      // block and read after it, so this handler threw a ReferenceError before it
+      // could refresh - leaving "compacting…" in the status bar forever and the
+      // compacted-to size nowhere.
+      let before = null;
+      let after = null;
       S.compacting = false;
       if (msg.aborted) {
         removeCompactionLive();
+        clearCompactLabelSoon();
         toast('Compaction cancelled', 'warning');
       } else if (msg.errorMessage) {
         removeCompactionLive();
+        clearCompactLabelSoon();
         toast(msg.errorMessage, 'error');
       } else if (msg.result) {
-        const before = msg.result.tokensBefore;
-        const after = msg.result.estimatedTokensAfter;
+        before = msg.result.tokensBefore;
+        after = msg.result.estimatedTokensAfter;
         toast(`Compacted: ${before != null ? formatTok(before) : '?'} → ${after != null ? formatTok(after) : '?'} tokens`);
         S.lastCompaction = msg.result;
         // Remember it so refreshMessages() can put the marker back where it
@@ -2237,16 +2326,20 @@ function handleEvent(msg) {
         // /compact never auto-continues (the user asked for it, task was done).
         // Only auto-compactions (threshold/overflow without retry) need a nudge.
         if (!msg.willRetry && msg.reason !== 'manual') S.compactionNeedsContinue = true;
+      } else {
+        removeCompactionLive();
       }
       // Context is unknown to pi right after compaction (it reports tokens:null
       // until the next response), which left the ring showing a dash until the
       // session was switched. Show the estimated size the compaction itself
       // reported, then keep asking until pi has a real number.
       if (after != null) showCompactionEstimate(after);
+      clearCompactLabelSoon();
       refreshStats().catch(() => {});
       scheduleStatsRetry();
       flushCompactionQueue();
       break;
+    }
     default:
       break;
   }
@@ -2260,22 +2353,40 @@ function stampTurnTimer() {
   const start = S.turnStartTs;
   S.turnStartTs = null;
   if (!start) return;
+  const ms = Date.now() - start;
+  // Remembered so a later re-render (or a session reload) can put the total
+  // back on the last message instead of losing it.
+  S.lastTurn = { ms, ts: Date.now() };
+  const stat = $('stat-turn');
+  if (stat) {
+    stat.textContent = `turn ${fmtElapsed(ms)}`;
+    stat.title = `the last turn took ${fmtElapsed(ms)} (thinking, tool calls and waiting included)`;
+    stat.classList.remove('live');
+  }
   const bubbles = chat.querySelectorAll('.msg.assistant .bubble');
   const bubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
   if (!bubble) return;
   bubble.querySelectorAll('.turn-timer').forEach((n) => n.remove());
-  bubble.appendChild(el('div', 'turn-timer', `turn took ${fmtElapsed(Date.now() - start)}`));
+  bubble.appendChild(el('div', 'turn-timer', `turn took ${fmtElapsed(ms)}`));
 }
 
-/* Live version while the turn is running, inside the streaming message. */
-function startTurnTimer(root) {
-  const foot = el('div', 'turn-timer', 'turn running…');
-  root.querySelector('.bubble').appendChild(foot);
+/* Live version while the turn is running: lives in the status bar (where the
+ * total ends up) instead of inside the message being written. */
+function startTurnTimer() {
+  const stat = $('stat-turn');
   const started = S.turnStartTs || Date.now();
-  const tick = () => { foot.textContent = `turn running… ${fmtElapsed(Date.now() - started)}`; };
+  if (!stat) return () => {};
+  stat.classList.add('live');
+  const tick = () => { stat.textContent = `turn ${fmtElapsed(Date.now() - started)}`; };
   tick();
   const t = setInterval(tick, 1000);
   return () => clearInterval(t);
+}
+
+/* A compaction marker belongs at the end of the transcript the user is looking
+ * at, so it stays visible while the next answer streams in. */
+function pinCompactionMarkers() {
+  for (const node of chat.querySelectorAll('.msg.compaction.pinned')) chat.appendChild(node);
 }
 
 function startLive() {
@@ -2295,7 +2406,7 @@ function startLive() {
   const dots = el('span', 'streaming-dots');
   for (let i = 0; i < 3; i++) dots.appendChild(el('span', 'dot', '.'));
   root.querySelector('.who-text').replaceChildren(document.createTextNode(' · '), dots);
-  const stopTurnTimer = startTurnTimer(root);
+  const stopTurnTimer = startTurnTimer();
   // While another session is on screen the live message stays out of it: new
   // turns used to be appended to whatever transcript was open, so the agent
   // appeared to write into the session you were reading.
@@ -2541,6 +2652,18 @@ function scheduleStatsRetry() {
   [3000, 8000, 20000].forEach((ms) => setTimeout(() => { refreshStats().catch(() => {}); }, ms));
 }
 
+/* Put a real number back in the status bar in case the "compacting…" state is
+ * left over (a compaction that was cancelled, failed, or whose end event never
+ * arrived). Anything the ring has already shown is left alone. */
+function clearCompactLabelSoon() {
+  setTimeout(() => {
+    const label = $('ctx-label');
+    if (!label || label.textContent !== 'compacting…') return;
+    label.textContent = '–';
+    refreshStats().catch(() => {});
+  }, 250);
+}
+
 function updateStreamUi() {
   // The Stop button appears next to the (always visible) Send button while the
   // agent is generating, so you can stop generation or steer/queue a message.
@@ -2659,6 +2782,10 @@ function autoSize() {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 200) + 'px';
   syncComposerText();
+  // The chat shrinks as the box grows; without this the transcript shifted up
+  // and the last thing written (a compaction marker, a tool call) slid out of
+  // view while typing.
+  if (S.stickToBottom) pinSoon();
 }
 input.addEventListener('input', () => { autoSize(); updateSlashMenu(); });
 

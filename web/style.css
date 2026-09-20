@@ -569,12 +569,20 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 }
 .status-bar { padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap; }
 
-#composer {
-  padding: 4px 12px 10px;
-  background: color-mix(in srgb, var(--bg) calc(var(--ui-alpha) * 100%), transparent);
+/* No slab behind the whole composer strip: only the actual controls carry a
+ * background, so typing more (or adding attachments) never stretches a dark bar
+ * past the elements themselves. */
+#composer { padding: 4px 12px 10px; }
+#stats-bar {
+  padding: 3px 8px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
   backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
   -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
 }
+/* the live turn clock in the status bar, frozen into the total when it settles */
+#stat-turn.live { color: var(--accent); }
+.tool-timer.over-timeout { color: var(--yellow); }
 .edit-banner {
   max-width: 860px; margin: 0 auto 6px;
   background: #2b2410; border: 1px solid var(--yellow); border-radius: 8px;
