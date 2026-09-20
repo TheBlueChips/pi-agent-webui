@@ -26,13 +26,13 @@ const WHISPER_PORT = process.env.WHISPER_PORT || '8081';
  * are what actually matters when choosing (accuracy vs speed vs machine). */
 const WHISPER_MODELS = [
   { id: 'ggml-tiny.en.bin', label: 'Tiny (English)', size: '75 MB',
-    note: 'Fastest, works on anything. Fine for short commands and names, but it will miss words in longer sentences.' },
+    note: 'Fastest, and only understandable for clear English.' },
   { id: 'ggml-base.en.bin', label: 'Base (English)', size: '142 MB',
-    note: 'The sensible default: good accuracy on normal speech, still quick on a laptop CPU.' },
+    note: 'The default: quick and decent for English dictation.' },
   { id: 'ggml-small.en.bin', label: 'Small (English)', size: '466 MB',
-    note: 'Clearly better with accents, background noise and technical words. Needs a few CPU cores, noticeably slower.' },,
+    note: 'Noticeably better English accuracy, still quick.' },
   { id: 'ggml-large-v3.bin', label: 'Large v3 (multilingual)', size: '3.1 GB',
-    note: 'The biggest multilingual model - the most accurate, and the slowest to download and run.' }
+    note: 'The biggest multilingual model: best accuracy for any language, needs about 4 GB of memory and a long first download.' }
 ];
 const DEFAULT_MODEL = process.env.WHISPER_MODEL || 'ggml-base.en.bin';
 const VENDOR_DIR = path.join(__dirname, 'whisper');

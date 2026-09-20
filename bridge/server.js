@@ -660,6 +660,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/health')) {
+    // Which build is this? Two machines on the same URL can be serving very
+    // different copies of web/, and there was no way to tell them apart.
+    let build = 'unknown';
+    try {
+      const st = fs.statSync(path.join(__dirname, '..', 'web', 'app.js'));
+      build = Math.round(st.mtimeMs) + '-' + st.size;
+    } catch { /* not a checkout */ }
     // `busy` is the whole point for the multi-instance switcher: every other
     // instance polls this to show a pulsing dot while that agent is working.
     // It is the one endpoint that also answers cross-origin requests (see CORS
@@ -667,6 +674,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const payload = {
       ok: true,
+      build,
       busy: agentStatus.busy,
       name: agentStatus.sessionName || null,
     };

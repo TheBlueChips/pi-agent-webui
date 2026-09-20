@@ -216,6 +216,10 @@ function syncVoiceSettingsUi() {
     const t = (l.textContent || '').trim();
     if (t === 'Whisper model' || t === 'Whisper endpoint') l.classList.toggle('hidden', !whisper);
   });
+  // Fetch the list even when browser STT is selected: it is one request, and
+  // otherwise the whisper choices (including the multilingual model) only
+  // existed after you had already switched to whisper and back.
+  if (!sttModelsLoaded) loadSttModels();
   if (whisper) { loadSttModels(); refreshSttStatus(); }
 }
 
@@ -455,6 +459,8 @@ function applySettings() {
   document.querySelectorAll('.tool-card .tool-body').forEach((b) => {
     b.classList.toggle('hidden', SET.autoExpandTools !== true);
   });
+  // Runs here, once the settings are in: ?from=<instance> from the switcher.
+  absorbFromParam();
 }
 
 /* ───────────────────────── state ───────────────────────── */
@@ -534,20 +540,27 @@ function connect() {
     else if (msg.bridge === 'agent_stderr' && msg.text.trim()) console.warn('[pi stderr]', msg.text);
   };
   ws.onclose = () => {
-    setConn('off');
-    S.isStreaming = false;
-    // Connection lost mid-turn: mark any live tool cards as failed so they
-    // don't sit on "running…" forever.
-    markStuckToolCards('connection lost');
-    removeCompactionLive();
-    // In-flight RPCs will never get a response — fail them now instead of
-    // making callers wait out their full timeout.
-    for (const [id, p] of [...S.pending]) {
-      S.pending.delete(id);
-      p.reject(new Error('connection lost'));
+    // Everything in here is cleanup, and any one step throwing used to skip the
+    // reconnect below - leaving the page sitting there disconnected, with the
+    // whole UI quietly broken until a manual reload.
+    try {
+      setConn('off');
+      S.isStreaming = false;
+      // Connection lost mid-turn: mark any live tool cards as failed so they
+      // don't sit on "running…" forever.
+      markStuckToolCards('connection lost');
+      removeCompactionLive();
+      // In-flight RPCs will never get a response — fail them now instead of
+      // making callers wait out their full timeout.
+      for (const [id, p] of [...S.pending]) {
+        S.pending.delete(id);
+        p.reject(new Error('connection lost'));
+      }
+      updateStreamUi();
+      showBanner('error', 'Connection to the bridge lost — reconnecting…', 'Retry now', () => connect());
+    } catch (e) {
+      console.warn('reconnect cleanup failed:', e && e.message);
     }
-    updateStreamUi();
-    showBanner('error', 'Connection to the bridge lost — reconnecting…', 'Retry now', () => connect());
     scheduleReconnect();
   };
   ws.onerror = () => { /* onclose follows */ };
@@ -1339,7 +1352,24 @@ function atBottom(slack = 60) {
   return chat.scrollHeight - chat.scrollTop - chat.clientHeight < slack;
 }
 
+/* Where does a transcript node go? Normally the chat. While another session is
+ * on screen the agent's own output must not be mixed into it - that is why a turn
+ * running in the background used to appear in whatever session you were reading.
+ * It waits in a detached fragment until you switch back. transcriptTarget is set
+ * while a transcript is rebuilt for display, so re-rendering the session you are
+ * looking at still lands in the chat. */
+let transcriptTarget = null;
+function transcriptHost() {
+  if (transcriptTarget) return transcriptTarget;
+  if (!S.viewSession) return chat;
+  const keep = S.liveDetached && S.liveDetached.frag ? S.liveDetached.frag : document.createDocumentFragment();
+  S.liveDetached = { path: S.state.sessionFile, frag: keep };
+  return keep;
+}
+
 function scrollBottom(force) {
+  if (!force && transcriptTarget && transcriptTarget !== chat) return; // nothing was added to what you see
+
   if (!force && S.liveDetached) return; // the live view is parked; don't scroll the visible session
   if (!force && S.userScrolling) return; // never pin from under an active wheel/touch gesture
   if (force || S.stickToBottom) {
@@ -1570,7 +1600,7 @@ function renderUserMessage(msg) {
     body.innerHTML = renderMarkdown(text).replace(/^<p>/, '').replace(/<\/p>$/, '');
     bubble.appendChild(body);
   }
-  chat.appendChild(root);
+  transcriptHost().appendChild(root);
   scrollBottom();
 }
 
@@ -1659,7 +1689,7 @@ function renderAssistantMessage(msg, timing) {
     }
   }
   if (!bubble.childNodes.length) bubble.appendChild(el('div', 'md', '(empty message)'));
-  chat.appendChild(root);
+  transcriptHost().appendChild(root);
   scrollBottom();
 }
 
@@ -1840,7 +1870,7 @@ function renderToolResult(msg) {
     c.body.classList.remove('hidden');
     bubble.appendChild(c.card);
     root.querySelector('.who').remove();
-    chat.appendChild(root);
+    transcriptHost().appendChild(root);
     scrollBottom();
   }
 }
@@ -1863,7 +1893,7 @@ function renderBashExecution(msg) {
   const { root, bubble } = makeMsgShell('system', `system · ${timeStr(msg.timestamp)}`);
   root.querySelector('.who').remove();
   bubble.textContent = `$ ${msg.command}\n${msg.output || '(no output)'}`;
-  chat.appendChild(root);
+  transcriptHost().appendChild(root);
   scrollBottom();
 }
 
@@ -1880,7 +1910,7 @@ function renderBashExecution(msg) {
  * the live block was), so it is always visible and its summary expandable.
  * Older compactions still render inline so scrolling back stays accurate. */
 function renderCompactionSummary(msg, extra) {
-  chat.appendChild(buildCompactionSummary(msg, extra));
+  transcriptHost().appendChild(buildCompactionSummary(msg, extra));
 }
 
 /* Build the "conversation compacted" marker WITHOUT inserting it, so callers can
@@ -1955,7 +1985,7 @@ function renderCompactionLive() {
   const timer = el('span', 'tool-timer');
   who.appendChild(timer);
   root.appendChild(who);
-  chat.appendChild(root);
+  transcriptHost().appendChild(root);
   const start = Date.now();
   const t = setInterval(() => { timer.textContent = fmtElapsed(Date.now() - start); }, 500);
   if (S.stickToBottom) scrollBottom();
@@ -1986,7 +2016,7 @@ function renderCompactionBlock(result, reason) {
   body.innerHTML = renderMarkdown(result.summary || '');
   detail.appendChild(body);
   root.append(who, detail);
-  chat.appendChild(root);
+  transcriptHost().appendChild(root);
   if (S.stickToBottom) scrollBottom();
 }
 
@@ -2105,6 +2135,7 @@ async function refreshMessages() {
   const win = Math.max(80, S.historyWindow || 400);
   const windowed = msgs.length > win;
   const skipped = new Set(windowed ? msgs.slice(0, msgs.length - win) : []);
+  transcriptTarget = chat;   // this rebuild is for the transcript on screen
   for (const m of msgs) {
     // Totals count every message, rendered or not.
     if (m.usage) {
@@ -2133,6 +2164,7 @@ async function refreshMessages() {
       prevTs = m.timestamp;
     }
   }
+  transcriptTarget = null;
   // A compaction marker sits at the end of the transcript, so typing or a new
   // answer never pushes it out of sight.
   if (!S.viewSession) {
@@ -2485,13 +2517,7 @@ function startLive() {
   // While another session is on screen the live message stays out of it: new
   // turns used to be appended to whatever transcript was open, so the agent
   // appeared to write into the session you were reading.
-  if (S.viewSession) {
-    const frag = S.liveDetached && S.liveDetached.frag ? S.liveDetached.frag : document.createDocumentFragment();
-    frag.appendChild(root);
-    S.liveDetached = { path: S.state.sessionFile, frag };
-  } else {
-    chat.appendChild(root);
-  }
+  transcriptHost().appendChild(root);
   S.live = { root, md, text: '', thinking: '', thinkingEl: null, caret: el('span', 'streaming-caret'),
     stopTurnTimer,
     toolByIndex: new Map(),   // contentIndex -> tool card while a call is streaming
@@ -3063,7 +3089,7 @@ async function sendBash(command) {
   root.querySelector('.who').remove();
   const out = el('div', null, `$ ${command}\n`);
   bubble.appendChild(out);
-  chat.appendChild(root);
+  transcriptHost().appendChild(root);
   scrollBottom(true);
   try {
     const cmd = { type: 'bash', command };
@@ -3935,6 +3961,7 @@ async function renderSessionFromDisk(sessionPath) {
     const msgs = d.messages;
     const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
     chat.innerHTML = '';
+    transcriptTarget = chat;
     for (const m of msgs) {
       if (m.role === 'user') renderUserMessage(m);
       else if (m.role === 'assistant') renderAssistantMessage(m);
@@ -3942,6 +3969,7 @@ async function renderSessionFromDisk(sessionPath) {
       else if (m.role === 'bashExecution') renderBashExecution(m);
       else if (m.role === 'compactionSummary') renderCompactionSummary(m);
     }
+    transcriptTarget = null;
     // Put the file's compaction markers back where they happened.
     if (d.compactions.length) {
       const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
@@ -5717,9 +5745,19 @@ async function forkAt(entryId, text) {
   });
   if (!ok) return;
   try {
-    await rpc({ type: 'fork', entryId });
+    // pi forks *before* the message you picked and returns its text so the client
+    // can send it again - that is what its own UI does with the reply. Ignoring
+    // it left the new branch ending one turn earlier than the turn you clicked,
+    // which is why every fork looked like it came from the wrong turn.
+    const res = await rpc({ type: 'fork', entryId });
     await initSession(false);
-    toast('Forked - continue from here');
+    const again = res && typeof res.text === 'string' ? res.text.trim() : '';
+    if (again && !res.cancelled) {
+      toast('Forked - continuing from here');
+      rpc({ type: 'prompt', message: res.text }).catch((e) => toast(`Continue failed: ${e.message}`, 'error'));
+    } else {
+      toast('Forked - continue from here');
+    }
   } catch (e) {
     toast(`Fork failed: ${e.message}`, 'error');
   }
@@ -5776,9 +5814,15 @@ async function forkInOtherSession(entryId, text) {
     S.viewSession = null;
     S.liveDetached = null;
     await initSession(false);
-    await rpc({ type: 'fork', entryId });
+    const res = await rpc({ type: 'fork', entryId });
     await initSession(false);
-    toast('Forked - continue from here');
+    const again = res && typeof res.text === 'string' ? res.text.trim() : '';
+    if (again && !res.cancelled) {
+      toast('Forked - continuing from here');
+      rpc({ type: 'prompt', message: res.text }).catch((e) => toast(`Continue failed: ${e.message}`, 'error'));
+    } else {
+      toast('Forked - continue from here');
+    }
   } catch (e) {
     toast(`Fork failed: ${e.message}`, 'error');
   }
@@ -5871,7 +5915,34 @@ function openInstanceMenu(anchor, force) {
 function switchInstance(inst) {
   if (inst.url === location.origin) return;
   toast(`Switching to ${inst.name}…`);
-  location.href = inst.url;
+  // Tell the other instance where we came from: without it you could switch away
+  // and had no way back, because its list knew nothing about this one.
+  const me = SET.instanceName || 'this machine';
+  const sep = inst.url.includes('?') ? '&' : '?';
+  location.href = `${inst.url}${sep}from=${encodeURIComponent(location.origin)}&fromName=${encodeURIComponent(me)}`;
+}
+
+/* An instance opened through the switcher arrives with ?from=… - add it to the
+ * list so the switcher can go back. Runs once, from updateInstanceBtn. */
+let absorbedFrom = false;
+function absorbFromParam() {
+  if (absorbedFrom) return;
+  let params;
+  try { params = new URL(location.href).searchParams; } catch { absorbedFrom = true; return; }
+  const from = params.get('from');
+  if (!from) { absorbedFrom = true; return; }
+  // Only now is it safe to touch the list: called before the settings arrive,
+  // SET was replaced wholesale a moment later and the new entry was lost.
+  absorbedFrom = true;
+  let base;
+  try { base = new URL(from).origin; } catch { return; }
+  const name = params.get('fromName') || base;
+  if (base && base !== location.origin && !allInstances().some((i) => i.url === base)) {
+    SET.instances = [...(SET.instances || []), { id: `i${Date.now().toString(36)}`, name, url: base }];
+    saveSettings();
+    toast(`Added "${name}" to the instance list so you can switch back`);
+  }
+  try { history.replaceState(null, '', location.pathname); } catch { /* ignore */ }
 }
 
 function addInstance() {
