@@ -1992,6 +1992,15 @@ function renderCompactionBlock(result, reason) {
 
 // Read a session transcript from the bridge (messages + the compaction
 // entries, which are not messages and so are absent from get_messages).
+/* pi writes timestamps as ISO strings; every comparison below is numeric, and
+ * Number("2026-09-20T...") is NaN - which is why every compaction marker landed
+ * at the top of the transcript instead of where it happened. */
+function tsMs(v) {
+  if (v == null) return 0;
+  const n = typeof v === 'number' ? v : Date.parse(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
 async function fetchSession(sessionPath) {
   const r = await fetch(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`);
   const d = await r.json();
@@ -2000,7 +2009,7 @@ async function fetchSession(sessionPath) {
     messages: d.messages || [],
     compactions: (d.compactions || []).map((c) => ({
       ...c,
-      at: c.timestamp ? Date.parse(c.timestamp) : null,
+      at: tsMs(c.timestamp),
     })),
   };
 }
@@ -2044,6 +2053,12 @@ async function refreshMessages() {
   const marks = [...S.compactionMarks];
   const markSeen = new Set(marks.map((k) => k.summary));
   for (const k of fileMarks) if (k.summary && !markSeen.has(k.summary)) marks.push(k);
+  for (const m of msgs) {
+    if (m && m.timestamp != null && typeof m.timestamp !== 'number') {
+      const n = Date.parse(m.timestamp);
+      if (Number.isFinite(n)) m.timestamp = n;
+    }
+  }
   // Keep the reading position (distance from the bottom) across the re-render.
   const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
   chat.innerHTML = '';
@@ -2128,16 +2143,19 @@ async function refreshMessages() {
     const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
     for (const k of marks) {
       if (k.summary && inFile.has(k.summary)) continue;
+      const at = tsMs(k.at);
       let target = null;
-      if (k.at != null) {
-        for (const n of plain) {
-          const ts = Number(n.dataset.ts);
-          if (ts && ts <= k.at) target = n;
-        }
+      let firstTs = 0;
+      for (const n of plain) {
+        const ts = Number(n.dataset.ts) || 0;
+        if (!firstTs && ts) firstTs = ts;
+        if (ts && at && ts <= at) target = n;
       }
       const node = buildCompactionSummary(k, { count: marks.length });
+      // Before the first rendered message only if it really is older than it;
+      // otherwise it belongs after the newest content, not at the top.
       if (target) target.after(node);
-      else if (plain.length) plain[0].before(node);
+      else if (at && firstTs && at < firstTs) plain[0].before(node);
       else chat.appendChild(node);
     }
     // A compaction still in flight keeps its "compacting…" indicator: the
