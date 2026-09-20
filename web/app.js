@@ -334,6 +334,7 @@ const DEFAULT_SETTINGS = {
   ttsRate: 1.05,
   voiceAutoSend: false,   // send the composer automatically after voice input
   showThinking: true,     // show/hide thinking blocks
+  showToolCalls: true,    // show/hide tool call cards entirely
   autoExpandThinking: false, // render thinking blocks open by default
   autoExpandTools: false, // render tool call output open by default
   sttEndpoint: '',        // whisper-compatible transcription endpoint
@@ -402,6 +403,9 @@ function applySettings() {
   refreshAvatars();
   // thinking blocks visibility
   document.body.classList.toggle('hide-thinking', SET.showThinking === false);
+  document.body.classList.toggle('hide-tools', SET.showToolCalls === false);
+  const stt = $('set-show-tools');
+  if (stt) stt.checked = SET.showToolCalls !== false;
   const st = $('set-show-thinking');
   if (st) st.checked = SET.showThinking !== false;
   // theme
@@ -1144,22 +1148,36 @@ async function refreshForkable() {
     const d = await rpc({ type: 'get_fork_messages' });
     S.forkable = asArray(d, 'messages');
   } catch { S.forkable = []; }
-  // get_entries is the fuller list (it includes everything the file has, so old
-  // messages and pre-compaction turns stay forkable); fall back to the fork
-  // messages when an older agent does not implement it.
+  // Fork ids must come from the *active branch*. The file also holds abandoned
+  // branches from earlier forks, so walking it in file order shifted every id
+  // after the first fork - which is why right-clicking a turn forked somewhere
+  // else. The tree plus leafId gives exactly the conversation on screen.
   try {
-    const e = await rpc({ type: 'get_entries' });
-    const entries = asArray(e, 'entries');
-    const users = entries
-      .filter((x) => x && x.type === 'message' && x.message && x.message.role === 'user')
-      .map((x) => ({
-        entryId: x.id,
-        text: (x.message.content || []).filter((c) => c.type === 'text').map((c) => c.text).join(' '),
-      }));
-    S.forkEntries = users.length ? users : S.forkable.map((f) => ({ entryId: f.entryId, text: f.text }));
+    const d = await rpc({ type: 'get_tree' });
+    const path = leafPath(d && d.tree, d && d.leafId);
+    const users = path
+      .filter((e) => e && e.message && e.message.role === 'user')
+      .map((e) => ({ entryId: e.id, text: (e.message.content || []).filter((c) => c.type === 'text').map((c) => c.text).join(' ') }));
+    S.forkEntries = users.length ? users : (S.forkable || []).map((f) => ({ entryId: f.entryId, text: f.text }));
   } catch {
     S.forkEntries = (S.forkable || []).map((f) => ({ entryId: f.entryId, text: f.text }));
   }
+}
+
+/* The entries from the root down to the current leaf - the active branch. */
+function leafPath(tree, leafId) {
+  if (!Array.isArray(tree)) return [];
+  let found = null;
+  const walk = (nodes, acc) => {
+    for (const n of nodes) {
+      const next = [...acc, n.entry];
+      if (n.entry.id === leafId) { found = next; return true; }
+      if (n.children && n.children.length && walk(n.children, next)) return true;
+    }
+    return false;
+  };
+  walk(tree, []);
+  return found || [];
 }
 
 async function refreshStats() {
@@ -2099,10 +2117,16 @@ function handleEvent(msg) {
       autoOpenShortsIfEnabled();
       break;
     case 'agent_end':
+    case 'agent_start':
+      // When the turn began: the timer under the last message counts from here,
+      // so it covers everything - thinking, tool calls and waiting.
+      S.turnStartTs = Date.now();
+      break;
     case 'agent_settled':
       if (msg.type === 'agent_settled') {
         S.isStreaming = false;
         autoCloseShortsIfOurs();
+        stampTurnTimer();
         // The turn is in the session file now: (re)attach fork ids to the rows.
         stampForkIds().catch(() => {});
         // After a compaction the session history no longer matches the chat
@@ -2228,6 +2252,31 @@ function handleEvent(msg) {
 }
 
 /* live streaming render */
+/* Total time the turn took, written inside the last message of that turn. It is
+ * wall-clock time from agent_start to agent_settled, so tool calls and waiting
+ * are included, not just the writing. */
+function stampTurnTimer() {
+  const start = S.turnStartTs;
+  S.turnStartTs = null;
+  if (!start) return;
+  const bubbles = chat.querySelectorAll('.msg.assistant .bubble');
+  const bubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
+  if (!bubble) return;
+  bubble.querySelectorAll('.turn-timer').forEach((n) => n.remove());
+  bubble.appendChild(el('div', 'turn-timer', `turn took ${fmtElapsed(Date.now() - start)}`));
+}
+
+/* Live version while the turn is running, inside the streaming message. */
+function startTurnTimer(root) {
+  const foot = el('div', 'turn-timer', 'turn running…');
+  root.querySelector('.bubble').appendChild(foot);
+  const started = S.turnStartTs || Date.now();
+  const tick = () => { foot.textContent = `turn running… ${fmtElapsed(Date.now() - started)}`; };
+  tick();
+  const t = setInterval(tick, 1000);
+  return () => clearInterval(t);
+}
+
 function startLive() {
   const { root, tools, bubble } = makeMsgShell('assistant streaming', '…');
   addCopyButton(tools, () => S.live ? S.live.text : '');
@@ -2245,6 +2294,7 @@ function startLive() {
   const dots = el('span', 'streaming-dots');
   for (let i = 0; i < 3; i++) dots.appendChild(el('span', 'dot', '.'));
   root.querySelector('.who-text').replaceChildren(document.createTextNode(' · '), dots);
+  const stopTurnTimer = startTurnTimer(root);
   // While another session is on screen the live message stays out of it: new
   // turns used to be appended to whatever transcript was open, so the agent
   // appeared to write into the session you were reading.
@@ -2256,6 +2306,7 @@ function startLive() {
     chat.appendChild(root);
   }
   S.live = { root, md, text: '', thinking: '', thinkingEl: null, caret: el('span', 'streaming-caret'),
+    stopTurnTimer,
     toolByIndex: new Map(),   // contentIndex -> tool card while a call is streaming
     toolArgChars: new Map(),  // contentIndex -> argument characters streamed so far
              startTs: Date.now(), lastUsage: null, statsEl };
@@ -2402,6 +2453,7 @@ function liveExtraTokens() {
 function finalizeLive(finalMsg) {
   if (S.live) {
     const L = S.live;
+    if (L.stopTurnTimer) L.stopTurnTimer();
     const elapsedSec = (Date.now() - L.startTs) / 1000;
     const prefillSec = L.firstDeltaTs ? (L.firstDeltaTs - L.startTs) / 1000 : null;
     S.live.root.remove();
@@ -3533,6 +3585,14 @@ function renderSessions(sessions) {
   if (!shown.length) list.appendChild(el('div', 'session-item s-meta', 'No sessions found'));
   for (const s of shown) {
     const item = el('div', 'session-item');
+    // A session that was forked off another one: small, indented and marked
+    // with an arrow, so the branch structure is visible in the list.
+    const parentName = s.parent ? (sessions.find((x) => x.path === s.parent) || {}).name : null;
+    if (s.parent) {
+      item.classList.add('fork');
+      item.title = parentName ? `branched from "${parentName}"` : `branched from ${s.parent}`;
+    }
+    const forks = sessions.filter((x) => x.parent === s.path).length;
     const isCurrent = current && (s.path === current || s.fileName === current.split(/[\\/]/).pop());
     const isViewed = S.viewSession
       ? (s.path === S.viewSession || s.fileName === S.viewSession.split(/[\\/]/).pop())
@@ -3545,6 +3605,7 @@ function renderSessions(sessions) {
     const nameRow = el('div', 's-name');
     if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
     nameRow.appendChild(document.createTextNode(s.name));
+    if (forks) nameRow.appendChild(el('span', 'fork-badge', `⑂${forks}`));
     item.appendChild(nameRow);
     item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
     item.onclick = () => switchToSession(s.path);
@@ -4011,6 +4072,10 @@ $('set-voice-autosend').onchange = (e) => {
 wireVoiceSettings();
 $('set-show-thinking').onchange = (e) => {
   SET.showThinking = e.target.checked;
+  saveSettings();
+};
+$('set-show-tools').onchange = (e) => {
+  SET.showToolCalls = e.target.checked;
   saveSettings();
 };
 $('set-expand-thinking').onchange = (e) => {

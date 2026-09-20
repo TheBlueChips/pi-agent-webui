@@ -353,6 +353,17 @@ body.hide-thinking details.thinking { display: none; }
   display: flex !important; align-items: center; gap: 6px;
   color: var(--text) !important; font-size: 12.5px; cursor: pointer;
 }
+/* Every dialog gets the panel look by default. Adding one used to need its own
+ * #id rule, and forgetting it left a white sheet in the middle of a dark UI
+ * (which is exactly what happened to the crop and confirmation dialogs). */
+dialog {
+  background: var(--bg-panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px; max-width: 92vw;
+  font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+}
+dialog::backdrop { background: rgba(0, 0, 0, .6); }
+
 dialog#settings-dialog {
   background: var(--bg-panel); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -927,3 +938,24 @@ body.text-outline #stats-bar { text-shadow:
 #ask-dialog .ask-row input:focus { outline: none; border-color: var(--accent); }
 #ask-dialog .btn.danger { background: var(--red); border-color: var(--red); color: #fff; }
 #ask-dialog .btn.danger:hover { filter: brightness(1.08); }
+
+/* ── turn timer: how long the whole turn took, inside the last message ────── */
+.turn-timer {
+  margin-top: 8px; padding-top: 6px;
+  border-top: 1px dashed color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
+  font-size: 11px; color: var(--text-dim); text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── optional: hide tool calls entirely ──────────────────────────────────── */
+body.hide-tools .tool-card,
+body.hide-tools .msg.tool { display: none; }
+
+/* ── forked sessions in the sidebar ─────────────────────────────────────── */
+.session-item.fork { padding-left: 9px; }
+.session-item.fork .s-name { font-size: 12px; color: var(--text-dim); }
+.session-item.fork .s-name::before { content: '↳ '; color: var(--accent); }
+.session-item .fork-badge {
+  float: right; font-size: 9.5px; color: var(--accent);
+  border: 1px solid var(--accent-dim); border-radius: 999px; padding: 0 5px;
+}

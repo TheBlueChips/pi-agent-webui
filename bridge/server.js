@@ -348,12 +348,18 @@ function scanLocalSessions() {
       continue;
     }
     let title = '';
+    let parent = null;
     try {
       const fd = fs.openSync(file, 'r');
       const buf = Buffer.alloc(64 * 1024);
       const read = fs.readSync(fd, buf, 0, buf.length, 0);
       fs.closeSync(fd);
-      title = titleFromHead(buf.toString('utf8', 0, read));
+      const head = buf.toString('utf8', 0, read);
+      title = titleFromHead(head);
+      // The header records where a fork came from, which is what the sidebar
+      // uses to show "this one branched off that one".
+      const first = head.split('\n')[0];
+      try { parent = JSON.parse(first).parentSession || null; } catch { /* old or odd file */ }
     } catch {
       /* unreadable file — fall back to file name */
     }
@@ -366,6 +372,7 @@ function scanLocalSessions() {
       name: explicit || title || name.replace(/\.jsonl$/, ''),
       mtime: st.mtimeMs,
       size: st.size,
+      parent,
     });
   }
   sessions.sort((a, b) => b.mtime - a.mtime);
