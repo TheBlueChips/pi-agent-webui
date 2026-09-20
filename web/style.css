@@ -991,3 +991,12 @@ body.hide-tools .msg.tool { display: none; }
 
 /* the cropper sizes its stage inline; these keep the frame inside it */
 .crop-stage { overflow: hidden; }
+
+/* The crop stage is positioned and sized by the stylesheet, so the dialog can
+ * never come up empty because a measurement was taken before layout. */
+#crop-stage { position: relative !important; }
+.crop-stage { width: min(560px, 86vw); max-width: 100%; max-height: 50vh; margin: 8px auto; }
+.crop-stage.circle { width: min(320px, 60vw, 40vh); aspect-ratio: 1 / 1; border-radius: 50%; }
+.crop-media { position: absolute; inset: 0; overflow: hidden; }
+.crop-media img, .crop-media video { display: block; width: 100%; height: 100%; object-fit: contain; }
+#crop-dialog { width: min(640px, 94vw); max-height: 94vh; overflow: auto; }

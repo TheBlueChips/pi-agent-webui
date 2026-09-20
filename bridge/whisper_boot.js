@@ -30,7 +30,9 @@ const WHISPER_MODELS = [
   { id: 'ggml-base.en.bin', label: 'Base (English)', size: '142 MB',
     note: 'The sensible default: good accuracy on normal speech, still quick on a laptop CPU.' },
   { id: 'ggml-small.en.bin', label: 'Small (English)', size: '466 MB',
-    note: 'Clearly better with accents, background noise and technical words. Needs a few CPU cores, noticeably slower.' },
+    note: 'Clearly better with accents, background noise and technical words. Needs a few CPU cores, noticeably slower.' },,
+  { id: 'ggml-large-v3.bin', label: 'Large v3 (multilingual)', size: '3.1 GB',
+    note: 'The biggest multilingual model - the most accurate, and the slowest to download and run.' }
 ];
 const DEFAULT_MODEL = process.env.WHISPER_MODEL || 'ggml-base.en.bin';
 const VENDOR_DIR = path.join(__dirname, 'whisper');
@@ -115,6 +117,13 @@ async function startWhisper(modelId) {
 
 async function doStartWhisper(modelId) {
   const modelName = WHISPER_MODELS.some((m) => m.id === modelId) ? modelId : DEFAULT_MODEL;
+  // A server that is already up gets reused - but not for a different model.
+  // Without this, picking another one changed the setting and nothing else: the
+  // old model kept transcribing and the new choice appeared to do nothing.
+  if (whisperState.state === 'ready' && whisperState.model && whisperState.model !== modelName) {
+    try { await stopWhisper(); } catch { /* already gone */ }
+    whisperState = { state: 'off', model: modelName, url: null, detail: 'stopped to switch models', got: 0, total: 0 };
+  }
   const url = `http://localhost:${WHISPER_PORT}/inference`;
   whisperState = { state: 'starting', model: modelName, url: null, detail: 'checking for an existing server', got: 0, total: 0 };
   try {

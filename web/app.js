@@ -2204,6 +2204,10 @@ async function refreshMessages() {
   // Re-wire fork indexes for user messages in order.
   const userEls = [...chat.querySelectorAll('.msg.user')];
   userEls.forEach((e, i) => e.dataset.forkIdx = String(i));
+  // Fork ids belong to rows by position on the active branch, not by matching
+  // message text - two turns with the same wording got each other's id, so a
+  // fork was taken from the wrong turn. Re-stamp after every render.
+  stampForkIds().catch(() => {});
   // Back on the agent's own session mid-stream: re-attach the in-flight live
   // message (it was parked in S.liveDetached while viewing elsewhere). Only
   // when the agent is still in the session the live view belongs to.
@@ -4530,6 +4534,26 @@ function cropDrag(dx, dy) {
   paintCrop();
 }
 
+/* The dialog is not laid out the moment it opens, and inside an embedded webview
+ * window.innerHeight can still read 0 - paintCrop then measured a zero-sized
+ * stage and drew its mask over the whole thing, so on some machines the picture
+ * was invisible. Retry across a few frames until the stage has a real size. */
+function schedulePaint(frames) {
+  const stage = $('crop-stage');
+  if (!stage) return;
+  const n = frames || 0;
+  const tiny = stage.clientWidth < 24 || stage.clientHeight < 24;
+  if (tiny && n < 20) { requestAnimationFrame(() => schedulePaint(n + 1)); return; }
+  // Normally the stylesheet sizes the stage. Only if it really has no size -
+  // an embedded webview reporting a 0x0 window before layout - put pixels in.
+  if (tiny) {
+    const size = Math.max(150, Math.round(Math.min(320, (window.innerHeight || 600) * 0.4)));
+    stage.style.width = `${size}px`;
+    stage.style.height = `${size}px`;
+  }
+  paintCrop();
+}
+
 function openCropper(kind) {
   const isAvatar = kind === 'avatar';
   const src = isAvatar ? SET.avatar : SET.themeBg;
@@ -4565,18 +4589,11 @@ function openCropper(kind) {
     // can never end up below the screen. A wide picture keeps its own shape on
     // the background cropper only.
     if (isAvatar) {
-      const size = Math.round(Math.min(320, window.innerHeight * 0.42));
-      stage.style.width = `${size}px`;
-      stage.style.height = `${size}px`;
       stage.style.aspectRatio = '1 / 1';
-    } else {
-      const w = Math.round(Math.min(560, window.innerWidth * 0.7));
-      stage.style.width = `${w}px`;
-      stage.style.aspectRatio = nw && nh ? `${nw} / ${nh}` : '16 / 9';
-      stage.style.height = '';
-      stage.style.maxHeight = `${Math.round(window.innerHeight * 0.5)}px`;
+    } else if (nw && nh) {
+      stage.style.aspectRatio = `${nw} / ${nh}`;
     }
-    paintCrop();
+    schedulePaint();
   };
   setStage();
   node.addEventListener('load', setStage);
