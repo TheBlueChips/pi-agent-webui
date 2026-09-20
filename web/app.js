@@ -2094,10 +2094,12 @@ async function refreshMessages() {
     else if (m.role === 'toolResult') renderToolResult(m);
     else if (m.role === 'bashExecution') renderBashExecution(m);
     else if (m.role === 'compactionSummary') {
-      // A compaction we watched happen gets placed at its anchor below, so the
-      // marker does not jump. One that came back with the session (page reload)
-      // belongs right here in the transcript.
-      if (!marks.some((k) => k.summary === m.summary)) renderCompactionSummary(m);
+      // Reading someone else's session: show every compaction where it happened.
+      // In the live transcript only the newest one is shown, pinned at the end -
+      // rendering them all here is what still piled four markers up after a
+      // reload (a compaction entry's timestamp is newer than the messages
+      // before it, so they collected at the bottom).
+      if (S.viewSession) renderCompactionSummary(m);
     }
     // Stamp whatever node(s) this message produced, so a compaction marker can
     // be anchored to a point in time instead of a shifting position.
@@ -2109,16 +2111,18 @@ async function refreshMessages() {
   // A compaction marker sits at the end of the transcript, so typing or a new
   // answer never pushes it out of sight.
   if (!S.viewSession) {
-    // Only a compaction that is not part of the session file yet belongs at the
-    // end. Appending every mark piled the session's whole compaction history up
-    // there; the older ones render in place, where they happened.
-    const inFile = new Set(msgs.filter((m) => m.role === 'compactionSummary' && m.summary).map((m) => m.summary));
-    const fresh = marks.filter((k) => k.summary && !inFile.has(k.summary));
-    for (const k of (fresh.length ? fresh : (marks.length ? [marks[marks.length - 1]] : []))) {
-      const node = buildCompactionSummary(k, {
+    // Exactly one marker in the live transcript: the newest compaction, last.
+    // Older ones (in the file or in memory) are not repeated.
+    const kmark = marks.length ? marks[marks.length - 1] : null;
+    const fileLast = msgs.filter((m) => m.role === 'compactionSummary' && m.summary).pop();
+    const newest = kmark || (fileLast
+      ? { summary: fileLast.summary, tokensBefore: fileLast.tokensBefore, estimatedTokensAfter: fileLast.estimatedTokensAfter }
+      : null);
+    if (newest) {
+      const node = buildCompactionSummary(newest, {
         live: true,
         count: marks.length,
-        estimatedTokensAfter: k.estimatedTokensAfter,
+        estimatedTokensAfter: newest.estimatedTokensAfter,
       });
       node.dataset.compaction = '1';
       chat.appendChild(node);

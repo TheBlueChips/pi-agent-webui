@@ -606,25 +606,20 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   max-width: 860px; margin: 0 auto;
   display: flex; gap: 8px; align-items: flex-end;
   position: relative;
-  border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 8px;
-}
-/* The dark layer only covers the strip the buttons live on: it used to be a
- * slab as tall as the message you were typing (and stretched the moment an
- * attachment was added), while the accent ring is what marks the text itself. */
-.composer-row::before {
-  content: ''; position: absolute; left: 0; right: 0; bottom: 0;
-  height: 44px; border-radius: 0 0 var(--radius) var(--radius);
+  /* The dark layer covers the whole box again (the buttons strip alone looked
+   * like a stray strip), and the outline is the accent one instead of a thin
+   * neutral border which read as a leftover edge. */
   background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
   backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
   -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
-  z-index: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--radius); padding: 8px;
 }
 .composer-row > * { position: relative; z-index: 1; }
 /* Only ONE blue outline: the ring around what you typed. The row keeps a
  * neutral border on focus, so a second accent layer does not wrap the empty
  * space around the input. */
-.composer-row:focus-within { border-color: var(--border); }
+.composer-row:focus-within { border-color: var(--accent); }
 .composer-row.has-text #input,
 #input:focus {
   border-radius: 7px;
