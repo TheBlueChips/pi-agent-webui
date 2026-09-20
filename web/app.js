@@ -2019,12 +2019,24 @@ async function refreshMessages() {
     fileMarks = d.compactions;
   } else {
     const d = await rpc({ type: 'get_messages' });
-    msgs = asArray(d, 'messages');
-    // Compactions are stored as their own entries in the session file and are
-    // not part of get_messages, so re-read them — otherwise every "conversation
-    // compacted" marker disappears on reload.
+    const rpcMsgs = asArray(d, 'messages');
+    msgs = rpcMsgs;
+    // get_messages hands back pi's *current context*. Once a compaction has run
+    // that is the summary plus whatever came after it, so scrolling up showed
+    // compaction entries and none of the conversation they replaced. The session
+    // file keeps the whole log - prefer it whenever it is longer, and append
+    // anything pi holds that has not been written to it yet (a message sent
+    // seconds ago).
     if (S.state.sessionFile) {
-      try { fileMarks = (await fetchSession(S.state.sessionFile)).compactions; } catch { /* file may be gone */ }
+      try {
+        const f = await fetchSession(S.state.sessionFile);
+        fileMarks = f.compactions;
+        if (f.messages.length > rpcMsgs.length) {
+          const newest = f.messages.reduce((acc, m) => Math.max(acc, Date.parse((m && m.timestamp) || '') || 0), 0);
+          const pendingMsgs = rpcMsgs.filter((m) => (Date.parse((m && m.timestamp) || '') || 0) > newest);
+          msgs = [...f.messages, ...pendingMsgs];
+        }
+      } catch { /* no file to read: keep the RPC view */ }
     }
   }
   // Markers we watched happen in this page session, plus the ones already in
