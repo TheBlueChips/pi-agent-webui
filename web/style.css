@@ -988,3 +988,6 @@ body.hide-tools .msg.tool { display: none; }
 .crop-stage { max-height: 52vh; }
 .crop-stage.circle { width: min(320px, 46vh); aspect-ratio: 1 / 1; }
 .load-older { max-width: 860px; margin: 4px auto 10px; text-align: center; }
+
+/* the cropper sizes its stage inline; these keep the frame inside it */
+.crop-stage { overflow: hidden; }

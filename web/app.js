@@ -1887,7 +1887,7 @@ function renderCompactionSummary(msg, extra) {
  * put it exactly where the compaction happened. */
 function buildCompactionSummary(msg, extra) {
   const live = !!(extra && extra.live);
-  const root = el('div', 'msg compaction' + (live ? ' pinned' : ''));
+  const root = el('div', 'msg compaction');
   const who = el('div', 'who');
   const before = msg.tokensBefore != null ? `${formatTok(msg.tokensBefore)} tok` : 'context';
   const after = extra && extra.estimatedTokensAfter != null
@@ -2094,12 +2094,10 @@ async function refreshMessages() {
     else if (m.role === 'toolResult') renderToolResult(m);
     else if (m.role === 'bashExecution') renderBashExecution(m);
     else if (m.role === 'compactionSummary') {
-      // Reading someone else's session: show every compaction where it happened.
-      // In the live transcript only the newest one is shown, pinned at the end -
-      // rendering them all here is what still piled four markers up after a
-      // reload (a compaction entry's timestamp is newer than the messages
-      // before it, so they collected at the bottom).
-      if (S.viewSession) renderCompactionSummary(m);
+      // In place, in order - a compaction marker belongs at the point in the
+      // conversation where it happened, and it scrolls away with it. Pinning the
+      // newest one to the bottom left a marker permanently on screen.
+      renderCompactionSummary(m);
     }
     // Stamp whatever node(s) this message produced, so a compaction marker can
     // be anchored to a point in time instead of a shifting position.
@@ -2111,21 +2109,24 @@ async function refreshMessages() {
   // A compaction marker sits at the end of the transcript, so typing or a new
   // answer never pushes it out of sight.
   if (!S.viewSession) {
-    // Exactly one marker in the live transcript: the newest compaction, last.
-    // Older ones (in the file or in memory) are not repeated.
-    const kmark = marks.length ? marks[marks.length - 1] : null;
-    const fileLast = msgs.filter((m) => m.role === 'compactionSummary' && m.summary).pop();
-    const newest = kmark || (fileLast
-      ? { summary: fileLast.summary, tokensBefore: fileLast.tokensBefore, estimatedTokensAfter: fileLast.estimatedTokensAfter }
-      : null);
-    if (newest) {
-      const node = buildCompactionSummary(newest, {
-        live: true,
-        count: marks.length,
-        estimatedTokensAfter: newest.estimatedTokensAfter,
-      });
-      node.dataset.compaction = '1';
-      chat.appendChild(node);
+    // A compaction we watched happen is re-placed at the point it happened,
+    // anchored by timestamp. Its entry is in the session file too once the turn
+    // is saved, and that copy is rendered in order above, so skip those.
+    const inFile = new Set(msgs.filter((m) => m.role === 'compactionSummary' && m.summary).map((m) => m.summary));
+    const plain = [...chat.querySelectorAll('.msg:not(.compaction)')];
+    for (const k of marks) {
+      if (k.summary && inFile.has(k.summary)) continue;
+      let target = null;
+      if (k.at != null) {
+        for (const n of plain) {
+          const ts = Number(n.dataset.ts);
+          if (ts && ts <= k.at) target = n;
+        }
+      }
+      const node = buildCompactionSummary(k, { count: marks.length });
+      if (target) target.after(node);
+      else if (plain.length) plain[0].before(node);
+      else chat.appendChild(node);
     }
     // A compaction still in flight keeps its "compacting…" indicator: the
     // re-render above wiped the DOM node it lived in.
@@ -2266,7 +2267,7 @@ function handleEvent(msg) {
       // (and put the compaction marker back at the end of the list).
       if (S.turnPendingStamp) {
         S.turnPendingStamp = false;
-        setTimeout(() => { stampTurnTimer(); pinCompactionMarkers(); }, 0);
+        setTimeout(stampTurnTimer, 0);
       }
       // A compaction that never reported back would otherwise leave the status
       // bar saying "compacting…" for the rest of the session.
@@ -2427,12 +2428,6 @@ function startTurnTimer() {
   tick();
   const t = setInterval(tick, 1000);
   return () => clearInterval(t);
-}
-
-/* A compaction marker belongs at the end of the transcript the user is looking
- * at, so it stays visible while the next answer streams in. */
-function pinCompactionMarkers() {
-  for (const node of chat.querySelectorAll('.msg.compaction.pinned')) chat.appendChild(node);
 }
 
 function startLive() {
@@ -4535,17 +4530,36 @@ function openCropper(kind) {
   const setStage = () => {
     const nw = node.naturalWidth || node.videoWidth || 0;
     const nh = node.naturalHeight || node.videoHeight || 0;
-    // The avatar stage stays square: giving it the picture's own ratio turned
-    // the round crop window into a wide ellipse that could push the save/cancel
-    // buttons off screen, with no way out of the dialog.
-    if (nw && nh && !isAvatar) stage.style.aspectRatio = `${nw} / ${nh}`;
-    if (isAvatar) stage.style.aspectRatio = '1 / 1';
+    // Sized inline, in pixels: the avatar stage is a square that always fits the
+    // window, so the round crop window is a circle and the save/cancel buttons
+    // can never end up below the screen. A wide picture keeps its own shape on
+    // the background cropper only.
+    if (isAvatar) {
+      const size = Math.round(Math.min(320, window.innerHeight * 0.42));
+      stage.style.width = `${size}px`;
+      stage.style.height = `${size}px`;
+      stage.style.aspectRatio = '1 / 1';
+    } else {
+      const w = Math.round(Math.min(560, window.innerWidth * 0.7));
+      stage.style.width = `${w}px`;
+      stage.style.aspectRatio = nw && nh ? `${nw} / ${nh}` : '16 / 9';
+      stage.style.height = '';
+      stage.style.maxHeight = `${Math.round(window.innerHeight * 0.5)}px`;
+    }
     paintCrop();
   };
   setStage();
   node.addEventListener('load', setStage);
   node.addEventListener('loadedmetadata', setStage);
   const dlg = $('crop-dialog');
+  // Always leave a way out: the dialog scrolls, Escape closes it, and closing it
+  // for any reason (not just the buttons) drops the crop state.
+  dlg.style.maxHeight = '92vh';
+  dlg.style.overflow = 'auto';
+  if (!dlg.__wired) {
+    dlg.__wired = true;
+    dlg.addEventListener('close', () => { cropState = null; });
+  }
   if (!dlg.open) dlg.showModal();
 }
 
