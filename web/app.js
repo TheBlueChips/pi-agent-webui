@@ -90,6 +90,135 @@ function formatTok(n) {
   return String(Math.round(n));
 }
 
+/* ── speech to text ───────────────────────────────────────────────────────
+ * The browser's own recognition is the default: nothing to download and it is
+ * good enough for dictating a prompt. The local whisper.cpp server is opt-in -
+ * it pulls ~200 MB of binaries plus the chosen model, so it only starts when
+ * the backend is set to whisper (or the button is pressed) and never on a plain
+ * bridge launch. */
+let sttModelsLoaded = false;
+
+async function loadSttModels() {
+  const sel = $('set-stt-model');
+  if (!sel) return;
+  try {
+    const d = await fetch('/api/whisper-status').then((r) => r.json());
+    sttModelsLoaded = true;
+    sel.innerHTML = '';
+    for (const m of d.models || []) {
+      const o = el('option', null, `${m.label} - ${m.size}`);
+      o.value = m.id;
+      o.dataset.note = m.note || '';
+      sel.appendChild(o);
+    }
+    syncSelect(sel, SET.sttModel || d.model);
+    renderSttModelNote();
+    renderSttStatus(d);
+  } catch { /* offline bridge */ }
+}
+
+function renderSttModelNote() {
+  const sel = $('set-stt-model');
+  const note = $('stt-model-note');
+  if (!sel || !note) return;
+  const opt = sel.selectedOptions && sel.selectedOptions[0];
+  note.textContent = opt ? (opt.dataset.note || '') : '';
+}
+
+function renderSttStatus(st) {
+  const box = $('stt-status');
+  if (!box || !st) return;
+  box.classList.remove('hidden');
+  if (st.state === 'downloading') {
+    const pct = st.total ? ` ${Math.floor((st.got / st.total) * 100)}%` : '';
+    box.textContent = `Downloading ${st.detail || ''}${pct}`.trim();
+  } else if (st.state === 'starting') {
+    box.textContent = 'Starting the whisper server…';
+  } else if (st.state === 'ready') {
+    box.textContent = `Ready - ${st.detail || st.model}`;
+  } else if (st.state === 'failed') {
+    box.textContent = `Could not start it: ${st.detail || 'unknown error'}`;
+  } else {
+    box.textContent = 'Not running. "download & start" fetches whisper.cpp (~200 MB) and the model once.';
+  }
+}
+
+async function refreshSttStatus() {
+  try {
+    const d = await fetch('/api/whisper-status').then((r) => r.json());
+    renderSttStatus(d);
+    if (d.state === 'downloading') setTimeout(refreshSttStatus, 1000);
+  } catch { /* ignore */ }
+}
+
+/* Make sure a local whisper server is up, starting/downloading it if needed. */
+async function ensureWhisper(quiet) {
+  try {
+    const st = await fetch('/api/whisper-status').then((r) => r.json());
+    if (st.state === 'ready') return st.url || SET.sttEndpoint || null;
+  } catch { /* fall through to the start call */ }
+  if (!quiet) toast('Starting the local whisper server - first run downloads it, this takes a while…');
+  const d = await fetch('/api/whisper-start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: SET.sttModel || null }),
+  }).then((r) => r.json()).catch((e) => ({ ok: false, error: e.message }));
+  if (d && d.ok) {
+    if (d.url) { SET.sttEndpoint = d.url; saveSettings(); }
+    return d.url || null;
+  }
+  toast(`Whisper server failed: ${(d && (d.error || d.detail)) || 'unknown error'}`, 'error');
+  return null;
+}
+
+function wireVoiceSettings() {
+  const backend = $('set-stt-backend');
+  if (!backend) return;
+  backend.onchange = () => { SET.sttBackend = backend.value; saveSettings(); syncVoiceSettingsUi(); };
+  if ($('set-stt-model')) {
+    $('set-stt-model').onchange = (e) => {
+      SET.sttModel = e.target.value;
+      renderSttModelNote();
+      saveSettings();
+    };
+  }
+  const startBtn = $('btn-stt-start');
+  if (startBtn) {
+    startBtn.onclick = async () => {
+      startBtn.disabled = true;
+      await ensureWhisper(false);
+      startBtn.disabled = false;
+      refreshSttStatus();
+    };
+  }
+  syncVoiceSettingsUi();
+}
+
+/* Show only what the chosen backend needs: the browser needs nothing, whisper
+ * needs a model, an endpoint and a start button. */
+function syncVoiceSettingsUi() {
+  const backend = $('set-stt-backend');
+  if (!backend) return;
+  backend.value = SET.sttBackend === 'whisper' ? 'whisper' : 'browser';
+  const whisper = backend.value === 'whisper';
+  const modelSel = $('set-stt-model');
+  const modelRow = modelSel && modelSel.closest('.rate-row');
+  const startBtn = $('btn-stt-start');
+  const endpoint = $('set-stt-endpoint');
+  const note = $('stt-model-note');
+  const status = $('stt-status');
+  if (modelRow) modelRow.classList.toggle('hidden', !whisper);
+  if (startBtn) startBtn.classList.toggle('hidden', !whisper);
+  if (endpoint && endpoint.parentElement) endpoint.parentElement.classList.toggle('hidden', !whisper);
+  if (note) note.classList.toggle('hidden', !whisper);
+  if (status) status.classList.toggle('hidden', !whisper);
+  document.querySelectorAll('#tab-voice .settings-grid > label').forEach((l) => {
+    const t = (l.textContent || '').trim();
+    if (t === 'Whisper model' || t === 'Whisper endpoint') l.classList.toggle('hidden', !whisper);
+  });
+  if (whisper) { loadSttModels(); refreshSttStatus(); }
+}
+
 /* Live elapsed-time timer for a running tool card (bash etc.). */
 function fmtElapsed(ms) {
   const s = ms / 1000;
@@ -97,12 +226,31 @@ function fmtElapsed(ms) {
   if (s < 3600) return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
   return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
 }
+/* Restart the counter from now - used when the timeout becomes known, so the
+ * countdown starts with the command instead of with the card appearing. */
+function restartCardTimer(card) {
+  if (card._timer) { clearInterval(card._timer); card._timer = null; }
+  card._running = false;
+  startCardTimer(card);
+}
+
 function startCardTimer(card) {
   if (card._timer) return;
+  card._running = true;
   card._start = Date.now();
   const tick = () => {
     card.timerEl.classList.remove('hidden');
-    card.timerEl.textContent = fmtElapsed(Date.now() - card._start);
+    // A bash call with a timeout counts down instead of up - "done" while the
+    // command is still running was the confusing part, and a countdown says how
+    // long it has left.
+    if (card._timeoutMs) {
+      const left = Math.max(0, card._timeoutMs - (Date.now() - card._start));
+      const s = left / 1000;
+      const mm = Math.floor(s / 60);
+      card.timerEl.textContent = `${mm}:${String(Math.floor(s % 60)).padStart(2, '0')} left`;
+    } else {
+      card.timerEl.textContent = fmtElapsed(Date.now() - card._start);
+    }
   };
   tick();
   card._timer = setInterval(tick, 1000);
@@ -112,6 +260,7 @@ function stopCardTimer(card, stateText) {
     clearInterval(card._timer);
     card._timer = null;
   }
+  card._running = false;
   // Always update the state text, even when no timer was running (the card
   // may have been created without one) — otherwise it stays stuck on
   // "running…" while the class already shows done/error. The label lives in
@@ -188,7 +337,9 @@ const DEFAULT_SETTINGS = {
   autoExpandThinking: false, // render thinking blocks open by default
   autoExpandTools: false, // render tool call output open by default
   sttEndpoint: '',        // whisper-compatible transcription endpoint
-  sttBackend: 'whisper',  // 'whisper' or 'browser'
+  sttBackend: 'browser',  // 'browser' (built in, default) | 'whisper' (local server, downloaded on demand)
+  sttModel: 'ggml-base.en.bin', // whisper.cpp model id
+  instances: [],          // other pi agents to switch between: [{id, name, url}]
   ttsBackend: 'browser',  // 'browser' | 'endpoint'
   ttsEndpoint: '',        // OpenAI-compatible /v1/audio/speech server (Piper etc.)
   ttsModel: 'piper',
@@ -199,6 +350,7 @@ const DEFAULT_SETTINGS = {
   shortsProvider: 'instagram', // 'instagram' | 'tiktok' | 'youtube' | 'none'
   shortsAutoOpen: false,  // open the feed while the agent runs, close it when the run finishes
   shortsMode: 'panel',    // 'panel' (in-app split) | 'window' (side window, full feed) | 'tab' — legacy 'split'='panel', 'popup'='window'
+  reelsWidth: null,       // px — the shorts panel width, remembered across launches
   autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
   fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
   chatFontSize: 14,       // px — chat + composer text size
@@ -323,6 +475,7 @@ const S = {
   attachments: [],         // [{data, mimeType, name}]
   models: [],
   levels: [],
+  instanceStatus: {},       // instance url -> {ok, busy, name} for the switcher
   msgTiming: new Map(),    // message key -> {elapsedSec, prefillSec, est} for the t/s figure
   autoTts: false,
   speaking: false,
@@ -432,6 +585,14 @@ function send(obj) {
 /* Resolve when the (re)started agent reports agent_started. */
 let agentReadyWaiters = [];
 function onAgentStarted() {
+  // A fresh agent means the crash banner is stale - it used to sit there until
+  // the page was reloaded, even after a successful restart.
+  hideBanner();
+  refreshCommands().catch(() => {});
+  refreshBuiltinCommands().catch(() => {});
+  refreshModels().catch(() => {});
+  refreshLevels().catch(() => {});
+  refreshStats().catch(() => {});
   const w = agentReadyWaiters;
   agentReadyWaiters = [];
   w.forEach((r) => r());
@@ -563,6 +724,116 @@ function applyState(d) {
 function syncSelect(sel, value) {
   if (value && [...sel.options].some((o) => o.value === value)) sel.value = value;
   if (sel && sel.id === 'model-select') updateModelBtn();
+  if (sel && sel.id === 'thinking-select') updateThinkingBtn();
+}
+
+/* ── shared dropdown menu ─────────────────────────────────────────────────
+ * The model picker's look - search box, scrollable rows, groups, accent on the
+ * current entry - reused for the thinking levels, the session and turn context
+ * menus and the instance switcher, so they all behave the same way. */
+let openMenuEl = null;
+function closeMenu() {
+  if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; }
+}
+
+function openMenu(anchor, items, opts = {}) {
+  const wasOpenFor = openMenuEl && openMenuEl._anchor === anchor;
+  closeMenu();
+  toggleModelMenu(false);
+  if (wasOpenFor && !opts.force) return null;   // clicking the same anchor again closes
+  if (!anchor || !items || !items.length) return null;
+  const menu = el('div', 'model-menu');
+  menu._anchor = anchor;
+  let search = null;
+  if (opts.search) {
+    search = el('input');
+    search.type = 'search';
+    search.placeholder = opts.search;
+    search.autocomplete = 'off';
+    search.spellcheck = false;
+    menu.appendChild(search);
+  }
+  if (opts.title) menu.appendChild(el('div', 'model-group', opts.title));
+  const list = el('div', 'model-list');
+  const render = (q) => {
+    list.replaceChildren();
+    const query = (q || '').trim().toLowerCase();
+    const rows = items.filter((it) => !query ||
+      `${it.label || ''} ${it.hint || ''} ${it.group || ''}`.toLowerCase().includes(query));
+    if (!rows.length) { list.appendChild(el('div', 'model-empty', 'Nothing matches')); return; }
+    let group = null;
+    for (const it of rows) {
+      if (it.sep) { list.appendChild(el('div', 'menu-sep', '')); group = null; continue; }
+      if (it.group && it.group !== group) { group = it.group; list.appendChild(el('div', 'model-group', group)); }
+      const row = el('div', 'model-item' + (it.active ? ' sel' : '') + (it.danger ? ' danger' : ''));
+      if (it.dot) row.appendChild(el('span', `menu-dot ${it.dot}`, ''));
+      row.appendChild(el('span', 'model-label', it.label || ''));
+      if (it.hint) row.appendChild(el('span', 'model-provider', it.hint));
+      row.onclick = (e) => {
+        e.stopPropagation();
+        if (it.keepOpen) { it.onPick && it.onPick(it); return; }
+        closeMenu();
+        it.onPick && it.onPick(it);
+      };
+      list.appendChild(row);
+    }
+  };
+  menu.appendChild(list);
+  render('');
+  if (search) {
+    search.oninput = () => render(search.value);
+    search.onkeydown = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); closeMenu(); }
+      if (e.key === 'Enter') { const first = list.querySelector('.model-item'); if (first) first.click(); }
+    };
+  }
+  document.body.appendChild(menu);
+  openMenuEl = menu;
+  const r = anchor.getBoundingClientRect();
+  const w = Math.max(200, Math.min(opts.width || 300, window.innerWidth - 24));
+  menu.style.width = `${w}px`;
+  const h = menu.offsetHeight;
+  const roomBelow = window.innerHeight - r.bottom - 10;
+  if (roomBelow < Math.min(h, 220) && r.top > roomBelow) menu.style.bottom = `${window.innerHeight - r.top + 6}px`;
+  else menu.style.top = `${Math.min(r.bottom + 6, Math.max(8, window.innerHeight - h - 8))}px`;
+  menu.style.left = `${Math.max(8, Math.min(opts.align === 'right' ? r.right - w : r.left, window.innerWidth - w - 8))}px`;
+  if (search) search.focus();
+  menu.addEventListener('click', (e) => e.stopPropagation());
+  setTimeout(() => document.addEventListener('click', closeMenu, { once: true }), 0);
+  return menu;
+}
+
+/* What each thinking level means - shown in the dropdown, not on the button. */
+const THINKING_NOTES = {
+  off: 'no thinking - fastest replies',
+  minimal: 'a quick look before answering',
+  low: 'brief reasoning',
+  medium: 'balanced - the usual choice',
+  high: 'thorough reasoning, slower on hard problems',
+  max: 'the most it can do - slowest',
+};
+
+function updateThinkingBtn() {
+  const btn = $('thinking-btn');
+  if (!btn) return;
+  const sel = $('thinking-select');
+  const opt = sel.selectedOptions && sel.selectedOptions[0];
+  btn.textContent = opt ? opt.value : 'off';
+  btn.title = `Thinking level: ${opt ? opt.value : 'off'} - click to change`;
+}
+
+function openThinkingMenu() {
+  const sel = $('thinking-select');
+  const levels = [...sel.options].map((o) => o.value);
+  openMenu($('thinking-btn'), levels.map((lv) => ({
+    label: lv,
+    hint: THINKING_NOTES[lv] || '',
+    active: sel.value === lv,
+    onPick: () => {
+      sel.value = lv;
+      sel.dispatchEvent(new Event('change'));
+    },
+  })), { title: 'thinking level', width: 330 });
 }
 
 /* ── model picker ─────────────────────────────────────────────────────────
@@ -708,6 +979,11 @@ async function refreshLlamaGroup() {
       return;
     }
     const known = new Set(S.models.map((m) => `${m.provider}||${m.id}`));
+    // The same model can be registered by pi under its own provider id and
+    // appear again here under "llama-server=<url>", which showed every local
+    // model twice. Match on the model id as well - these ids are unique per
+    // file on the server.
+    const knownIds = new Set(S.models.map((m) => m.id));
     const group = el('optgroup', null, 'llama.cpp (local)');
     group.dataset.llama = '1';
     let unregistered = null;
@@ -717,7 +993,7 @@ async function refreshLlamaGroup() {
       if (!registered && !unregistered) unregistered = srv;
       for (const m of srv.models) {
         const key = `${srv.providerId}||${m.id}`;
-        if (known.has(key)) continue; // already listed by the agent itself
+        if (known.has(key) || knownIds.has(m.id)) continue; // already listed by the agent itself
         const o = el('option', null, llamaLiveServers.length > 1 ? `${m.name || m.id} · ${short}` : (m.name || m.id));
         o.value = key;
         group.appendChild(o);
@@ -824,11 +1100,14 @@ async function refreshLevels() {
     const sel = $('thinking-select');
     sel.innerHTML = '';
     (S.levels.length ? S.levels : ['off']).forEach((lv) => {
-      const o = el('option', null, `thinking: ${lv}`);
+      // The button shows the bare level ("off", "low"); the description is for
+      // the dropdown only.
+      const o = el('option', null, lv);
       o.value = lv;
       sel.appendChild(o);
     });
     if (S.state.thinkingLevel) syncSelect(sel, S.state.thinkingLevel);
+    updateThinkingBtn();
   } catch { /* ignore */ }
 }
 
@@ -1156,9 +1435,27 @@ function addSpeakButton(tools, getText) {
   addToolButton(tools, 'speak', 'Speak this message (TTS)', () => speak(getText()));
 }
 
+/* pi's user messages and the forkable list are both in order, so pair them up as
+ * the transcript renders; identical texts then keep working. */
+let forkQueue = [];
+function resetForkQueue() { forkQueue = (S.forkable || []).map((f) => ({ ...f, used: false })); }
+function takeForkable(text) {
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const t = norm(text);
+  let hit = forkQueue.find((f) => !f.used && norm(f.text) === t);
+  if (!hit) hit = forkQueue.find((f) => !f.used);
+  if (hit) hit.used = true;
+  return hit || null;
+}
+
 function renderUserMessage(msg) {
   const { text, images } = messageBlock(msg.content);
   const { root, tools, bubble } = makeMsgShell('user', `you · ${timeStr(msg.timestamp)}`);
+  root._msg = msg;
+  // Fork entry for this turn, from get_fork_messages - used by the right-click
+  // menu ("fork from here") and by edit & resend.
+  const fk = takeForkable(text);
+  if (fk) { root.dataset.fork = fk.entryId; root.dataset.forktext = text.slice(0, 300); }
   addCopyButton(tools, () => text);
   // fork index is (re)written onto the element by refreshMessages; read it at click time
   addToolButton(tools, 'edit', 'Edit & resend (forks the session from here)',
@@ -1220,6 +1517,7 @@ function noteHistoryTiming(msg, prevTs) {
 function renderAssistantMessage(msg, timing) {
   timing = timingFor(msg, timing);
   const { root, tools, bubble } = makeMsgShell('assistant', timeStr(msg.timestamp));
+  root._msg = msg;
   const textBlocks = [];
   let stats = usageStats(msg.usage, timing && timing.elapsedSec, timing && timing.prefillSec);
   if (!stats && timing && timing.est) stats = estStatsText(timing.est, timing.elapsedSec);
@@ -1255,8 +1553,10 @@ function renderAssistantMessage(msg, timing) {
       if (wasRunning) {
         clearInterval(prev._timer);
         card._start = prev._start;
+        card._timeoutMs = prev._timeoutMs || 0;
         startCardTimer(card);
       }
+      noteToolTimeout(card, block.arguments);
       fillToolBody(card, block.name, block.arguments);
       bubble.appendChild(card.card);
       S.toolCards.set(block.id, card);
@@ -1300,7 +1600,10 @@ function makeToolCard(name, opts = {}) {
   const head = el('div', 'tool-head');
   head.appendChild(el('span', 'tool-name', `${name}`));
   const state = opts.state || 'running';
-  const stateEl = el('span', `tool-state${state === 'running' ? ' running' : ''}`);
+  // finished cards keep their colour too: the rebuilt-from-history cards used to
+  // come back with no state class at all, so a done call lost its green label
+  const stateCls = state === 'running' ? ' running' : (state === 'done' || state === 'error' ? ` ${state}` : '');
+  const stateEl = el('span', `tool-state${stateCls}`);
   stateEl.appendChild(el('span', 'tool-state-label', state));
   if (state === 'running') stateEl.appendChild(makeDots());
   head.appendChild(stateEl);
@@ -1309,7 +1612,18 @@ function makeToolCard(name, opts = {}) {
   const body = el('div', 'tool-body hidden');
   head.onclick = () => body.classList.toggle('hidden');
   card.append(head, body);
-  return { card, head, body, stateEl, timerEl, _timer: null, _start: 0 };
+  return { card, head, body, stateEl, timerEl, _timer: null, _start: 0, _running: false, _timeoutMs: 0 };
+}
+
+/* pi's bash tool takes `timeout` in seconds; remember it so the card can count
+ * down instead of just counting up. */
+function noteToolTimeout(card, args) {
+  if (!card || !args || typeof args !== 'object') return;
+  const t = args.timeoutSeconds != null ? args.timeoutSeconds
+    : (args.timeout_ms != null ? Number(args.timeout_ms) / 1000
+      : (args.timeoutMs != null ? Number(args.timeoutMs) / 1000 : args.timeout));
+  const secs = Number(t);
+  if (Number.isFinite(secs) && secs > 0) card._timeoutMs = secs * 1000;
 }
 
 /* Edit-style tool calls (old text -> new text) render as a color diff. */
@@ -1560,6 +1874,8 @@ async function fetchSession(sessionPath) {
 }
 
 async function refreshMessages() {
+  if (!S.viewSession) await refreshForkable().catch(() => {});
+  resetForkQueue();
   let msgs;
   let fileMarks = [];
   if (S.viewSession) {
@@ -1598,11 +1914,19 @@ async function refreshMessages() {
       ? [...S.toolCards.entries()].filter(([, c]) => S.live.root.contains(c.card))
       : [];
     const liveIds = new Set(liveCards.map(([id]) => id));
+    // Cards whose tool is still executing must keep their running state: they
+    // are rebuilt from the message below, and this loop used to mark every card
+    // that was not part of the live message as "done" - so a long command could
+    // show done while it was still running.
+    const keepCards = new Map();
     for (const [id, card] of S.toolCards) {
-      if (!liveIds.has(id) && card._timer) stopCardTimer(card, 'done');
+      if (liveIds.has(id)) continue;
+      if (card._running) { keepCards.set(id, card); continue; }
+      if (card._timer) stopCardTimer(card, 'done');
     }
     S.toolCards.clear();
     for (const [id, card] of liveCards) S.toolCards.set(id, card);
+    for (const [id, card] of keepCards) S.toolCards.set(id, card);
     removeCompactionLive();
   }
   // session token totals summed from per-message usage
@@ -1826,10 +2150,13 @@ function handleEvent(msg) {
         // Only auto-compactions (threshold/overflow without retry) need a nudge.
         if (!msg.willRetry && msg.reason !== 'manual') S.compactionNeedsContinue = true;
       }
-      // Context is unknown right after compaction (agent reports tokens:null
-      // until the next response) — refresh to reflect that, then send any
-      // messages the user queued while compaction was running.
+      // Context is unknown to pi right after compaction (it reports tokens:null
+      // until the next response), which left the ring showing a dash until the
+      // session was switched. Show the estimated size the compaction itself
+      // reported, then keep asking until pi has a real number.
+      if (after != null) showCompactionEstimate(after);
       refreshStats().catch(() => {});
+      scheduleStatsRetry();
       flushCompactionQueue();
       break;
     default:
@@ -1855,7 +2182,16 @@ function startLive() {
   const dots = el('span', 'streaming-dots');
   for (let i = 0; i < 3; i++) dots.appendChild(el('span', 'dot', '.'));
   root.querySelector('.who-text').replaceChildren(document.createTextNode(' · '), dots);
-  chat.appendChild(root);
+  // While another session is on screen the live message stays out of it: new
+  // turns used to be appended to whatever transcript was open, so the agent
+  // appeared to write into the session you were reading.
+  if (S.viewSession) {
+    const frag = S.liveDetached && S.liveDetached.frag ? S.liveDetached.frag : document.createDocumentFragment();
+    frag.appendChild(root);
+    S.liveDetached = { path: S.state.sessionFile, frag };
+  } else {
+    chat.appendChild(root);
+  }
   S.live = { root, md, text: '', thinking: '', thinkingEl: null, caret: el('span', 'streaming-caret'),
     toolByIndex: new Map(),   // contentIndex -> tool card while a call is streaming
     toolArgChars: new Map(),  // contentIndex -> argument characters streamed so far
@@ -1916,6 +2252,8 @@ function applyDelta(ev) {
       // preview and the elapsed timer) instead of appending a duplicate.
       existing.toolName = ev.toolCall.name;
       existing.card.querySelector('.tool-name').textContent = ev.toolCall.name;
+      noteToolTimeout(existing, ev.toolCall.arguments);
+      if (existing._running && existing._timeoutMs) restartCardTimer(existing);
       fillToolBody(existing, ev.toolCall.name, ev.toolCall.arguments);
       // Re-key to the real tool-call id so the tool_execution_* events (which
       // are keyed by it) find this card.
@@ -2053,12 +2391,16 @@ function startToolCard(msg) {
     // It may have been rendered as "done" by the message finalise above; the
     // execution is starting right now, so put the running label back.
     setCardRunning(existing);
-    startCardTimer(existing);
+    noteToolTimeout(existing, msg.args);
+    // With a timeout known, count down from the moment the command starts.
+    if (existing._timeoutMs) restartCardTimer(existing);
+    else startCardTimer(existing);
     return existing;
   }
   const card = makeToolCard(msg.toolName || msg.name || 'tool', { toolCallId: msg.toolCallId });
   card.toolName = msg.toolName || msg.name || '';
   card._rawArgs = '';
+  noteToolTimeout(card, msg.args);
   fillToolBody(card, card.toolName, msg.args);
   startCardTimer(card);
   const parent = S.live ? S.live.root.querySelector('.bubble') : chat;
@@ -2067,6 +2409,20 @@ function startToolCard(msg) {
   scrollBottom();
   pinSoon();
   return card;
+}
+
+/* The ring right after a compaction: pi has no number yet, so show the estimate
+ * the compaction reported instead of a dash. */
+function showCompactionEstimate(tokens) {
+  const win = (S.ctxStats && S.ctxStats.contextWindow) || (S.state && S.state.contextWindow) || null;
+  if (!win) return;
+  setCtxRing({ tokens, contextWindow: win, percent: Math.max(0, Math.min(100, (tokens / win) * 100)) });
+}
+
+/* pi only knows the new context size once it has answered something again, so
+ * check a few times instead of leaving the estimate on screen forever. */
+function scheduleStatsRetry() {
+  [3000, 8000, 20000].forEach((ms) => setTimeout(() => { refreshStats().catch(() => {}); }, ms));
 }
 
 function updateStreamUi() {
@@ -2543,6 +2899,9 @@ async function transcribeAudioFile(file) {
   try { wavBlob = await blobToWav(file); } catch { /* not browser-decodable; send raw */ }
   const dataUrl = await readAsDataUrl(wavBlob);
   const b64 = dataUrl.split(',')[1];
+  // Whisper backend: make sure the local server is actually up first (it is
+  // downloaded on demand), so picking whisper in settings "just works".
+  if (SET.sttBackend === 'whisper') await ensureWhisper(true);
   try {
     const d = await (await fetch('/api/transcribe', {
       method: 'POST',
@@ -2676,6 +3035,18 @@ const LOCAL_COMMANDS = [
   { name: 'thinking', description: 'Toggle showing thinking blocks', source: 'local' },
 ];
 
+/* pi's built-in slash commands are implemented by its TUI, not by RPC mode:
+ * using them from here either did nothing or went to the model as a prompt. The
+ * UI maps the useful ones (compact, name, clone, copy, session, model,
+ * thinking) to their RPC equivalents itself, and the rest belong to a button
+ * somewhere - so the menu only offers what actually runs. Typing a hidden one
+ * still works when the UI implements it. */
+const HIDDEN_BUILTINS = new Set([
+  'settings', 'model', 'scoped-models', 'export', 'import', 'share', 'changelog',
+  'hotkeys', 'fork', 'tree', 'trust', 'login', 'logout', 'new', 'resume',
+  'reload', 'quit',
+]);
+
 function allCommands() {
   const seen = new Set();
   const out = [];
@@ -2700,6 +3071,7 @@ function updateSlashMenu() {
   if (!m || !caretInFirstWord || !allCommands().length) { closeSlashMenu(); return; }
   const q = m[1].toLowerCase();
   const items = allCommands()
+    .filter((c) => !(c.source === 'builtin' && HIDDEN_BUILTINS.has(c.name.toLowerCase())))
     .filter((c) => c.name.toLowerCase().includes(q) || (c.description || '').toLowerCase().includes(q))
     .slice(0, 300);   // the list scrolls; it used to be cut off at 12, which hid every skill
   if (!items.length) { closeSlashMenu(); return; }
@@ -3102,7 +3474,10 @@ function renderSessions(sessions) {
     const isViewed = S.viewSession
       ? (s.path === S.viewSession || s.fileName === S.viewSession.split(/[\\/]/).pop())
       : false;
-    if (isCurrent || isViewed) item.classList.add('active');
+    // The blue highlight follows what you are looking at; the green pulsing dot
+    // marks the session still running in the background. Highlighting both made
+    // it look like two sessions were selected at once.
+    if (S.viewSession ? isViewed : isCurrent) item.classList.add('active');
     if (isCurrent && S.isStreaming) item.classList.add('live');
     const nameRow = el('div', 's-name');
     if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
@@ -3110,6 +3485,7 @@ function renderSessions(sessions) {
     item.appendChild(nameRow);
     item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
     item.onclick = () => switchToSession(s.path);
+    item.oncontextmenu = (e) => { e.preventDefault(); openSessionMenu(s, item); };
     list.appendChild(item);
   }
 }
@@ -3468,11 +3844,12 @@ function openSettings() {
   if (SET.avatar) { prev.src = SET.avatar; prev.style.visibility = 'visible'; }
   else prev.style.visibility = 'hidden';
   $('set-voice-autosend').checked = !!SET.voiceAutoSend;
+  $('set-font').value = SET.fontFamily || '';
   $('set-show-thinking').checked = SET.showThinking !== false;
   $('set-expand-thinking').checked = !!SET.autoExpandThinking;
   $('set-expand-tools').checked = !!SET.autoExpandTools;
   $('set-stt-endpoint').value = SET.sttEndpoint || '';
-  $('set-stt-backend').value = SET.sttBackend || 'whisper';
+  syncVoiceSettingsUi();
   $('set-tts-backend').value = SET.ttsBackend || 'browser';
   $('set-tts-endpoint').value = SET.ttsEndpoint || '';
   $('set-tts-model').value = SET.ttsModel || '';
@@ -3481,7 +3858,6 @@ function openSettings() {
   $('set-bg-url').value = SET.themeBg && !SET.themeBg.startsWith('data:') && !SET.themeBg.startsWith('/api/bg-file') ? SET.themeBg : '';
   $('set-tts-rate').value = SET.ttsRate;
   $('set-tts-rate-val').textContent = Number(SET.ttsRate).toFixed(2);
-  $('set-font').value = SET.fontFamily || '';
   // System font list for the searchable font picker (loaded async).
   loadSystemFonts();
   $('set-font-size').value = Number(SET.chatFontSize) || 14;
@@ -3569,6 +3945,7 @@ $('set-voice-autosend').onchange = (e) => {
   SET.voiceAutoSend = e.target.checked;
   saveSettings();
 };
+wireVoiceSettings();
 $('set-show-thinking').onchange = (e) => {
   SET.showThinking = e.target.checked;
   saveSettings();
@@ -3663,18 +4040,14 @@ window.addEventListener('resize', () => {
  * object-position percentage plus a zoom factor, so it survives reloads and
  * applies at every size the media is shown at. */
 /* ── manual crop ──────────────────────────────────────────────────────────
- * Layout is always "cover, centred"; the crop rides on top of it as
- *   transform: translate(fx · range) scale(z)
- * Panning used to go through object-position, which can only move the part of a
- * cover-fitted image that already sticks out - so an image that exactly filled
- * the frame on one axis could never be moved along that axis, however far you
- * zoomed. Moving by transform instead means zooming always opens up movement on
- * both axes.
+ * The stage shows the WHOLE picture (object-fit: contain) with the crop area
+ * drawn on top as a frame, so you can see what you are cutting off. It used to
+ * show the image already cover-cropped to the frame, which made every crop
+ * guesswork. The frame is fixed in place and the picture moves under it.
  *
- *   cw = max(1, imageAspect / frameAspect)   content width  ÷ frame width
- *   ch = max(1, frameAspect / imageAspect)   content height ÷ frame height
- *   range_x = z·cw − 1                       travel, in frame widths (×100%)
- * fx/fy are −1..1 fractions of that range, 0 = centred. */
+ * Stored crop: { v:2, fx, fy, z } - fx/fy are -1..1 across the available pan
+ * range (0 = centred), z is the zoom relative to the cover fit. Rendering uses
+ * the same maths as before (translate + scale over a centred cover layout). */
 let cropState = null;
 
 /* Older crops stored object-position percentages; convert them on the way in. */
@@ -3715,10 +4088,46 @@ function attachCrop(node, crop, frameAspect) {
   return node;
 }
 
+/* Where the crop frame sits on the stage, and how much the picture can move.
+ * Everything is in stage pixels; the frame stays put and the picture moves. */
+function cropGeometry() {
+  if (!cropState) return null;
+  const { node, frame, fx, fy, z } = cropState;
+  const stage = $('crop-stage');
+  const nw = node.naturalWidth || node.videoWidth || 0;
+  const nh = node.naturalHeight || node.videoHeight || 0;
+  if (!stage || !nw || !nh) return null;
+  const sr = stage.getBoundingClientRect();
+  const s = Math.min(sr.width / nw, sr.height / nh);      // contain fit: whole picture visible
+  const b = nw / nh;
+  const baseW = b >= frame ? nh * frame : nw;             // biggest frame-shaped rect in the image
+  const baseH = b >= frame ? nh : nw / frame;
+  const cropW = baseW / z;
+  const cropH = baseH / z;
+  // How far the crop rect can travel inside the *picture* - using the base rect
+  // here instead would leave nothing to pan at zoom 1 and only a fraction of
+  // the picture to choose from further in.
+  const rangeX = (nw - cropW) / 2;
+  const rangeY = (nh - cropH) / 2;
+  const cx = nw / 2 + (Number(fx) || 0) * rangeX;
+  const cy = nh / 2 + (Number(fy) || 0) * rangeY;
+  const left = (sr.width - nw * s) / 2 + (cx - cropW / 2) * s;
+  const top = (sr.height - nh * s) / 2 + (cy - cropH / 2) * s;
+  return { s, rangeX, rangeY, left, top, w: cropW * s, h: cropH * s };
+}
+
 function paintCrop() {
   if (!cropState) return;
-  const { node, fx, fy, z, frame } = cropState;
-  applyCrop(node, { v: 2, fx, fy, z }, frame);
+  const g = cropGeometry();
+  const overlay = $('crop-frame');
+  if (g && overlay) {
+    overlay.classList.remove('hidden');
+    overlay.style.left = `${g.left}px`;
+    overlay.style.top = `${g.top}px`;
+    overlay.style.width = `${g.w}px`;
+    overlay.style.height = `${g.h}px`;
+  }
+  const { fx, fy, z } = cropState;
   const zoom = $('crop-zoom');
   if (zoom) { zoom.value = String(z); $('crop-zoom-val').textContent = `${z.toFixed(2)}×`; }
   const cx = $('crop-x'); if (cx) cx.value = String(fx);
@@ -3728,16 +4137,10 @@ function paintCrop() {
 /* Move the picture by a drag, in pixels, on the (possibly zoomed) stage. */
 function cropDrag(dx, dy) {
   if (!cropState) return;
-  const stage = $('crop-stage');
-  if (!stage) return;
-  const { node, z, frame } = cropState;
-  const { cw, ch, ready } = cropRatios(node, frame);
-  if (!ready) return;   // not loaded yet
-  const sr = stage.getBoundingClientRect();
-  // Screen pixels available each way: the content is z·cw wide against a frame
-  // one wide, so half of the excess in each direction.
-  const halfX = ((z * cw - 1) * sr.width) / 2;
-  const halfY = ((z * ch - 1) * sr.height) / 2;
+  const g = cropGeometry();
+  if (!g) return;   // not loaded yet
+  const halfX = g.rangeX * g.s;
+  const halfY = g.rangeY * g.s;
   const clamp = (v) => Math.max(-1, Math.min(1, v));
   if (halfX > 0.5) cropState.fx = clamp(cropState.fx - dx / halfX);
   if (halfY > 0.5) cropState.fy = clamp(cropState.fy - dy / halfY);
@@ -3758,13 +4161,10 @@ function openCropper(kind) {
   media.replaceChildren(node);
   $('crop-title').textContent = isAvatar ? 'Crop profile image' : 'Crop background';
   $('crop-hint').textContent = isAvatar
-    ? 'Drag the picture inside the circle, scroll or use the slider to zoom. Zooming in is what lets you slide it sideways. What you see here is what the chat shows.'
-    : 'Drag the picture, scroll or use the slider to zoom. Zooming in is what lets you slide it sideways. The frame is your window shape.';
+    ? 'The circle is what the chat will show. Drag the picture to move it, scroll or use the slider to zoom - zooming in lets you slide it further.'
+    : 'The frame is what you will see on screen. Drag the picture to move it, scroll or use the slider to zoom - zooming in lets you slide it further.';
   stage.classList.toggle('circle', isAvatar);
   const frame = isAvatar ? 1 : window.innerWidth / Math.max(1, window.innerHeight);
-  stage.style.aspectRatio = isAvatar
-    ? '1 / 1'
-    : `${Math.max(1, window.innerWidth)} / ${Math.max(1, window.innerHeight)}`;
   cropState = {
     kind,
     node,
@@ -3773,7 +4173,16 @@ function openCropper(kind) {
     fy: saved.fy == null ? 0 : Number(saved.fy),
     z: saved.z == null ? 1 : Math.max(1, Number(saved.z)),
   };
-  paintCrop();
+  // Show the picture at its own shape, so nothing is hidden from the start.
+  const setStage = () => {
+    const nw = node.naturalWidth || node.videoWidth || 0;
+    const nh = node.naturalHeight || node.videoHeight || 0;
+    if (nw && nh) stage.style.aspectRatio = `${nw} / ${nh}`;
+    paintCrop();
+  };
+  setStage();
+  node.addEventListener('load', setStage);
+  node.addEventListener('loadedmetadata', setStage);
   const dlg = $('crop-dialog');
   if (!dlg.open) dlg.showModal();
 }
@@ -4573,10 +4982,25 @@ if (reelsResize) {
     if (!dragging) return;
     dragging = false;
     reelsResize.classList.remove('dragging');
+    // Remember the width - the panel used to snap back to its narrow default
+    // on every launch.
+    SET.reelsWidth = Math.round($('reels-panel').getBoundingClientRect().width);
+    saveSettings();
     syncNativeFeed();
   };
   reelsResize.addEventListener('pointerup', stop);
   window.addEventListener('pointerup', stop);
+  applyReelsWidth();
+}
+
+/* The saved panel width, or a wider default than the old 400px so the feed has
+ * room from the start. */
+function applyReelsWidth() {
+  const panel = $('reels-panel');
+  if (!panel) return;
+  const max = Math.max(320, window.innerWidth - 360);
+  const want = Number(SET.reelsWidth) > 0 ? Number(SET.reelsWidth) : Math.round(window.innerWidth * 0.42);
+  panel.style.width = `${Math.max(340, Math.min(max, want))}px`;
 }
 
 if (typeof ResizeObserver !== 'undefined') {
@@ -4604,6 +5028,256 @@ setInterval(() => {
   if (reelsWin && reelsWin.closed) { reelsWin = null; hideReelsPill(); }
 }, 1000);
 
+/* ── context menus ────────────────────────────────────────────────────────
+ * Right click a session in the sidebar, or a message in the transcript. Both use
+ * the same dropdown component as the model picker. */
+
+function openSessionMenu(s, anchor) {
+  const cur = S.state.sessionFile;
+  const isCurrent = !!(cur && (s.path === cur || s.fileName === String(cur).split(/[\\/]/).pop()));
+  openMenu(anchor, [
+    { label: 'open', hint: s.name, active: isCurrent, onPick: () => switchToSession(s.path) },
+    { label: 'export…', hint: 'save the .jsonl wherever you want', onPick: () => exportSession(s) },
+    { label: 'branches…', hint: 'fork points in this session', sub: true, onPick: () => openBranchesMenu(s, anchor) },
+    { sep: true },
+    { label: 'delete…', hint: 'removes the file from disk', danger: true, onPick: () => deleteSession(s) },
+  ], { title: 'session', width: 330, align: 'right' });
+}
+
+/* Download a session file. showSaveFilePicker is a real "where do you want it"
+ * dialog; the plain anchor fallback still saves to the download folder. */
+async function exportSession(s) {
+  const url = `/api/session-file?path=${encodeURIComponent(s.path)}`;
+  const name = String(s.fileName || 'session.jsonl');
+  try {
+    if (window.showSaveFilePicker) {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: 'pi session', accept: { 'application/jsonl': ['.jsonl'] } }],
+      });
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`bridge said ${res.status}`);
+      const blob = await res.blob();
+      const w = await handle.createWritable();
+      await w.write(blob);
+      await w.close();
+      toast(`Exported ${name}`);
+      return;
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;   // cancelled in the dialog
+  }
+  const a = el('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast(`Exporting ${name}`);
+}
+
+async function deleteSession(s) {
+  const ok = confirm(`Delete this session for good?\n\n${s.name}\n${s.path}\n\n` +
+    'The file is removed from disk - this cannot be undone.');
+  if (!ok) return;
+  try {
+    const r = await fetch('/api/session-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: s.path }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'delete failed');
+    if (S.state.sessionFile && s.path === S.state.sessionFile) {
+      toast('That was the open session - starting a new one', 'warning');
+      await rpc({ type: 'new_session' }).catch(() => {});
+      await initSession(false);
+    }
+    await refreshSessions();
+    toast(`Deleted ${s.name}`);
+  } catch (e) {
+    toast(`Delete failed: ${e.message}`, 'error');
+  }
+}
+
+/* Branch points of the open session (pi keeps branches in one file as a tree).
+ * There is no RPC for moving the active leaf, so choosing a branch point means
+ * forking there - which is how a branch gets started in the first place. */
+async function openBranchesMenu(s, anchor) {
+  let tree = null, leafId = null;
+  try {
+    const d = await rpc({ type: 'get_tree' });
+    tree = d && d.tree;
+    leafId = d && d.leafId;
+  } catch { /* older agent */ }
+  if (!tree || !tree.length) { toast('This session has no branches yet', 'warning'); return; }
+  const describe = (entry) => {
+    const m = entry && entry.message;
+    const text = m ? String((m.content || []).map((c) => c.text || '').join(' ')).replace(/\s+/g, ' ').trim() : '';
+    return `${m ? m.role : (entry && entry.type) || 'entry'}: ${text.slice(0, 70) || entry.id}`;
+  };
+  const items = [];
+  const walk = (nodes) => {
+    for (const n of nodes) {
+      const kids = n.children || [];
+      const isLeaf = kids.length === 0;
+      if (isLeaf || kids.length > 1) {
+        items.push({
+          label: `${isLeaf ? (n.entry.id === leafId ? '● ' : '○ ') : '⑂ '}${describe(n.entry)}`,
+          hint: isLeaf ? 'branch end' : `${kids.length} branches`,
+          active: n.entry.id === leafId,
+          onPick: () => forkAt(n.entry.id, describe(n.entry)),
+        });
+      }
+      if (kids.length) walk(kids);
+    }
+  };
+  walk(tree);
+  if (!items.length) { toast('Nothing to switch between yet', 'warning'); return; }
+  openMenu(anchor, items, {
+    title: 'branches - picking one starts a new branch from there',
+    width: 420,
+    search: 'filter branch points…',
+    align: 'right',
+  });
+}
+
+async function forkAt(entryId, text) {
+  if (!confirm(`Start a new branch from this point?\n\n${text}\n\nThe conversation continues from there.`)) return;
+  try {
+    await rpc({ type: 'fork', entryId });
+    await initSession(false);
+    toast('Forked - continue from here');
+  } catch (e) {
+    toast(`Fork failed: ${e.message}`, 'error');
+  }
+}
+
+/* Right-click a message: fork from the user turn that started it. */
+function openTurnMenu(node) {
+  const m = node._msg || null;
+  const entryId = node.dataset.fork || null;
+  const items = [];
+  if (entryId) items.push({ label: 'fork from here', hint: 'new branch at this message', onPick: () => forkAt(entryId, node.dataset.forktext || '') });
+  if (m && m.role === 'assistant') items.push({ label: 'clone session here', hint: 'copy the session up to now', onPick: () => cloneHere() });
+  const md = node.querySelector('.md');
+  const text = md ? md.innerText : '';
+  if (text) {
+    if (items.length) items.push({ sep: true });
+    items.push({ label: 'copy text', onPick: () => { navigator.clipboard.writeText(text); toast('Copied'); } });
+    items.push({ label: 'speak', onPick: () => speak(stripMarkdown(text)) });
+  }
+  if (!items.length) return;
+  openMenu(node.querySelector('.who') || node, items, { title: 'message', width: 300 });
+}
+
+async function cloneHere() {
+  try {
+    await rpc({ type: 'clone' });
+    await initSession(false);
+    toast('Cloned into a new session');
+  } catch (e) {
+    toast(`Clone failed: ${e.message}`, 'error');
+  }
+}
+
+/* ── instances ────────────────────────────────────────────────────────────
+ * Other pi agents (other machines, or a second bridge on this one) in the
+ * sidebar. Switching opens that instance's own WebUI, so its name, picture and
+ * every other setting stay with it - each bridge keeps its own settings file.
+ * The dot comes from /api/health, the one endpoint that answers cross-origin. */
+function localInstance() { return { id: 'local', name: (SET.agentName || '').trim() || 'this machine', url: location.origin }; }
+function allInstances() {
+  const out = [localInstance()];
+  for (const i of SET.instances || []) if (i && i.url) out.push(i);
+  return out;
+}
+function instanceStatus(url) {
+  return S.instanceStatus[url === location.origin ? 'local' : url] || null;
+}
+
+async function pollInstances() {
+  await Promise.all(allInstances().map(async (inst) => {
+    const key = inst.url === location.origin ? 'local' : inst.url;
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 4000);
+      const d = await fetch(`${inst.url}/api/health`, { signal: ctl.signal, cache: 'no-store' }).then((r) => r.json());
+      clearTimeout(t);
+      S.instanceStatus[key] = { ok: !!d.ok, busy: !!d.busy, name: d.name || null, at: Date.now() };
+    } catch {
+      S.instanceStatus[key] = { ok: false, busy: false, at: Date.now() };
+    }
+  }));
+  updateInstanceBtn();
+  if (openMenuEl && openMenuEl._instances) openInstanceMenu(openMenuEl._anchor, true);
+}
+
+function updateInstanceBtn() {
+  const btn = $('btn-instance');
+  if (!btn) return;
+  const extra = allInstances().length - 1;
+  btn.textContent = ((SET.agentName || '').trim() || 'this machine') + (extra ? ` +${extra}` : '');
+  btn.title = 'pi agent instances - click to switch or add another one';
+}
+
+function openInstanceMenu(anchor, force) {
+  const items = [];
+  for (const inst of allInstances()) {
+    const st = instanceStatus(inst.url);
+    const here = inst.url === location.origin;
+    items.push({
+      label: (here ? '● ' : '') + inst.name + (st && st.name ? `  (${st.name})` : ''),
+      hint: here ? 'this window' : String(inst.url).replace(/^https?:\/\//, ''),
+      dot: st && st.busy ? 'live-dot' : (st && st.ok ? null : 'off-dot'),
+      active: here,
+      onPick: () => switchInstance(inst),
+    });
+  }
+  items.push({ sep: true });
+  items.push({ label: 'add another pi agent…', hint: 'other machine or port', onPick: () => addInstance() });
+  if ((SET.instances || []).length) {
+    items.push({ sep: true, group: 'remove' });
+    for (const i of SET.instances) {
+      items.push({
+        label: `remove ${i.name}`,
+        hint: i.url.replace(/^https?:\/\//, ''),
+        danger: true,
+        onPick: () => {
+          SET.instances = (SET.instances || []).filter((x) => x.id !== i.id);
+          saveSettings();
+          toast(`Removed ${i.name}`);
+        },
+      });
+    }
+  }
+  const menu = openMenu(anchor, items, { title: 'pi agents', width: 360, force });
+  if (menu) menu._instances = true;
+}
+
+function switchInstance(inst) {
+  if (inst.url === location.origin) return;
+  toast(`Switching to ${inst.name}…`);
+  location.href = inst.url;
+}
+
+function addInstance() {
+  const name = prompt('Name for the other pi agent (for example "laptop" or "work pc")');
+  if (!name) return;
+  let url = prompt('Address of its WebUI, as http://host:port', 'http://');
+  if (!url) return;
+  url = url.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(url)) url = `http://${url}`;
+  let base;
+  try { base = new URL(url).origin; } catch { toast('That is not a valid address', 'error'); return; }
+  if (allInstances().some((i) => i.url === base)) { toast('That instance is already in the list', 'warning'); return; }
+  SET.instances = [...(SET.instances || []), { id: `i${Date.now().toString(36)}`, name: name.trim(), url: base }];
+  saveSettings();
+  updateInstanceBtn();
+  toast(`${name.trim()} added - click it to switch`);
+  pollInstances().catch(() => {});
+}
+
 /* ───────────────────────── boot ───────────────────────── */
 
 wireTypeAnywhere();
@@ -4611,3 +5285,23 @@ applySettings();
 populateTtsVoiceSelect();
 loadServerSettings().then(() => maybeShowSetup());
 connect();
+
+/* thinking level: the button opens the same dropdown as the model picker */
+if ($('thinking-btn')) $('thinking-btn').onclick = (e) => { e.stopPropagation(); openThinkingMenu(); };
+
+/* right-click menus: a session row (wired in renderSessions) or a message */
+chat.addEventListener('contextmenu', (e) => {
+  const node = e.target.closest('.msg');
+  if (!node || node.classList.contains('compaction')) return;
+  e.preventDefault();
+  openTurnMenu(node);
+});
+
+/* instances: the button opens the switcher, and the dots refresh in the
+ * background so a busy agent on another machine shows up on its own */
+if ($('btn-instance')) {
+  $('btn-instance').onclick = (e) => { e.stopPropagation(); openInstanceMenu($('btn-instance')); };
+  updateInstanceBtn();
+  setTimeout(() => { pollInstances().catch(() => {}); }, 1500);
+  setInterval(() => { pollInstances().catch(() => {}); }, 8000);
+}

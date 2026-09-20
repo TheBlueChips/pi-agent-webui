@@ -23,6 +23,9 @@
       <button id="btn-refresh-sessions" class="btn icon" title="Refresh session list">⟳</button>
     </div>
     <div id="session-list" class="session-list"></div>
+    <div class="sidebar-foot">
+      <button id="btn-instance" class="btn small instance-btn" title="Switch pi agent instance">this machine</button>
+    </div>
   </aside>
 
   <!-- ══════════ Main ══════════ -->
@@ -82,6 +85,7 @@
         <select id="model-select" title="Model"></select>
         <button id="model-btn" class="btn pill" title="Model">no model</button>
         <select id="thinking-select" title="Thinking level"></select>
+        <button id="thinking-btn" class="btn pill" title="Thinking level">off</button>
       </div>
     </div>
 
@@ -128,6 +132,7 @@
   <h3 id="crop-title">Crop</h3>
   <div id="crop-stage" class="crop-stage">
     <div id="crop-media" class="crop-media"></div>
+    <div id="crop-frame" class="crop-frame hidden"></div>
   </div>
   <div class="settings-grid">
     <label>Zoom</label>
@@ -237,13 +242,22 @@
       </div>
       <label>Voice input</label>
       <label class="check-label"><input id="set-voice-autosend" type="checkbox"> auto-send after voice input</label>
-      <label>Whisper endpoint</label>
-      <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8080/inference or …/v1/audio/transcriptions">
       <label>Voice input backend</label>
       <select id="set-stt-backend">
-        <option value="whisper">Whisper server</option>
-        <option value="browser">Browser (Chrome/Edge only)</option>
+        <option value="browser">Browser (built in - default, nothing to download)</option>
+        <option value="whisper">Local Whisper server</option>
       </select>
+      <label>Whisper model</label>
+      <div class="rate-row">
+        <select id="set-stt-model"></select>
+        <button id="btn-stt-start" class="btn small">download &amp; start</button>
+      </div>
+      <label></label>
+      <div class="hint" id="stt-model-note"></div>
+      <label></label>
+      <div class="hint hidden" id="stt-status"></div>
+      <label>Whisper endpoint</label>
+      <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8081/inference (filled in automatically)">
       <label>TTS backend</label>
       <select id="set-tts-backend"><option value="browser">Browser voices</option><option value="endpoint">Local TTS server (Piper etc.)</option></select>
       <label>TTS server URL</label>

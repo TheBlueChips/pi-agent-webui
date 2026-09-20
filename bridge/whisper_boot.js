@@ -1,12 +1,15 @@
 /*
- * Auto-provision a local whisper.cpp server for speech-to-text.
+ * Provision a local whisper.cpp server for speech-to-text - on request only.
  *
- * On launch: if something already listens on WHISPER_PORT, reuse it.
- * Otherwise (first run) download the whisper.cpp Windows binaries and a ggml
- * model, extract them into bridge/whisper/, and start the server. All failures
- * are non-fatal — the UI falls back to browser speech recognition.
+ * Nothing is downloaded until the UI asks for it (the Whisper backend is not
+ * the default), because the binaries are ~200 MB and a model on top of that.
+ * Once asked: reuse whatever listens on WHISPER_PORT, otherwise fetch the
+ * whisper.cpp Windows binaries and the requested ggml model into bridge/whisper/
+ * and start the server. Failures are non-fatal - the browser's own speech
+ * recognition stays available.
  *
- * Env: WHISPER_PORT (8081), WHISPER_MODEL (ggml-base.en.bin), AUTO_WHISPER=0 to disable.
+ * Env: WHISPER_PORT (8081), WHISPER_MODEL (default model id), AUTO_WHISPER=1 to
+ * start it on boot anyway.
  */
 'use strict';
 
@@ -18,16 +21,30 @@ const https = require('https');
 const { spawn, execFile, execSync } = require('child_process');
 
 const WHISPER_PORT = process.env.WHISPER_PORT || '8081';
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'ggml-base.en.bin';
+
+/* The models offered in the UI. Sizes are the ggml .bin downloads; the notes
+ * are what actually matters when choosing (accuracy vs speed vs machine). */
+const WHISPER_MODELS = [
+  { id: 'ggml-tiny.en.bin', label: 'Tiny (English)', size: '75 MB',
+    note: 'Fastest, works on anything. Fine for short commands and names, but it will miss words in longer sentences.' },
+  { id: 'ggml-base.en.bin', label: 'Base (English)', size: '142 MB',
+    note: 'The sensible default: good accuracy on normal speech, still quick on a laptop CPU.' },
+  { id: 'ggml-small.en.bin', label: 'Small (English)', size: '466 MB',
+    note: 'Clearly better with accents, background noise and technical words. Needs a few CPU cores, noticeably slower.' },
+];
+const DEFAULT_MODEL = process.env.WHISPER_MODEL || 'ggml-base.en.bin';
 const VENDOR_DIR = path.join(__dirname, 'whisper');
 // Note: whisper.cpp's semantic-version releases ship source only; the Windows
 // binaries are attached to the tagged nightly builds (b5130 etc.).
 const BIN_ZIP_URL = 'https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip';
-const MODEL_URL = `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL}`;
+const MODEL_URL = (m) => `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${m}`;
 
 // The whisper-server child we spawned (null if we reused an existing server or
 // never started one). Kept so the bridge can stop it on shutdown.
 let whisperProc = null;
+// What the UI polls: { state, model, url, detail, got, total }
+let whisperState = { state: 'off', model: DEFAULT_MODEL, url: null, detail: 'not started', got: 0, total: 0 };
+let whisperStart = null;   // in-flight promise, so two clicks cannot download twice
 
 function tcpReachable(port) {
   return new Promise((resolve) => {
@@ -38,7 +55,7 @@ function tcpReachable(port) {
   });
 }
 
-function download(url, dest) {
+function download(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
     const get = (u, redirects) => {
       const mod = u.startsWith('https:') ? https : http;
@@ -57,6 +74,7 @@ function download(url, dest) {
         res.on('data', (c) => {
           got += c.length;
           const pct = total ? Math.floor((got / total) * 100) : 0;
+          if (onProgress) onProgress(got, total);
           if (pct >= lastPct + 10) { lastPct = pct; console.log(`  downloading ${path.basename(dest)} … ${pct}%`); }
         });
         res.pipe(out);
@@ -89,31 +107,45 @@ function findServerExe(dir) {
     || null;
 }
 
-async function startWhisper() {
+async function startWhisper(modelId) {
+  if (whisperStart) return whisperStart;      // one download at a time
+  whisperStart = doStartWhisper(modelId).finally(() => { whisperStart = null; });
+  return whisperStart;
+}
+
+async function doStartWhisper(modelId) {
+  const modelName = WHISPER_MODELS.some((m) => m.id === modelId) ? modelId : DEFAULT_MODEL;
   const url = `http://localhost:${WHISPER_PORT}/inference`;
+  whisperState = { state: 'starting', model: modelName, url: null, detail: 'checking for an existing server', got: 0, total: 0 };
   try {
     if (await tcpReachable(WHISPER_PORT)) {
       console.log(`whisper STT: reusing server already listening on port ${WHISPER_PORT}`);
+      whisperState = { state: 'ready', model: modelName, url, detail: 'reusing the server already on ' + WHISPER_PORT, got: 0, total: 0 };
       return url;
     }
     fs.mkdirSync(VENDOR_DIR, { recursive: true });
     let serverExe = findServerExe(VENDOR_DIR);
-    const model = path.join(VENDOR_DIR, WHISPER_MODEL);
+    const model = path.join(VENDOR_DIR, modelName);
     if (!serverExe) {
       console.log('whisper STT: first run — downloading whisper.cpp binaries (~200 MB, once)…');
+      whisperState = { state: 'downloading', model: modelName, url: null, detail: 'whisper.cpp binaries (~200 MB, once)', got: 0, total: 0 };
       const zip = path.join(VENDOR_DIR, 'whisper-bin-x64.zip');
-      await download(BIN_ZIP_URL, zip);
+      await download(BIN_ZIP_URL, zip, (got, total) => { whisperState.got = got; whisperState.total = total; });
+      whisperState.detail = 'unpacking whisper.cpp…';
       await unzip(zip, VENDOR_DIR);
       fs.rmSync(zip, { force: true });
       serverExe = findServerExe(VENDOR_DIR);
     }
     if (!serverExe) {
       console.log('whisper STT: server binary not found after download — skipping (browser voice stays available)');
+      whisperState = { state: 'failed', model: modelName, url: null, detail: 'could not unpack the whisper.cpp download', got: 0, total: 0 };
       return null;
     }
     if (!fs.existsSync(model)) {
-      console.log(`whisper STT: downloading model ${WHISPER_MODEL}…`);
-      await download(MODEL_URL, model);
+      console.log(`whisper STT: downloading model ${modelName}…`);
+      const info = WHISPER_MODELS.find((m) => m.id === modelName);
+      whisperState = { state: 'downloading', model: modelName, url: null, detail: `model ${modelName} (${info ? info.size : ''})`.trim(), got: 0, total: 0 };
+      await download(MODEL_URL(modelName), model, (got, total) => { whisperState.got = got; whisperState.total = total; });
     }
     const child = spawn(serverExe, ['-m', model, '--port', String(WHISPER_PORT), '--inference-path', '/inference'], {
       cwd: path.dirname(serverExe),
@@ -121,20 +153,29 @@ async function startWhisper() {
     });
     child.on('error', (e) => console.log('whisper STT: failed to start:', e.message));
     whisperProc = child;
+    whisperState.detail = 'starting the server…';
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 1000));
       if (await tcpReachable(WHISPER_PORT)) break;
     }
     if (await tcpReachable(WHISPER_PORT)) {
-      console.log(`whisper STT: serving ${WHISPER_MODEL} at ${url}`);
+      console.log(`whisper STT: serving ${modelName} at ${url}`);
+      whisperState = { state: 'ready', model: modelName, url, detail: `serving ${modelName}`, got: 0, total: 0 };
       return url;
     }
     console.log('whisper STT: server did not come up — browser voice fallback stays available');
+    whisperState = { state: 'failed', model: modelName, url: null, detail: 'the server did not come up', got: 0, total: 0 };
     return null;
   } catch (e) {
     console.log('whisper STT: setup skipped (' + e.message + ')');
+    whisperState = { state: 'failed', model: modelName, url: null, detail: e.message, got: 0, total: 0 };
     return null;
   }
+}
+
+function whisperStatus() {
+  const st = WHISPER_MODELS.find((m) => m.id === whisperState.model);
+  return { ...whisperState, models: WHISPER_MODELS, size: st ? st.size : null, running: !!whisperProc || whisperState.state === 'ready' };
 }
 
 // Stop the whisper server we started. Only acts if we actually spawned one
@@ -153,4 +194,4 @@ function stopWhisper() {
   } catch { /* already gone */ }
 }
 
-module.exports = { startWhisper, stopWhisper };
+module.exports = { startWhisper, stopWhisper, whisperStatus, WHISPER_MODELS, DEFAULT_MODEL };

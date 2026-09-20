@@ -22,9 +22,13 @@ const crypto = require('crypto');
 const { spawn, execFile, execSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { WebSocketServer } = require('ws');
-const { startWhisper, stopWhisper } = require('./whisper_boot');
+const { startWhisper, stopWhisper, whisperStatus, WHISPER_MODELS, DEFAULT_MODEL } = require('./whisper_boot');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
+// Localhost by default. The agent behind this bridge runs commands on this
+// machine and there is no authentication, so exposing the bridge to the LAN is
+// an explicit decision (PI_WEBUI_HOST=0.0.0.0), not the default.
+const HOST = process.env.PI_WEBUI_HOST || '127.0.0.1';
 const PI_COMMAND = process.env.PI_COMMAND || 'pi --mode rpc';
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd();
 // Session dir for listing. Either a normal path, or "docker:<container>:<path>"
@@ -32,6 +36,9 @@ const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd();
 // agent runs in an existing container, e.g. PI_COMMAND="docker exec -i ctr pi --mode rpc").
 const SESSION_DIR =
   process.env.PI_SESSION_DIR || path.join(os.homedir(), '.pi', 'agent', 'sessions');
+// Same thing, as a list and never a docker spec - used to bound session
+// export/delete to files that really are session files.
+const SESSION_DIRS = SESSION_DIR.startsWith('docker:') ? [] : [SESSION_DIR];
 // pi's config dir (~/.pi/agent): models.json / settings.json / auth.json live here.
 const PI_AGENT_DIR = process.env.PI_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
 const PI_MODELS_FILE = path.join(PI_AGENT_DIR, 'models.json');
@@ -196,6 +203,24 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+
+/* Resolve a session path for export/delete: only real .jsonl files inside the
+ * configured session directory, so a crafted request cannot read or remove
+ * anything else on the machine. Returns null when it does not check out. */
+function safeSessionPath(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const want = path.resolve(raw.trim());
+  const roots = SESSION_DIRS.length ? SESSION_DIRS : [SESSION_DIR];
+  const inside = roots.some((r) => {
+    const root = path.resolve(String(r));
+    return want === root || want.startsWith(root + path.sep);
+  });
+  if (!inside || path.extname(want).toLowerCase() !== '.jsonl') return null;
+  try {
+    if (!fs.statSync(want).isFile()) return null;
+  } catch { return null; }
+  return want;
+}
 
 function serveStatic(req, res) {
   let urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
@@ -622,8 +647,46 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/health')) {
+    // `busy` is the whole point for the multi-instance switcher: every other
+    // instance polls this to show a pulsing dot while that agent is working.
+    // It is the one endpoint that also answers cross-origin requests (see CORS
+    // below) - it says nothing but "alive" and "working".
+    const url = new URL(req.url, 'http://localhost');
+    const payload = {
+      ok: true,
+      busy: agentStatus.busy,
+      name: agentStatus.sessionName || null,
+    };
+    if (url.searchParams.get('verbose')) payload.whisper = whisperStatus().state;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  // Local speech-to-text: started on request, never on boot. The Whisper
+  // backend downloads ~200 MB of whisper.cpp plus the chosen model, so it waits
+  // until someone actually picks it.
+  if (req.url.startsWith('/api/whisper-status')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify(whisperStatus()));
+    return;
+  }
+  if (req.url.startsWith('/api/whisper-start')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const { model } = JSON.parse(body || '{}');
+        const url = await startWhisper(model || DEFAULT_MODEL);
+        whisperUrl = url;
+        res.writeHead(url ? 200 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: !!url, url, ...whisperStatus() }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
     return;
   }
 
@@ -764,6 +827,43 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Download a session file (the sidebar's right-click -> export), and delete
+  // one when the user explicitly confirms. Both are restricted to files inside
+  // the configured session directory.
+  if (req.url.startsWith('/api/session-file')) {
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    const raw = new URL(req.url, 'http://localhost').searchParams.get('path') || '';
+    const file = safeSessionPath(raw);
+    if (!file) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'session not found' })); return; }
+    const st = fs.statSync(file);
+    res.writeHead(200, {
+      'Content-Type': 'application/jsonl',
+      'Content-Length': st.size,
+      'Content-Disposition': `attachment; filename="${path.basename(file)}"`,
+    });
+    fs.createReadStream(file).pipe(res);
+    return;
+  }
+  if (req.url.startsWith('/api/session-delete')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const { path: raw } = JSON.parse(body || '{}');
+        const file = safeSessionPath(raw);
+        if (!file) throw new Error('session not found');
+        fs.rmSync(file);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: file }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   // Save an uploaded file (PDF / audio / video / other) into the workspace so
   // the agent can read it with its tools. Body: {name, data(base64), mimeType}.
   // Serve a previously uploaded file back to the browser. Used for background
@@ -862,8 +962,13 @@ const server = http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/transcribe')) {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     if (!whisperUrl) {
+      // Started on demand: the UI may have asked for Whisper before the server
+      // was up (or the bridge was restarted under it).
+      whisperUrl = await startWhisper(DEFAULT_MODEL).catch(() => null);
+    }
+    if (!whisperUrl) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'no local STT server is running' }));
+      res.end(JSON.stringify({ error: 'no local STT server is running', whisper: whisperStatus() }));
       return;
     }
     let body = '';
@@ -1225,6 +1330,21 @@ function broadcast(obj, except) {
   }
 }
 
+// Tiny activity tracker for /api/health, which other instances poll to show a
+// pulsing dot. agent_start .. agent_settled is exactly "a turn is running".
+const agentStatus = { busy: false, sessionName: null };
+function noteAgentActivity(obj) {
+  if (!obj || typeof obj !== 'object') return;
+  switch (obj.type) {
+    case 'agent_start': agentStatus.busy = true; break;
+    case 'agent_settled':
+    case 'agent_end': agentStatus.busy = false; break;
+    case 'session_info_changed': if (obj.name) agentStatus.sessionName = obj.name; break;
+    case 'agent_exit': agentStatus.busy = false; break;
+    default: break;
+  }
+}
+
 const isWin = process.platform === 'win32';
 
 // Kill a child and (on Windows) its whole process tree. `shell: true` spawns
@@ -1277,6 +1397,7 @@ function startAgent() {
       }
       // A response belongs only to the client that issued the request; events
       // (everything without a matching owner) go to everybody.
+      noteAgentActivity(parsed);
       if (parsed && parsed.type === 'response' && parsed.id && pendingOwner.has(parsed.id)) {
         const owner = pendingOwner.get(parsed.id);
         pendingOwner.delete(parsed.id);
@@ -1301,6 +1422,7 @@ function startAgent() {
 
   child.on('exit', (code, signal) => {
     if (agent === child) agent = null;
+    agentStatus.busy = false;
     broadcast({ bridge: 'agent_exit', code, signal });
   });
 
@@ -1428,15 +1550,24 @@ function onFatalServerError(err) {
 server.on('error', onFatalServerError);
 wss.on('error', onFatalServerError);
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   listening = true;
   console.log(`Pi Agent WebUI`);
   console.log(`  http://localhost:${PORT}`);
   console.log(`  agent command : ${PI_COMMAND}`);
   console.log(`  workspace     : ${WORKSPACE_DIR}`);
   console.log(`  session dir   : ${SESSION_DIR}`);
-  if (process.env.AUTO_WHISPER !== '0') {
-    startWhisper().then((u) => { whisperUrl = u; });
+  if (HOST === '0.0.0.0' || HOST === '::') {
+    console.log('');
+    console.log('  !! reachable from your network, not just this machine.');
+    console.log('     Anyone on the LAN can drive this agent - there is no login.');
+    console.log('     Start it without PI_WEBUI_HOST to keep it local again.');
+    console.log('');
+  }
+  console.log('  speech to text: browser by default; the local whisper.cpp server is');
+  console.log('                  downloaded only when you pick it in Settings > Voice');
+  if (process.env.AUTO_WHISPER === '1') {
+    startWhisper(DEFAULT_MODEL).then((u) => { whisperUrl = u; });
   }
 });
 

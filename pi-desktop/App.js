@@ -104,7 +104,9 @@ export default function App() {
   autoOpenShortsRef.current = autoOpenShorts;
 
   const landscape = dims.width > dims.height;
-  const shortsWidth = landscape ? Math.max(320, Math.min(520, Math.round(dims.width * 0.42))) : 0;
+  // Wider than it used to be (42% / max 520): the feed had too little room on
+  // a laptop screen, and "extend further" is the point of the panel.
+  const shortsWidth = landscape ? Math.max(360, Math.min(680, Math.round(dims.width * 0.52))) : 0;
   const sheetHeight = shortsExpanded ? Math.round(dims.height * 0.92) : Math.round(dims.height * 0.55);
 
   const httpBase = useMemo(() => httpUrl(settings?.host, settings?.port), [settings]);
