@@ -4023,10 +4023,20 @@ $('model-select').onchange = async (e) => {
 };
 
 $('thinking-select').onchange = async (e) => {
+  const wanted = e.target.value;
   try {
-    await rpc({ type: 'set_thinking_level', level: e.target.value });
-    toast(`Thinking level: ${e.target.value}`);
-  } catch (err) { toast(err.message, 'error'); }
+    const d = await rpc({ type: 'set_thinking_level', level: wanted });
+    // The button is the only part of this control you can actually see (the
+    // select is hidden), and it was refreshed by the full state sync alone - so
+    // a new level showed up on the next page load and not before.
+    if (d && d.thinkingLevel) syncSelect($('thinking-select'), d.thinkingLevel);
+    updateThinkingBtn();
+    toast(`Thinking level: ${$('thinking-select').value}`);
+  } catch (err) {
+    toast(err.message, 'error');
+    // Put the old value back: the select had already been moved by the menu.
+    rpc({ type: 'get_state' }).then(applyState).catch(() => {});
+  }
 };
 
 /* ───────────────────────── extension UI protocol ───────────────────────── */
@@ -4566,6 +4576,13 @@ function openCropper(kind) {
   const media = $('crop-media');
   const node = mediaNode(src, 'crop-node');
   media.replaceChildren(node);
+  // If the picture cannot be decoded here, say so rather than showing an empty
+  // frame - a cropper that looks "invisible" usually means this.
+  setTimeout(() => {
+    const hint = $('crop-hint');
+    if (node.naturalWidth || node.videoWidth) return;
+    if (hint && !/did not load/.test(hint.textContent)) hint.textContent += '  (the picture did not load on this device)';
+  }, 1800);
   $('crop-title').textContent = isAvatar ? 'Crop profile image' : 'Crop background';
   $('crop-hint').textContent = isAvatar
     ? 'The circle is what the chat will show. Drag the picture to move it, scroll or use the slider to zoom - zooming in lets you slide it further.'
@@ -4606,14 +4623,50 @@ function openCropper(kind) {
   if (!dlg.__wired) {
     dlg.__wired = true;
     dlg.addEventListener('close', () => { cropState = null; });
+    // Escape has to work on the fallback overlay too, where there is no native
+    // dialog behaviour to close it.
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && $('crop-dialog') && $('crop-dialog').classList.contains('cropper-open')) {
+        ev.preventDefault();
+        closeCropper();
+      }
+    });
   }
-  if (!dlg.open) dlg.showModal();
+  if (!dlg.open && !dlg.classList.contains('cropper-open')) showCropDialog(dlg);
+}
+
+/* <dialog> + showModal is patchy on older mobile browsers and embedded
+ * webviews. Where it does not work the crop dialog simply never appeared - the
+ * click looked like it did nothing. Fall back to a plain fixed overlay, and
+ * verify afterwards that the dialog is really on screen. */
+function showCropDialog(dlg) {
+  let modal = false;
+  try {
+    if (typeof dlg.showModal === 'function') { dlg.showModal(); modal = dlg.open === true; }
+  } catch { modal = false; }
+  dlg.classList.add('cropper-open');
+  document.body.classList.add('modal-open');
+  if (!modal) {
+    dlg.setAttribute('open', '');
+    dlg.classList.add('cropper-forced');
+    return;
+  }
+  // Supported, but check it landed somewhere visible: if not, force the overlay.
+  requestAnimationFrame(() => {
+    const r = dlg.getBoundingClientRect();
+    const h = window.innerHeight || 0;
+    if (!r.width || !r.height || r.bottom < 8 || (h && r.top > h)) dlg.classList.add('cropper-forced');
+  });
 }
 
 function closeCropper() {
   cropState = null;
   const dlg = $('crop-dialog');
   if (dlg && dlg.open) dlg.close();
+  if (dlg) {
+    dlg.classList.remove('cropper-open', 'cropper-forced');
+    dlg.removeAttribute('open');
+  }
   // A leftover Escape-opened state used to leave the dialog modal-blocking the
   // page with nothing clickable behind it.
   document.body.classList.remove('modal-open');
