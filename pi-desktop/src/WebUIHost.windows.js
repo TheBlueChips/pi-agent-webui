@@ -15,7 +15,13 @@ import * as WV from './webview2';
 
 export function WebUIHost({ url }) {
   const hostRef = useRef(null);
-  const openedRef = useRef(false);
+  // Whether the native surface exists is module state, not component state: this
+  // component gets remounted whenever the app's layout changes (window resize,
+  // rotation, the Shorts panel opening), and closing the WebView on unmount
+  // reloaded the whole UI - losing the transcript view, the Shorts panel and
+  // every running timer. The surface is now kept and just re-bounded, so a
+  // resize leaves the page alone.
+  const openedRef = WV.opened || (WV.opened = { current: false });
   const urlRef = useRef(url);
   urlRef.current = url;
 
@@ -41,10 +47,11 @@ export function WebUIHost({ url }) {
     // Re-align when the window resizes / the app is backgrounded and restored.
     const sub = AppState.addEventListener('change', place);
     return () => {
+      // Deliberately no WV.close() here: an unmount is a layout change, not the
+      // end of the app. The surface stays where it is (or gets re-bounded by the
+      // next mount) and the page keeps its state.
       cancelAnimationFrame(raf);
       sub && sub.remove && sub.remove();
-      openedRef.current = false;
-      WV.close();
     };
   }, [place]);
 

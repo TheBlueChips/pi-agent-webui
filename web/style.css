@@ -712,7 +712,9 @@ body { display: flex; }
 @keyframes comp-spin { to { transform: rotate(360deg); } }
 
 /* ── live session indicator ── */
-.session-item.live { border-color: var(--accent); }
+/* the running session is marked by its green dot, not by an accent border:
+ * the border made it look selected while you were reading a different one */
+.session-item.live { border-color: color-mix(in srgb, var(--green) 50%, transparent); }
 .live-dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   background: var(--green); margin-right: 6px; vertical-align: 1px;
@@ -910,3 +912,18 @@ body.text-outline #stats-bar { text-shadow:
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, .55);
 }
 .crop-stage.circle .crop-frame { border-radius: 50%; }
+
+/* ── in-app confirmations / small forms ───────────────────────────────────── */
+#ask-dialog { width: min(460px, 92vw); }
+#ask-dialog #ask-body { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 2px; }
+#ask-dialog .ask-text { margin: 0; font-size: 13px; color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; }
+#ask-dialog .ask-hint { margin: 0; font-size: 12px; color: var(--text-dim); }
+#ask-dialog .ask-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-dim); }
+#ask-dialog .ask-label { width: 70px; flex-shrink: 0; text-align: right; }
+#ask-dialog .ask-row input {
+  flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 6px 8px; font-size: 12.5px;
+}
+#ask-dialog .ask-row input:focus { outline: none; border-color: var(--accent); }
+#ask-dialog .btn.danger { background: var(--red); border-color: var(--red); color: #fff; }
+#ask-dialog .btn.danger:hover { filter: brightness(1.08); }

@@ -603,11 +603,17 @@ const server = http.createServer(async (req, res) => {
     try {
       const messages = [];
       const compactions = [];
+      let parent = null;
       for (const line of fs.readFileSync(resolved, 'utf8').split('\n')) {
         if (!line.trim()) continue;
         let e; try { e = JSON.parse(line); } catch { continue; }
+        // The header records where a fork came from - deleting a fork can send
+        // you back to its original session instead of a blank one.
+        if (e && e.type === 'session' && e.parentSession) parent = e.parentSession;
         if (e && e.type === 'message' && e.message) {
-          messages.push({ ...e.message, timestamp: e.message.timestamp ?? e.timestamp });
+          // entryId travels with the message so the UI can offer "fork from
+          // here" while reading a session that the agent has not loaded.
+          messages.push({ ...e.message, timestamp: e.message.timestamp ?? e.timestamp, entryId: e.id || null });
         } else if (e && e.type === 'compaction' && e.summary) {
           // Compactions are their own entry type (not messages), so they are
           // missing from get_messages — without these the "conversation
@@ -622,7 +628,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ path: p, messages, compactions }));
+      res.end(JSON.stringify({ path: p, messages, compactions, parent }));
     } catch (e) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `read failed: ${e.message}` }));

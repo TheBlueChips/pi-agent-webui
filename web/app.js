@@ -351,6 +351,7 @@ const DEFAULT_SETTINGS = {
   shortsAutoOpen: false,  // open the feed while the agent runs, close it when the run finishes
   shortsMode: 'panel',    // 'panel' (in-app split) | 'window' (side window, full feed) | 'tab' — legacy 'split'='panel', 'popup'='window'
   reelsWidth: null,       // px — the shorts panel width, remembered across launches
+  reelsOpen: false,       // was the shorts panel open? restored on load
   autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
   fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
   chatFontSize: 14,       // px — chat + composer text size
@@ -463,6 +464,7 @@ const S = {
   commands: [],            // from get_commands (extension / prompt / skill)
   builtinCommands: [],     // from /api/builtin-commands (pi's built-in slash commands)
   forkable: [],            // from get_fork_messages: [{entryId, text}]
+  forkEntries: [],         // from get_entries - same idea, but everything in the file
   state: {},               // last get_state payload
   isStreaming: false,
   compacting: false,        // true while a compaction is in flight
@@ -793,10 +795,18 @@ function openMenu(anchor, items, opts = {}) {
   const w = Math.max(200, Math.min(opts.width || 300, window.innerWidth - 24));
   menu.style.width = `${w}px`;
   const h = menu.offsetHeight;
-  const roomBelow = window.innerHeight - r.bottom - 10;
-  if (roomBelow < Math.min(h, 220) && r.top > roomBelow) menu.style.bottom = `${window.innerHeight - r.top + 6}px`;
-  else menu.style.top = `${Math.min(r.bottom + 6, Math.max(8, window.innerHeight - h - 8))}px`;
-  menu.style.left = `${Math.max(8, Math.min(opts.align === 'right' ? r.right - w : r.left, window.innerWidth - w - 8))}px`;
+  if (opts.at) {
+    // Right-click menus appear where the pointer is, not at the message header.
+    const left = Math.max(8, Math.min(opts.at.x, window.innerWidth - w - 8));
+    const top = opts.at.y + h + 8 > window.innerHeight ? Math.max(8, opts.at.y - h - 6) : opts.at.y + 6;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  } else {
+    const roomBelow = window.innerHeight - r.bottom - 10;
+    if (roomBelow < Math.min(h, 220) && r.top > roomBelow) menu.style.bottom = `${window.innerHeight - r.top + 6}px`;
+    else menu.style.top = `${Math.min(r.bottom + 6, Math.max(8, window.innerHeight - h - 8))}px`;
+    menu.style.left = `${Math.max(8, Math.min(opts.align === 'right' ? r.right - w : r.left, window.innerWidth - w - 8))}px`;
+  }
   if (search) search.focus();
   menu.addEventListener('click', (e) => e.stopPropagation());
   setTimeout(() => document.addEventListener('click', closeMenu, { once: true }), 0);
@@ -900,6 +910,7 @@ function toggleModelMenu(open) {
   if (!menu) return;
   const show = open == null ? menu.classList.contains('hidden') : open;
   if (!show) { menu.classList.add('hidden'); return; }
+  closeMenu();   // one dropdown at a time - the thinking menu used to stay open behind it
   const btn = $('model-btn');
   const r = btn.getBoundingClientRect();
   const width = Math.max(280, Math.min(420, window.innerWidth - 24));
@@ -1133,6 +1144,22 @@ async function refreshForkable() {
     const d = await rpc({ type: 'get_fork_messages' });
     S.forkable = asArray(d, 'messages');
   } catch { S.forkable = []; }
+  // get_entries is the fuller list (it includes everything the file has, so old
+  // messages and pre-compaction turns stay forkable); fall back to the fork
+  // messages when an older agent does not implement it.
+  try {
+    const e = await rpc({ type: 'get_entries' });
+    const entries = asArray(e, 'entries');
+    const users = entries
+      .filter((x) => x && x.type === 'message' && x.message && x.message.role === 'user')
+      .map((x) => ({
+        entryId: x.id,
+        text: (x.message.content || []).filter((c) => c.type === 'text').map((c) => c.text).join(' '),
+      }));
+    S.forkEntries = users.length ? users : S.forkable.map((f) => ({ entryId: f.entryId, text: f.text }));
+  } catch {
+    S.forkEntries = (S.forkable || []).map((f) => ({ entryId: f.entryId, text: f.text }));
+  }
 }
 
 async function refreshStats() {
@@ -1435,10 +1462,35 @@ function addSpeakButton(tools, getText) {
   addToolButton(tools, 'speak', 'Speak this message (TTS)', () => speak(getText()));
 }
 
+/* Stamp fork ids onto the rendered user rows. Freshly sent rows cannot be
+ * matched when they are drawn (their entry does not exist yet), so this runs
+ * again whenever a turn settles: it walks the rows in order against the current
+ * entry list and rewrites the ids, which makes every turn - including the very
+ * first one - forkable from its right-click menu. */
+async function stampForkIds() {
+  if (S.viewSession) return;   // a read-only view already carries entry ids
+  await refreshForkable().catch(() => {});
+  resetForkQueue();
+  document.querySelectorAll('#chat .msg.user').forEach((row) => {
+    const text = row._msg ? messageBlock(row._msg.content).text : '';
+    const fk = takeForkable(text);
+    if (fk) {
+      row.dataset.fork = fk.entryId;
+      row.dataset.forktext = String(fk.text || '').slice(0, 300);
+    } else {
+      delete row.dataset.fork;
+      delete row.dataset.forktext;
+    }
+  });
+}
+
 /* pi's user messages and the forkable list are both in order, so pair them up as
- * the transcript renders; identical texts then keep working. */
+ * the transcript renders; identical texts then keep working. The list comes from
+ * get_entries, not get_fork_messages: get_entries keeps pre-compaction history
+ * and abandoned branches, so an old message - or one before the last compaction
+ * - is still forkable instead of only the tail of the session. */
 let forkQueue = [];
-function resetForkQueue() { forkQueue = (S.forkable || []).map((f) => ({ ...f, used: false })); }
+function resetForkQueue() { forkQueue = (S.forkEntries || []).map((f) => ({ ...f, used: false })); }
 function takeForkable(text) {
   const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
   const t = norm(text);
@@ -1452,9 +1504,11 @@ function renderUserMessage(msg) {
   const { text, images } = messageBlock(msg.content);
   const { root, tools, bubble } = makeMsgShell('user', `you · ${timeStr(msg.timestamp)}`);
   root._msg = msg;
-  // Fork entry for this turn, from get_fork_messages - used by the right-click
-  // menu ("fork from here") and by edit & resend.
-  const fk = takeForkable(text);
+  // Fork entry for this turn. A session read from disk carries its entry id;
+  // for the agent's own session it is matched from the entry list. A row that
+  // was just sent by this window is skipped: it is not in the file yet, so it
+  // has no entry to point at, and consuming one would shift every later match.
+  const fk = msg.entryId ? { entryId: msg.entryId } : (msg.__live ? null : takeForkable(text));
   if (fk) { root.dataset.fork = fk.entryId; root.dataset.forktext = text.slice(0, 300); }
   addCopyButton(tools, () => text);
   // fork index is (re)written onto the element by refreshMessages; read it at click time
@@ -1927,7 +1981,14 @@ async function refreshMessages() {
     S.toolCards.clear();
     for (const [id, card] of liveCards) S.toolCards.set(id, card);
     for (const [id, card] of keepCards) S.toolCards.set(id, card);
-    removeCompactionLive();
+    // Keep the live "compacting…" marker through a re-render: a compaction that
+    // starts after the turn settled had its marker wiped here, so the status
+    // only showed up once it was already over.
+    if (S.compacting) {
+      if (S.compactionLive) chat.appendChild(S.compactionLive.root);
+    } else {
+      removeCompactionLive();
+    }
   }
   // session token totals summed from per-message usage
   let read = 0, write = 0, prevTs = null;
@@ -2042,6 +2103,8 @@ function handleEvent(msg) {
       if (msg.type === 'agent_settled') {
         S.isStreaming = false;
         autoCloseShortsIfOurs();
+        // The turn is in the session file now: (re)attach fork ids to the rows.
+        stampForkIds().catch(() => {});
         // After a compaction the session history no longer matches the chat
         // DOM (older messages were summarized away and the "compacted" marker
         // is missing) — re-render from the session so the marker shows up.
@@ -2734,7 +2797,7 @@ function sendPrompt(text, images, behavior) {
     const content = [];
     for (const a of imgs) content.push({ type: 'image', data: a.data, mimeType: a.mimeType });
     if (msg) content.push({ type: 'text', text: msg });
-    renderUserMessage({ role: 'user', content: content.length ? content : msg, timestamp: Date.now() });
+    renderUserMessage({ role: 'user', content: content.length ? content : msg, timestamp: Date.now(), __live: true });
     S.stickToBottom = true;
     scrollBottom(true);
   }
@@ -4073,8 +4136,12 @@ function applyCrop(node, crop, frameAspect) {
   if (!c) { node.style.objectPosition = ''; node.style.transform = ''; return; }
   const { cw, ch } = cropRatios(node, frameAspect);
   const z = Math.max(1, Number(c.z) || 1);
-  const tx = (Number(c.fx) || 0) * 50 * (z * cw - 1);
-  const ty = (Number(c.fy) || 0) * 50 * (z * ch - 1);
+  // Negative: the visible window moves the *other* way from the crop rect's
+  // position inside the picture. With the sign the wrong way round, the saved
+  // image came out mirrored compared to the preview - which is why the cropped
+  // part was never where it had been chosen.
+  const tx = -(Number(c.fx) || 0) * 50 * (z * cw - 1);
+  const ty = -(Number(c.fy) || 0) * 50 * (z * ch - 1);
   node.style.objectPosition = '50% 50%';
   node.style.transform = `translate(${tx}%, ${ty}%) scale(${z})`;
 }
@@ -4134,7 +4201,10 @@ function paintCrop() {
   const cy = $('crop-y'); if (cy) cy.value = String(fy);
 }
 
-/* Move the picture by a drag, in pixels, on the (possibly zoomed) stage. */
+/* Move the crop frame by a drag, in pixels, on the (possibly zoomed) stage.
+ * The frame follows the pointer - dragging up moves it up. It used to go the
+ * other way, and since the picture itself stays put, that read as the picture
+ * sliding backwards. */
 function cropDrag(dx, dy) {
   if (!cropState) return;
   const g = cropGeometry();
@@ -4142,8 +4212,8 @@ function cropDrag(dx, dy) {
   const halfX = g.rangeX * g.s;
   const halfY = g.rangeY * g.s;
   const clamp = (v) => Math.max(-1, Math.min(1, v));
-  if (halfX > 0.5) cropState.fx = clamp(cropState.fx - dx / halfX);
-  if (halfY > 0.5) cropState.fy = clamp(cropState.fy - dy / halfY);
+  if (halfX > 0.5) cropState.fx = clamp(cropState.fx + dx / halfX);
+  if (halfY > 0.5) cropState.fy = clamp(cropState.fy + dy / halfY);
   paintCrop();
 }
 
@@ -4858,6 +4928,10 @@ function showReels(provider) {
   const panel = $('reels-panel');
   panel.classList.remove('hidden');
   setReelsFeed(provider || 'instagram');
+  // Remember it: a reload (or a native shell that rebuilds its surface) brings
+  // the panel back instead of silently closing it.
+  SET.reelsOpen = true;
+  saveSettings();
   // Windows app: back the panel with a real Chromium surface instead of the
   // placeholder. No-op in a plain browser.
   openNativeFeed(reelsFeed);
@@ -4866,6 +4940,8 @@ function showReels(provider) {
 function hideReels() {
   autoShortsOpened = false;   // the user (or the auto-hook) took it down
   $('reels-panel').classList.add('hidden');
+  SET.reelsOpen = false;
+  saveSettings();
   closeNativeFeed();
 }
 
@@ -5028,6 +5104,60 @@ setInterval(() => {
   if (reelsWin && reelsWin.closed) { reelsWin = null; hideReelsPill(); }
 }, 1000);
 
+/* ── in-app dialogs ───────────────────────────────────────────────────────
+ * confirm() and prompt() look like a browser warning bolted onto the page. This
+ * is the same shape as the settings dialog, so confirmations read as part of the
+ * app. Returns a promise: the resolved value is the field values object, or null
+ * when cancelled. */
+function askDialog(opts = {}) {
+  return new Promise((resolve) => {
+    const dlg = $('ask-dialog');
+    if (!dlg) { resolve(null); return; }
+    $('ask-title').textContent = opts.title || 'Are you sure?';
+    const body = $('ask-body');
+    body.innerHTML = '';
+    if (opts.body) body.appendChild(el('p', 'ask-text', opts.body));
+    const fields = opts.fields || [];
+    const inputs = {};
+    for (const f of fields) {
+      const row = el('label', 'ask-row');
+      row.appendChild(el('span', 'ask-label', f.label));
+      const input = el('input');
+      input.type = 'text';
+      input.value = f.value || '';
+      input.placeholder = f.placeholder || '';
+      input.autocomplete = 'off';
+      row.appendChild(input);
+      body.appendChild(row);
+      inputs[f.name] = input;
+    }
+    if (opts.hint) body.appendChild(el('p', 'ask-hint', opts.hint));
+    $('ask-ok').textContent = opts.okLabel || 'ok';
+    $('ask-ok').classList.toggle('danger', opts.danger === true);
+    $('ask-cancel').textContent = opts.cancelLabel || 'cancel';
+    const done = (value) => {
+      dlg.removeEventListener('close', onClose);
+      if (dlg.open) dlg.close();
+      resolve(value);
+    };
+    const onClose = () => resolve(null);
+    dlg.addEventListener('close', onClose);
+    $('ask-ok').onclick = () => {
+      const out = {};
+      for (const f of fields) out[f.name] = inputs[f.name].value.trim();
+      if (opts.require) {
+        const missing = opts.require.find((n) => !out[n]);
+        if (missing) { inputs[missing].focus(); return; }
+      }
+      done(out);
+    };
+    $('ask-cancel').onclick = () => done(null);
+    const first = fields.length ? inputs[fields[0].name] : $('ask-ok');
+    if (!dlg.open) dlg.showModal();
+    setTimeout(() => first.focus(), 30);
+  });
+}
+
 /* ── context menus ────────────────────────────────────────────────────────
  * Right click a session in the sidebar, or a message in the transcript. Both use
  * the same dropdown component as the model picker. */
@@ -5036,9 +5166,11 @@ function openSessionMenu(s, anchor) {
   const cur = S.state.sessionFile;
   const isCurrent = !!(cur && (s.path === cur || s.fileName === String(cur).split(/[\\/]/).pop()));
   openMenu(anchor, [
-    { label: 'open', hint: s.name, active: isCurrent, onPick: () => switchToSession(s.path) },
+    { label: 'open', active: isCurrent, onPick: () => switchToSession(s.path) },
     { label: 'export…', hint: 'save the .jsonl wherever you want', onPick: () => exportSession(s) },
-    { label: 'branches…', hint: 'fork points in this session', sub: true, onPick: () => openBranchesMenu(s, anchor) },
+    // The tree comes from the agent, so it is only meaningful for the session
+    // the agent has loaded - a read-only view would list the wrong branches.
+    ...(isCurrent ? [{ label: 'branches…', hint: 'fork points in this session', sub: true, onPick: () => openBranchesMenu(s, anchor) }] : []),
     { sep: true },
     { label: 'delete…', hint: 'removes the file from disk', danger: true, onPick: () => deleteSession(s) },
   ], { title: 'session', width: 330, align: 'right' });
@@ -5077,8 +5209,13 @@ async function exportSession(s) {
 }
 
 async function deleteSession(s) {
-  const ok = confirm(`Delete this session for good?\n\n${s.name}\n${s.path}\n\n` +
-    'The file is removed from disk - this cannot be undone.');
+  const ok = await askDialog({
+    title: 'Delete this session?',
+    body: `${s.name}\n${s.path}`,
+    hint: 'The file is removed from disk. This cannot be undone.',
+    okLabel: 'delete',
+    danger: true,
+  });
   if (!ok) return;
   try {
     const r = await fetch('/api/session-delete', {
@@ -5089,15 +5226,35 @@ async function deleteSession(s) {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'delete failed');
     if (S.state.sessionFile && s.path === S.state.sessionFile) {
-      toast('That was the open session - starting a new one', 'warning');
-      await rpc({ type: 'new_session' }).catch(() => {});
-      await initSession(false);
+      // Deleting a fork used to leave you on a brand new empty session. Go back
+      // to where it was forked from when the file says, otherwise to the most
+      // recent other session - either way, not a blank one.
+      const parent = await sessionParent(s.path);
+      const rest = (await fetch('/api/sessions').then((x) => x.json()).catch(() => ({ sessions: [] })).then((d2) => (d2.sessions || [])))
+        .filter((x) => x.path !== s.path)
+        .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+      const target = parent && rest.some((x) => x.path === parent) ? parent : (rest[0] && rest[0].path);
+      if (target) {
+        await switchToSession(target);
+      } else {
+        toast('That was the only session - starting a new one', 'warning');
+        await rpc({ type: 'new_session' }).catch(() => {});
+        await initSession(false);
+      }
     }
     await refreshSessions();
     toast(`Deleted ${s.name}`);
   } catch (e) {
     toast(`Delete failed: ${e.message}`, 'error');
   }
+}
+
+/* The session a fork came from, if the file records it. */
+async function sessionParent(sessionPath) {
+  try {
+    const d = await fetchSession(sessionPath);
+    return d.parent || null;
+  } catch { return null; }
 }
 
 /* Branch points of the open session (pi keeps branches in one file as a tree).
@@ -5143,7 +5300,13 @@ async function openBranchesMenu(s, anchor) {
 }
 
 async function forkAt(entryId, text) {
-  if (!confirm(`Start a new branch from this point?\n\n${text}\n\nThe conversation continues from there.`)) return;
+  const ok = await askDialog({
+    title: 'Start a new branch?',
+    body: text,
+    hint: 'The conversation continues from this point. The old continuation stays in the session file.',
+    okLabel: 'fork',
+  });
+  if (!ok) return;
   try {
     await rpc({ type: 'fork', entryId });
     await initSession(false);
@@ -5153,13 +5316,29 @@ async function forkAt(entryId, text) {
   }
 }
 
-/* Right-click a message: fork from the user turn that started it. */
-function openTurnMenu(node) {
+/* Right-click a message. On a user turn there is a fork entry for it; on an
+ * assistant turn the fork point is the user message that started it, so walk
+ * back to the nearest one. Reading a session the agent has not loaded cannot be
+ * forked in place - the agent has to switch to it first, which the menu says. */
+function openTurnMenu(node, at) {
   const m = node._msg || null;
-  const entryId = node.dataset.fork || null;
+  let forkNode = node;
+  if (!forkNode.dataset.fork) {
+    let prev = forkNode.previousElementSibling;
+    while (prev && !prev.dataset.fork) prev = prev.previousElementSibling;
+    forkNode = prev || null;
+  }
+  const entryId = forkNode && forkNode.dataset.fork ? forkNode.dataset.fork : null;
   const items = [];
-  if (entryId) items.push({ label: 'fork from here', hint: 'new branch at this message', onPick: () => forkAt(entryId, node.dataset.forktext || '') });
-  if (m && m.role === 'assistant') items.push({ label: 'clone session here', hint: 'copy the session up to now', onPick: () => cloneHere() });
+  if (entryId) {
+    const elsewhere = !!S.viewSession;
+    items.push({
+      label: elsewhere ? 'open this session and fork here' : 'fork from here',
+      hint: elsewhere ? 'the agent has to load it first' : 'new branch at this message',
+      onPick: () => (elsewhere ? forkInOtherSession(entryId, forkNode.dataset.forktext || '') : forkAt(entryId, forkNode.dataset.forktext || '')),
+    });
+  }
+  if (m && m.role === 'assistant' && !S.viewSession) items.push({ label: 'clone session here', hint: 'copy the session up to now', onPick: () => cloneHere() });
   const md = node.querySelector('.md');
   const text = md ? md.innerText : '';
   if (text) {
@@ -5168,7 +5347,32 @@ function openTurnMenu(node) {
     items.push({ label: 'speak', onPick: () => speak(stripMarkdown(text)) });
   }
   if (!items.length) return;
-  openMenu(node.querySelector('.who') || node, items, { title: 'message', width: 300 });
+  openMenu(node.querySelector('.who') || node, items, { title: 'message', width: 320, at });
+}
+
+/* Forking in a session the agent has not loaded: switch to it, then fork. */
+async function forkInOtherSession(entryId, text) {
+  const target = S.viewSession;
+  if (!target) return;
+  const ok = await askDialog({
+    title: 'Open that session and fork?',
+    body: text,
+    hint: 'The agent switches to it first - it can only fork in the session it has loaded.',
+    okLabel: 'fork',
+  });
+  if (!ok) return;
+  try {
+    await rpc({ type: 'switch_session', sessionPath: target });
+    S.state.sessionFile = target;
+    S.viewSession = null;
+    S.liveDetached = null;
+    await initSession(false);
+    await rpc({ type: 'fork', entryId });
+    await initSession(false);
+    toast('Forked - continue from here');
+  } catch (e) {
+    toast(`Fork failed: ${e.message}`, 'error');
+  }
 }
 
 async function cloneHere() {
@@ -5262,20 +5466,28 @@ function switchInstance(inst) {
 }
 
 function addInstance() {
-  const name = prompt('Name for the other pi agent (for example "laptop" or "work pc")');
-  if (!name) return;
-  let url = prompt('Address of its WebUI, as http://host:port', 'http://');
-  if (!url) return;
-  url = url.trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//.test(url)) url = `http://${url}`;
-  let base;
-  try { base = new URL(url).origin; } catch { toast('That is not a valid address', 'error'); return; }
-  if (allInstances().some((i) => i.url === base)) { toast('That instance is already in the list', 'warning'); return; }
-  SET.instances = [...(SET.instances || []), { id: `i${Date.now().toString(36)}`, name: name.trim(), url: base }];
-  saveSettings();
-  updateInstanceBtn();
-  toast(`${name.trim()} added - click it to switch`);
-  pollInstances().catch(() => {});
+  askDialog({
+    title: 'Add another pi agent',
+    body: 'Its WebUI address. Add an SSH tunnel or start that bridge with PI_WEBUI_HOST=0.0.0.0 to reach another machine.',
+    fields: [
+      { name: 'name', label: 'name', placeholder: 'laptop' },
+      { name: 'url', label: 'address', placeholder: 'http://192.168.1.20:3080', value: 'http://' },
+    ],
+    require: ['name', 'url'],
+    okLabel: 'add',
+  }).then((res) => {
+    if (!res) return;
+    let url = String(res.url).trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//.test(url)) url = `http://${url}`;
+    let base;
+    try { base = new URL(url).origin; } catch { toast('That is not a valid address', 'error'); return; }
+    if (allInstances().some((i) => i.url === base)) { toast('That instance is already in the list', 'warning'); return; }
+    SET.instances = [...(SET.instances || []), { id: `i${Date.now().toString(36)}`, name: res.name, url: base }];
+    saveSettings();
+    updateInstanceBtn();
+    toast(`${res.name} added - click it to switch`);
+    pollInstances().catch(() => {});
+  });
 }
 
 /* ───────────────────────── boot ───────────────────────── */
@@ -5294,7 +5506,7 @@ chat.addEventListener('contextmenu', (e) => {
   const node = e.target.closest('.msg');
   if (!node || node.classList.contains('compaction')) return;
   e.preventDefault();
-  openTurnMenu(node);
+  openTurnMenu(node, { x: e.clientX, y: e.clientY });
 });
 
 /* instances: the button opens the switcher, and the dots refresh in the
@@ -5304,4 +5516,9 @@ if ($('btn-instance')) {
   updateInstanceBtn();
   setTimeout(() => { pollInstances().catch(() => {}); }, 1500);
   setInterval(() => { pollInstances().catch(() => {}); }, 8000);
+}
+
+// Reopen the shorts panel if it was open when the page last unloaded.
+if (SET.reelsOpen && SHORTS_FEEDS[SET.shortsProvider || 'instagram']) {
+  setTimeout(() => { if (reelsHidden()) showReels(SET.shortsProvider); }, 600);
 }
