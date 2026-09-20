@@ -2069,17 +2069,27 @@ async function refreshMessages() {
     }
   }
   // session token totals summed from per-message usage
-  let read = 0, write = 0, prevTs = null;
+  let read = 0;
+  let write = 0, prevTs = null;
+  // A session with thousands of messages (and images in them) freezes the tab
+  // while every row is built. Counters still cover all of it, but only the
+  // newest slice is rendered; the rest loads on demand from the button below.
+  if (S.windowFor !== S.state.sessionFile) { S.windowFor = S.state.sessionFile; S.historyWindow = 400; }
+  const win = Math.max(80, S.historyWindow || 400);
+  const windowed = msgs.length > win;
+  const skipped = new Set(windowed ? msgs.slice(0, msgs.length - win) : []);
   for (const m of msgs) {
+    // Totals count every message, rendered or not.
+    if (m.usage) {
+      read += (m.usage.input || 0) + (m.usage.cacheRead || 0) + (m.usage.cacheWrite || 0);
+      write += m.usage.output || 0;
+    }
+    if (skipped.has(m)) continue;
     const firstNew = chat.children.length;
     if (m.role === 'user') renderUserMessage(m);
     else if (m.role === 'assistant') {
       noteHistoryTiming(m, prevTs);
       renderAssistantMessage(m);
-      if (m.usage) {
-        read += (m.usage.input || 0) + (m.usage.cacheRead || 0) + (m.usage.cacheWrite || 0);
-        write += m.usage.output || 0;
-      }
     }
     else if (m.role === 'toolResult') renderToolResult(m);
     else if (m.role === 'bashExecution') renderBashExecution(m);
@@ -2099,7 +2109,12 @@ async function refreshMessages() {
   // A compaction marker sits at the end of the transcript, so typing or a new
   // answer never pushes it out of sight.
   if (!S.viewSession) {
-    for (const k of marks) {
+    // Only a compaction that is not part of the session file yet belongs at the
+    // end. Appending every mark piled the session's whole compaction history up
+    // there; the older ones render in place, where they happened.
+    const inFile = new Set(msgs.filter((m) => m.role === 'compactionSummary' && m.summary).map((m) => m.summary));
+    const fresh = marks.filter((k) => k.summary && !inFile.has(k.summary));
+    for (const k of (fresh.length ? fresh : (marks.length ? [marks[marks.length - 1]] : []))) {
       const node = buildCompactionSummary(k, {
         live: true,
         count: marks.length,
@@ -2112,8 +2127,35 @@ async function refreshMessages() {
     // re-render above wiped the DOM node it lived in.
     if (S.compacting && !S.compactionLive) S.compactionLive = renderCompactionLive();
   }
-  S.totals = { read, write };
+  // Totals are high-water marks: a compaction removes the older messages from
+  // the session file, and recomputing the sum from what is left made the read /
+  // write counters drop right after a compaction. They only reset when you
+  // switch to another session.
+  const base = S.sessionTotals && S.sessionTotals.path === S.state.sessionFile ? S.sessionTotals : null;
+  const totals = {
+    path: S.state.sessionFile,
+    read: Math.max(read, (base && base.read) || 0),
+    write: Math.max(write, (base && base.write) || 0),
+  };
+  S.sessionTotals = totals;
+  S.totals = { read: totals.read, write: totals.write };
   updateTotals();
+  // Older messages are only rendered on request.
+  if (windowed) {
+    const hidden = msgs.length - win;
+    const more = el('div', 'load-older');
+    const btn = el('button', 'btn small', `load ${hidden} older message${hidden > 1 ? 's' : ''}`);
+    btn.onclick = () => {
+      S.historyWindow = (S.historyWindow || win) + 400;
+      const keep = chat.scrollHeight - chat.scrollTop;
+      refreshMessages().then(() => {
+        const c = $('chat');
+        c.scrollTop = c.scrollHeight - keep;
+      }).catch(() => {});
+    };
+    more.appendChild(btn);
+    chat.insertBefore(more, chat.firstChild);
+  }
   // The last turn's total belongs on the last message: bring it back after a
   // re-render (a settle, a reload, a session re-read).
   if (S.lastTurn && S.lastTurn.ms) {
@@ -3711,7 +3753,7 @@ function renderSessions(sessions) {
   }
   // Order the list so a session is followed by the forks it spawned, instead of
   // everything being sorted by time: a branch belongs under the session it came
-  // from. Forks whose parent is gone stay in the list, just without a parent.
+  // from.
   const byPath = new Map(sessions.map((s) => [s.path, s]));
   const ordered = [];
   const placed = new Set();
@@ -4489,7 +4531,11 @@ function openCropper(kind) {
   const setStage = () => {
     const nw = node.naturalWidth || node.videoWidth || 0;
     const nh = node.naturalHeight || node.videoHeight || 0;
-    if (nw && nh) stage.style.aspectRatio = `${nw} / ${nh}`;
+    // The avatar stage stays square: giving it the picture's own ratio turned
+    // the round crop window into a wide ellipse that could push the save/cancel
+    // buttons off screen, with no way out of the dialog.
+    if (nw && nh && !isAvatar) stage.style.aspectRatio = `${nw} / ${nh}`;
+    if (isAvatar) stage.style.aspectRatio = '1 / 1';
     paintCrop();
   };
   setStage();
@@ -4503,6 +4549,9 @@ function closeCropper() {
   cropState = null;
   const dlg = $('crop-dialog');
   if (dlg && dlg.open) dlg.close();
+  // A leftover Escape-opened state used to leave the dialog modal-blocking the
+  // page with nothing clickable behind it.
+  document.body.classList.remove('modal-open');
 }
 
 function saveCrop() {

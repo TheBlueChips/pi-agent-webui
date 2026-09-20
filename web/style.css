@@ -605,12 +605,22 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .composer-row {
   max-width: 860px; margin: 0 auto;
   display: flex; gap: 8px; align-items: flex-end;
-  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--radius); padding: 8px;
+}
+/* The dark layer only covers the strip the buttons live on: it used to be a
+ * slab as tall as the message you were typing (and stretched the moment an
+ * attachment was added), while the accent ring is what marks the text itself. */
+.composer-row::before {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+  height: 44px; border-radius: 0 0 var(--radius) var(--radius);
+  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
   backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
   -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
+  z-index: 0;
 }
+.composer-row > * { position: relative; z-index: 1; }
 /* Only ONE blue outline: the ring around what you typed. The row keeps a
  * neutral border on focus, so a second accent layer does not wrap the empty
  * space around the input. */
@@ -977,3 +987,9 @@ body.hide-tools .msg.tool { display: none; }
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 .session-item .fork-toggle:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+
+/* the cropper must always keep its own buttons on screen */
+#crop-dialog { max-height: 92vh; overflow: auto; }
+.crop-stage { max-height: 52vh; }
+.crop-stage.circle { width: min(320px, 46vh); aspect-ratio: 1 / 1; }
+.load-older { max-width: 860px; margin: 4px auto 10px; text-align: center; }
