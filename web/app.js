@@ -93,9 +93,10 @@ function formatTok(n) {
 /* ── speech to text ───────────────────────────────────────────────────────
  * The browser's own recognition is the default: nothing to download and it is
  * good enough for dictating a prompt. The local whisper.cpp server is opt-in -
- * it pulls ~200 MB of binaries plus the chosen model, so it only starts when
- * the backend is set to whisper (or the button is pressed) and never on a plain
- * bridge launch. */
+ * it pulls ~200 MB of binaries plus the chosen model, so it never starts on a
+ * plain bridge launch. With the Whisper backend selected, clicking the mic
+ * starts it automatically with the model picked in settings (first use
+ * downloads it); if it cannot start, browser voice takes over. */
 let sttModelsLoaded = false;
 
 async function loadSttModels() {
@@ -151,13 +152,22 @@ async function refreshSttStatus() {
   } catch { /* ignore */ }
 }
 
-/* Make sure a local whisper server is up, starting/downloading it if needed. */
+/* Make sure the local whisper server is serving the selected model: reuse a
+ * running one, switch it to the selected model, or start it - downloading the
+ * binaries and model on first use. Returns the endpoint to use, or null when
+ * the local server could not be started (browser voice stays available). */
 async function ensureWhisper(quiet) {
-  try {
-    const st = await fetch('/api/whisper-status').then((r) => r.json());
-    if (st.state === 'ready') return st.url || SET.sttEndpoint || null;
-  } catch { /* fall through to the start call */ }
-  if (!quiet) toast('Starting the local whisper server - first run downloads it, this takes a while…');
+  let st = null;
+  try { st = await fetch('/api/whisper-status').then((r) => r.json()); } catch { /* bridge offline: fall through */ }
+  if (st && st.state === 'ready' && (!SET.sttModel || !st.model || st.model === SET.sttModel)) {
+    if (st.url && SET.sttEndpoint !== st.url) { SET.sttEndpoint = st.url; saveSettings(); }
+    return st.url || SET.sttEndpoint || null;
+  }
+  if (!quiet) {
+    if (st && st.state === 'ready') toast('Switching the whisper server to the selected model…');
+    else if (st && (st.state === 'downloading' || st.state === 'starting')) toast(`Whisper is already ${st.state === 'downloading' ? 'downloading' : 'starting'}…`);
+    else toast('Starting the local whisper server - first run downloads it, this takes a while…');
+  }
   const d = await fetch('/api/whisper-start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -710,19 +720,40 @@ async function initSession(resumeLast) {
 }
 
 /* A fresh pi process always starts a new empty session; on page load, reopen
- * the most recent session instead so work continues where it left off. */
+ * the session the user was in instead so work continues where it left off.
+ * The bridge normally resumes it already (it remembers the last session and
+ * switches the restarted agent back), which makes `known` true below and this
+ * a no-op. This is the fallback for when the bridge has no record yet - and
+ * it prefers the session THIS browser was last in over "newest file", which
+ * can be a different session on a shared agent. */
 async function resumeLastSession() {
+  let d;
   try {
     const res = await fetch('/api/sessions');
-    const d = await res.json();
-    const cur = S.state.sessionFile;
-    const known = cur && d.sessions.some((s) => s.path === cur);
-    if (!known && d.sessions.length && d.sessions[0].path !== cur) {
-      await rpc({ type: 'switch_session', sessionPath: d.sessions[0].path });
-      await rpc({ type: 'get_state' }).then((st) => applyState(st));
-      toast(`Resumed last session: ${(d.sessions[0].name || 'unnamed').slice(0, 60)}`);
-    }
-  } catch { /* no sessions yet */ }
+    d = await res.json();
+  } catch { return; /* bridge unreachable */ }
+  const sessions = d.sessions || [];
+  const cur = S.state.sessionFile;
+  const known = cur && sessions.some((s) => s.path === cur);
+  if (known || !sessions.length) return;
+  let target = null;
+  try {
+    const last = localStorage.getItem('piwebui-last-session');
+    if (last) target = sessions.find((s) => s.path === last) || null;
+  } catch { /* private mode */ }
+  if (!target) target = sessions[0];
+  if (target.path === cur) return;
+  try {
+    await rpc({ type: 'switch_session', sessionPath: target.path });
+    await rpc({ type: 'get_state' }).then((st) => applyState(st));
+    toast(`Resumed last session: ${(target.name || 'unnamed').slice(0, 60)}`);
+  } catch (e) {
+    // The switch failed (e.g. the session's working directory is gone). The
+    // session is still in the sidebar - clicking it offers to recreate the
+    // folder - so this is a warning, not a silent drop.
+    console.warn(`could not resume last session ${target.path}: ${e.message}`);
+    toast(`Could not resume last session: ${e.message}`, 'error');
+  }
 }
 
 /* ───────────────────────── state / config refresh ───────────────────────── */
@@ -730,6 +761,11 @@ async function resumeLastSession() {
 function applyState(d) {
   S.state = d || {};
   if (d) {
+    // Remember which session this browser is in, so a reload can get back to
+    // it even if the bridge has no record (see resumeLastSession).
+    if (d.sessionFile) {
+      try { localStorage.setItem('piwebui-last-session', d.sessionFile); } catch { /* cache only */ }
+    }
     if (d.sessionName) $('session-name').value = d.sessionName;
     else if (!$('session-name').value) $('session-name').value = '';
     // otherwise the derived session name (first user message) fills in via refreshSessions
@@ -3255,13 +3291,14 @@ async function transcribeAudioFile(file) {
     if (d.ok && d.text) return d.text;
   } catch { /* no local STT server */ }
   if (SET.sttEndpoint) {
+    const endpoint = sttEndpointUrl();
     const fd = new FormData();
     fd.append('file', wavBlob, wavBlob.name || 'speech.wav');
-    if (/\/v1\/audio\/transcriptions\/?$/.test(SET.sttEndpoint)) {
+    if (/\/v1\/audio\/transcriptions\/?$/.test(endpoint)) {
       fd.append('model', 'whisper-1');
       fd.append('response_format', 'json');
     }
-    const res = await fetch(SET.sttEndpoint, { method: 'POST', body: fd });
+    const res = await fetch(endpoint, { method: 'POST', body: fd });
     if (!res.ok) throw new Error(`STT server ${res.status}`);
     const d = await res.json();
     return d.text || d.transcription || '';
@@ -3557,7 +3594,8 @@ async function blobToWav(blob) {
 
 async function transcribeWithWhisper(blob) {
   const wav = await blobToWav(blob);
-  const isOpenAI = /\/v1\/audio\/transcriptions\/?$/.test(SET.sttEndpoint);
+  const endpoint = sttEndpointUrl();
+  const isOpenAI = /\/v1\/audio\/transcriptions\/?$/.test(endpoint);
   const fd = new FormData();
   if (isOpenAI) {
     fd.append('file', wav, 'speech.wav');
@@ -3571,7 +3609,7 @@ async function transcribeWithWhisper(blob) {
     fd.append('file', wav, 'speech.wav');
     fd.append('response_format', 'json');
   }
-  const res = await fetch(SET.sttEndpoint, { method: 'POST', body: fd });
+  const res = await fetch(endpoint, { method: 'POST', body: fd });
   if (!res.ok) {
     let detail = '';
     try { detail = (await res.text()).slice(0, 120); } catch { /* ignore */ }
@@ -3615,32 +3653,59 @@ async function startWhisperRecording() {
   toast('Recording… click again to transcribe with Whisper');
 }
 
-async function ensureSttEndpoint() {
-  if (SET.sttEndpoint) return;
+/* True for endpoints that point at this machine's own whisper server
+ * (localhost): those die with the bridge, so a mic click re-checks them and
+ * restarts the selected model if needed. A custom endpoint on another machine
+ * is trusted as-is. */
+function isLocalSttEndpoint(u) {
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(u || '');
+}
+
+/* The URL to actually send audio to. The local whisper server is stored as
+ * http://localhost:PORT/… - but when the WebUI is browsed from another machine
+ * on the LAN, that "localhost" must mean the machine the bridge runs on (this
+ * page's host), not the client's own. Custom endpoints are used as-is. */
+function sttEndpointUrl() {
+  const u = SET.sttEndpoint;
+  if (!u || !isLocalSttEndpoint(u)) return u;
   try {
-    const cfg = await fetch('/api/config').then((r) => r.json());
-    if (cfg.whisperUrl) {
-      SET.sttEndpoint = cfg.whisperUrl;
-      saveSettings();
-      toast('Using local whisper server for voice input');
-    }
-  } catch { /* no endpoint */ }
+    const parsed = new URL(u);
+    parsed.hostname = location.hostname || 'localhost';
+    return parsed.toString();
+  } catch { return u; }
 }
 
 $('btn-mic').onclick = async () => {
   if (whisperBusy) return;
   const useWhisper = (SET.sttBackend || 'whisper') !== 'browser';
-  if (useWhisper && !SET.sttEndpoint) await ensureSttEndpoint();
-  if (useWhisper && SET.sttEndpoint) {
+  if (useWhisper) {
+    // Second click while recording: stop and transcribe - no server checks.
     if (mediaRecorder && mediaRecorder.state === 'recording') {
       mediaRecorder.stop();
       return;
     }
-    startWhisperRecording().catch((e) => {
+    // Automatic start: make sure the model picked in settings is actually
+    // being served - reuse a running local server, switch it to the selected
+    // model, or start it (first use downloads whisper.cpp + the model).
+    // A custom endpoint on another machine is used as-is.
+    if (!SET.sttEndpoint || isLocalSttEndpoint(SET.sttEndpoint)) {
+      whisperBusy = true; // no double-clicks while a download is running
+      $('btn-mic').classList.add('recording'); // lit while it comes up
+      const url = await ensureWhisper(false);
+      whisperBusy = false;
       $('btn-mic').classList.remove('recording');
-      toast(`Microphone error: ${e.message}`, 'error');
-    });
-    return;
+      if (!url && isLocalSttEndpoint(SET.sttEndpoint)) SET.sttEndpoint = ''; // dead local endpoint
+    }
+    if (SET.sttEndpoint) {
+      startWhisperRecording().catch((e) => {
+        $('btn-mic').classList.remove('recording');
+        toast(`Microphone error: ${e.message}`, 'error');
+      });
+      return;
+    }
+    // The local server could not be started (offline, server failed): fall
+    // back to browser voice instead of a dead endpoint.
+    if (recog) toast('Whisper server is not available - using browser voice instead', 'warning');
   }
   // browser SpeechRecognition fallback
   if (!recog) { toast('This browser has no built-in voice — set a Whisper endpoint in settings (⚙) for voice input', 'warning'); return; }

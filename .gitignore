@@ -12,3 +12,6 @@ webui-settings.json
 
 # logs
 *.log
+
+# last active session, remembered across bridge/agent restarts
+last-session.json

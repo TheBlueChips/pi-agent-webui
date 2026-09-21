@@ -121,6 +121,8 @@ if /i "!SOURCE!"=="native" (
 )
 
 set PORT=3080
+rem LAN access is configured in bridge\lan.json ("lan": true) - the bridge
+rem reads it on start and prints the LAN address when it is enabled.
 
 rem -- if an older bridge is still holding the port, offer to stop it --
 set "OLD_PID="
