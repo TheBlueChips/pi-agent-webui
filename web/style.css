@@ -58,8 +58,36 @@ body {
 }
 body.sidebar-hidden #sidebar { display: none; }
 .sidebar-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 12px;
+}
+/* The instance button is the agent's face and name: one tap to switch, and the
+ * only part of the sidebar that is about a different machine. */
+.instance-head {
+  display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1;
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  color: var(--text); padding: 4px 6px; cursor: pointer; text-align: left;
+}
+.instance-head:hover { background: var(--bg-hover); }
+.instance-head.remote { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-dim); }
+.instance-labels { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; overflow: hidden; }
+/* The name ellipsizes, the buttons next to it keep their size - a long agent
+ * name used to push "+ New" half off the edge. */
+.instance-labels .logo { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#btn-new-session { flex: none; }
+.instance-sub { font-size: 11px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.instance-caret { color: var(--text-dim); font-size: 10px; margin-left: auto; }
+/* avatar per row in the switcher */
+.model-item .menu-avatar {
+  width: 24px; height: 24px; border-radius: 50%; object-fit: cover; flex: none;
+  background: var(--bg-hover); margin-right: 8px;
+}
+.model-item .menu-avatar.empty { display: inline-block; }
+.remote-banner {
+  margin: 8px 12px 0; padding: 7px 10px; border-radius: 8px; font-size: 12.5px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
 }
 .logo { font-weight: 700; font-size: 15px; }
 .sidebar-search { display: flex; gap: 6px; padding: 0 12px 8px; }
@@ -777,14 +805,106 @@ body { display: flex; }
 }
 .font-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
+/* Scrollbars follow the theme colour: the grey ones read as part of the
+ * browser rather than part of the app, and on the sidebar they were hard to see
+ * against the panel at all. */
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb {
+  /* a transparent border + background-clip keeps the thumb visually thinner than
+   * the track that reserves the space */
+  background: color-mix(in srgb, var(--accent) 50%, transparent);
+  border: 2px solid transparent; background-clip: padding-box; border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--accent) 78%, transparent); background-clip: padding-box; }
+::-webkit-scrollbar-track { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 8px; }
+::-webkit-scrollbar-corner { background: transparent; }
+/* standards version (Firefox, Chrome 121+) */
+* { scrollbar-color: color-mix(in srgb, var(--accent) 55%, transparent) color-mix(in srgb, var(--accent) 10%, transparent); scrollbar-width: thin; }
 
+/* ───────────────────────── long content ─────────────────────────────────
+ * A model can emit one enormous unbroken line (a minified file, a URL, a base64
+ * blob). Without this the line widened the transcript and the whole chat could
+ * be scrolled sideways, which is never what you want: the text wraps, and only
+ * a code block itself scrolls. */
+#chat { overflow-x: hidden; }
+.msg, .msg .body, .msg .bubble, .msg .text, .who, .tool-card, .tool-card .tool-out,
+.tool-card .tool-name, .queue-item, .status-bar, #view-banner, .edit-banner,
+.stt-transcript, .agent-stats, .attachments {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+/* code keeps its shape but scrolls inside its own box */
+.msg pre, .tool-card pre, .codebox pre, .md pre, pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.msg code { overflow-wrap: anywhere; }
+.msg a { overflow-wrap: anywhere; }
+
+/* ───────────────────────── mobile / narrow windows ───────────────────────
+ * A phone (or a narrow side window) used to show a topbar whose session name was
+ * squeezed to nothing between the buttons, a stats bar whose numbers drew on top
+ * of each other, and a sidebar that covered a third of the screen. The sidebar is
+ * a drawer here, the topbar wraps onto two rows, and the stats bar wraps rather
+ * than overlapping. */
 @media (max-width: 760px) {
-  #sidebar { position: fixed; z-index: 40; height: 100vh; left: -260px; transition: left .15s; }
-  #sidebar.open { left: 0; }
+  #sidebar {
+    position: fixed; z-index: 40; height: 100vh; height: 100dvh;
+    left: -280px; width: 268px; min-width: 0;
+    transition: left .18s ease;
+  }
+  /* The dimming behind the drawer exists only while the drawer is out. As a plain
+   * rule on #sidebar it painted a 45% black veil over the whole app at every
+   * narrow width, drawer or not - a window under 760px simply looked broken, and
+   * that veil was the "invisible" thing swallowing the UI. */
+  #sidebar.open {
+    left: 0;
+    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, .45);
+  }
   body.sidebar-hidden #sidebar { display: flex; }
+
+  #topbar { flex-wrap: wrap; gap: 6px; padding: 8px 10px; row-gap: 8px; }
+  /* the name gets a row of its own instead of the leftovers between buttons */
+  #session-name { order: -1; flex: 1 1 100%; font-size: 15px; padding: 2px 4px; }
+  #btn-settings, #btn-toggle-sidebar { order: 1; }
+  #btn-tts, #conn-dot { order: 2; }
+  #btn-tts { margin-left: auto; }
+
+  #chat { padding: 10px 10px 4px; }
+  .msg { margin-bottom: 12px; }
+
+  #composer { padding: 4px 8px 8px; }
+  .composer-row { gap: 6px; padding: 6px; }
+  .composer-row .btn.icon { padding: 7px; }
+  #input { font-size: 15px; }               /* 16px avoids the iOS zoom-on-focus */
+
+  /* the stats row wraps into as many lines as it needs, and the least important
+     numbers step aside rather than colliding */
+  #stats-bar { flex-wrap: wrap; row-gap: 4px; padding: 4px 6px; }
+  .stats-spacer { display: none; }
+  #stat-turn { display: none; }
+  #ctx-label { max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #model-btn.pill { max-width: 44vw; }
+  .ctx-ring svg { width: 30px; height: 30px; }
+
+  /* dialogs go edge to edge: a 560px box on a 412px screen is mostly backdrop */
+  dialog { max-width: 100vw; }
+  dialog#settings-dialog, dialog#setup-dialog, dialog#ask-dialog, dialog#crop-dialog {
+    width: 100vw; max-width: 100vw; height: 100vh; height: 100dvh;
+    max-height: 100dvh; border-radius: 0; margin: 0;
+  }
+  dialog#settings-dialog .settings-grid { grid-template-columns: 1fr; }
+  dialog#settings-dialog .settings-grid > label { margin-top: 6px; }
+
+  /* anything tappable gets a real target */
+  .btn { min-height: 32px; }
+  .session-item { padding: 10px 10px; }
+  .model-menu { left: 8px; right: 8px; width: auto; }
+  .model-item { padding: 9px 10px; }
 }
 
 /* Reels placeholder: the feed cannot be iframed, so the panel offers a real
@@ -816,6 +936,13 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
  * The select is kept for state (set_model, sync, llama.cpp entries) but the
  * visible control is the button: a native popup cannot be filtered and ran off
  * the screen once enough models were installed. */
+/* The count of sessions started from this one: a button, because that is how you
+ * get to them now that they no longer fill the session list. */
+#btn-branches { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; padding: 3px 9px; }
+#btn-branches.hidden { display: none; }
+.fork-toggle { cursor: pointer; }
+.fork-toggle:hover { color: var(--accent); }
+
 #model-select { display: none; }
 #model-btn.pill {
   max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

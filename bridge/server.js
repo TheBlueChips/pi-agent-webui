@@ -16,13 +16,14 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn, execFile, execSync } = require('child_process');
 const { pathToFileURL } = require('url');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, WebSocket } = require('ws');
 const { startWhisper, stopWhisper, whisperStatus, WHISPER_MODELS, DEFAULT_MODEL } = require('./whisper_boot');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -43,6 +44,36 @@ function lanHostFromConfig() {
   return null;
 }
 
+// The address another device on the network should type in.
+function lanUrl(port) {
+  const ip = lanAddress();
+  return ip ? `http://${ip}:${port}` : null;
+}
+
+// Move the listening socket between localhost and the network without a restart.
+// Existing connections are dropped on purpose: they were opened on the old
+// address, and the page reconnects on its own.
+let rebinding = false;
+// Where the socket is bound right now. Comparing against HOST (the value from the
+// environment at startup) made switching back to localhost a no-op: HOST was
+// still 127.0.0.1 while the server was actually on 0.0.0.0.
+let boundHost = null;   // set right after HOST is defined
+function rebind(host) {
+  if (rebinding || host === boundHost) return;
+  rebinding = true;
+  const done = () => {
+    server.listen(PORT, host, () => { bindNow(host); });
+  };
+  try { if (server.closeAllConnections) server.closeAllConnections(); } catch { /* older node */ }
+  server.close(() => done());
+  setTimeout(() => { if (rebinding) { rebinding = false; done(); } }, 2000);
+}
+function bindNow(host) {
+  boundHost = host;
+  rebinding = false;
+  console.log(`listening on ${host}:${PORT}${host === '0.0.0.0' ? ` (network: ${lanUrl(PORT) || 'no address'})` : ' (this machine only)'}`);
+}
+
 // First non-internal IPv4 address, so the startup banner can show the other
 // devices on the LAN the address to type in (null when there is none).
 function lanAddress() {
@@ -57,8 +88,23 @@ function lanAddress() {
 }
 
 const HOST = process.env.PI_WEBUI_HOST || lanHostFromConfig() || '127.0.0.1';
+boundHost = HOST;
 const PI_COMMAND = process.env.PI_COMMAND || 'pi --mode rpc';
+// PI_WEBUI_DEBUG_RPC=1 logs every RPC in and out together with the session
+// changes around it. Off by default; it is the fastest way to see what a client
+// asked for and in which session it was answered.
+const DEBUG_RPC = process.env.PI_WEBUI_DEBUG_RPC === '1';
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd();
+/* The directory the agent process is *started* in on this machine. With
+ * PI_COMMAND="docker exec -i <ctr> pi --mode rpc" the workspace is a path inside
+ * that container ("/workspace"), and the shell this bridge spawns through cannot
+ * change into it: the spawn fails with ENOENT and no agent ever starts - which
+ * looked like a Docker problem with sessions, because the UI simply stayed
+ * empty. The host side only needs a directory that exists. */
+function hostSpawnDir() {
+  try { if (fs.statSync(WORKSPACE_DIR).isDirectory()) return WORKSPACE_DIR; } catch { /* not here */ }
+  return __dirname;
+}
 // Session dir for listing. Either a normal path, or "docker:<container>:<path>"
 // to list sessions inside a container via `docker exec` (used when the pi
 // agent runs in an existing container, e.g. PI_COMMAND="docker exec -i ctr pi --mode rpc").
@@ -249,6 +295,150 @@ function safeSessionPath(raw) {
   } catch { return null; }
   return want;
 }
+
+/* A session file lives either on this machine or inside a container
+ * (PI_SESSION_DIR=docker:<ctr>:<dir>). Reading, downloading and deleting one go
+ * through these helpers, so no endpoint has to know which of the two it is.
+ * The transcript reader used to refuse outright - "docker session dirs are not
+ * supported here" - and the UI showed that as "Could not load session" for every
+ * session in the sidebar whenever the agent ran in a container. */
+function dockerCapture(container, args, timeoutMs = 60000, maxBuffer = 256 * 1024 * 1024) {
+  return new Promise((resolve) => {
+    execFile('docker', ['exec', container, ...args], { timeout: timeoutMs, maxBuffer, shell: false },
+      (err, stdout) => resolve(err ? '' : stdout));
+  });
+}
+
+/* A path from either world, or null when it is not a .jsonl inside the session
+ * dir - the check that stops delete/export from being talked into touching
+ * anything else. In container mode the path is validated as a container path
+ * and only ever read through `docker exec`, never from the host. */
+function sessionRef(raw) {
+  const remote = parseSessionDir();
+  if (!remote) {
+    const local = safeSessionPath(raw);
+    return local ? { kind: 'local', path: local } : null;
+  }
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  // Windows paths can arrive with backslashes; inside the container it is a
+  // POSIX path either way. 92 is the backslash, spelled this way so the
+  // source does not depend on how many escapes survived the editor.
+  const posix = (v) => path.posix.normalize(String(v).replaceAll(String.fromCharCode(92), '/'));
+  const want = posix(raw.trim());
+  const root = posix(remote.dir);
+  if (!(want === root || want.startsWith(root === '/' ? '/' : root + '/'))) return null;
+  if (path.posix.extname(want).toLowerCase() !== '.jsonl') return null;
+  return { kind: 'docker', container: remote.container, path: want };
+}
+
+async function readSessionRef(ref) {
+  if (ref.kind === 'docker') return (await dockerCapture(ref.container, ['cat', ref.path])) || null;
+  try { return fs.readFileSync(ref.path, 'utf8'); } catch { return null; }
+}
+
+async function deleteSessionRef(ref) {
+  if (ref.kind === 'docker') { await dockerCapture(ref.container, ['rm', '-f', ref.path], 30000); return; }
+  fs.rmSync(ref.path);
+}
+
+/* ── reaching another instance from this one ─────────────────────────────
+ * Switching instances used to navigate this page to the other machine. In a
+ * browser that means leaving where you were; in the packaged app there is no
+ * address bar, so a host that is switched off leaves you on a network error with
+ * no way back. Instead the local bridge fetches on the page's behalf:
+ * /proxy/<origin>/<path> is forwarded to that instance, WebSocket included, so
+ * the page stays on this origin and the switcher always works.
+ *
+ * Only origins already listed as instances in this bridge's own settings are
+ * proxied - otherwise the bridge would be an open relay for the whole network. */
+function proxyTargets() {
+  try {
+    const st = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    return (st.instances || []).map((i) => (i && i.url) || '').filter(Boolean);
+  } catch { return []; }
+}
+
+function proxyBaseFor(origin) {
+  let want;
+  try { want = new URL(origin).origin; } catch { return null; }
+  for (const u of proxyTargets()) {
+    try { if (new URL(u).origin === want) return want; } catch { /* skip a bad entry */ }
+  }
+  return null;
+}
+
+/* "/proxy/<encoded origin>/rest" -> { base, path: "/rest" }, or null when the
+ * target is not one of ours. */
+function splitProxyPath(url) {
+  if (typeof url !== 'string' || !url.startsWith('/proxy/')) return null;
+  const rest = url.slice('/proxy/'.length);
+  const i = rest.indexOf('/');
+  if (i < 0) return null;
+  let origin;
+  try { origin = decodeURIComponent(rest.slice(0, i)); } catch { return null; }
+  const base = proxyBaseFor(origin);
+  return base ? { base, path: rest.slice(i) } : null;
+}
+
+// Headers that belong to one hop of a connection and must not be forwarded.
+const HOP_HEADERS = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
+  'proxy-authorization', 'proxy-connection', 'te', 'trailer']);
+
+function proxyHttp(req, res, base, pathAndQuery) {
+  let target;
+  try { target = new URL(pathAndQuery, base); } catch { res.writeHead(400).end('bad proxy target'); return; }
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP_HEADERS.has(k.toLowerCase())) headers[k] = v;
+  const secure = target.protocol === 'https:';
+  const send = secure ? https : http;
+  const upstream = send.request({
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || (secure ? 443 : 80),
+    path: target.pathname + target.search,
+    method: req.method,
+    headers,
+  }, (down) => {
+    const out = {};
+    for (const [k, v] of Object.entries(down.headers)) if (!HOP_HEADERS.has(k.toLowerCase())) out[k] = v;
+    try { res.writeHead(down.statusCode || 502, out); } catch { /* headers already sent */ }
+    down.pipe(res);
+  });
+  upstream.on('error', (e) => {
+    if (res.headersSent) { res.destroy(); return; }
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `instance unreachable: ${e.message}` }));
+  });
+  req.pipe(upstream);
+}
+
+/* WebSocket side of the same idea. Messages are forwarded one by one rather than
+ * tunnelling bytes, which keeps ping/pong and close frames correct at both ends. */
+const proxyWss = new WebSocketServer({ noServer: true });
+proxyWss.on('connection', (client, req, parsed) => {
+  const url = new URL(parsed.path, parsed.base);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const upstream = new WebSocket(url.toString());
+  const queue = [];
+  upstream.on('open', () => {
+    for (const m of queue) { try { upstream.send(m.data, { binary: m.binary }); } catch { /* gone */ } }
+    queue.length = 0;
+  });
+  upstream.on('message', (data, isBinary) => {
+    if (client.readyState === client.OPEN) { try { client.send(data, { binary: isBinary }); } catch { /* gone */ } }
+  });
+  upstream.on('close', () => { try { client.close(); } catch { /* already closing */ } });
+  upstream.on('error', (e) => {
+    console.warn(`proxy: ${url.origin} websocket failed: ${e.message}`);
+    try { client.close(1011, 'instance unreachable'); } catch { /* already closing */ }
+  });
+  client.on('message', (data, isBinary) => {
+    if (upstream.readyState === 1) { try { upstream.send(data, { binary: isBinary }); } catch { /* gone */ } }
+    else queue.push({ data, binary: isBinary });
+  });
+  client.on('close', () => { try { upstream.close(); } catch { /* already closing */ } });
+  client.on('error', () => { try { upstream.terminate(); } catch { /* already closed */ } });
+});
 
 function serveStatic(req, res) {
   let urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
@@ -462,7 +652,25 @@ async function scanSessions() {
 // UI settings (appearance, agent name/avatar, voice). PI_WEBUI_SETTINGS lets a
 // second instance - a test bridge, say - keep its own file instead of writing
 // over the real one next to the source.
-const SETTINGS_FILE = process.env.PI_WEBUI_SETTINGS || path.join(__dirname, '..', 'webui-settings.json');
+/* Where the WebUI keeps state of its own: its settings, and (below) the session
+ * it was last in. Both used to live next to the bridge, which inside a container
+ * is the image's writable layer - so `docker compose up` after a rebuild reset
+ * every UI setting and forgot where the user was, with nothing to show for it.
+ * The agent's config dir is the right home: in Docker that is exactly the
+ * directory people mount as a volume (and where pi keeps its own settings), and
+ * for a native bridge it is ~/.pi/agent. A file that already exists next to the
+ * bridge still wins, so nobody's settings move out from under them. */
+function stateFile(name) {
+  const legacy = path.join(__dirname, '..', name);
+  try { if (fs.existsSync(legacy)) return legacy; } catch { /* then the agent dir */ }
+  try {
+    fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
+    fs.accessSync(PI_AGENT_DIR, fs.constants.W_OK);
+    return path.join(PI_AGENT_DIR, name);
+  } catch { return legacy; }
+}
+
+const SETTINGS_FILE = process.env.PI_WEBUI_SETTINGS || stateFile('webui-settings.json');
 
 // The session the agent was last in, persisted across bridge/agent restarts.
 // A fresh `pi --mode rpc` always starts a brand-new empty session, and the
@@ -470,14 +678,49 @@ const SETTINGS_FILE = process.env.PI_WEBUI_SETTINGS || path.join(__dirname, '..'
 // page refresh (old socket closes, new one opens) dropped the user into a new
 // session. The bridge resumes this session whenever the agent (re)starts, and
 // the WebUI keeps its own copy in localStorage as a fallback.
+/* One record per agent source. A native pi and a pi inside a container keep
+ * their sessions in different places and neither path means anything to the
+ * other, so a single shared file made each of them try to resume into a session
+ * that only existed for the other one. */
+function agentSourceLabel() {
+  const remote = parseSessionDir();
+  if (remote) return 'docker-' + remote.container.replace(/[^A-Za-z0-9_.-]/g, '_');
+  return 'native';
+}
 const LAST_SESSION_FILE = process.env.PI_WEBUI_LAST_SESSION
-  || path.join(__dirname, '..', 'last-session.json');
+  || stateFile(`last-session-${agentSourceLabel()}.json`);
+// The single-file name used before that; still read, so nobody loses their place.
+const LEGACY_LAST_SESSION_FILE = path.join(__dirname, '..', 'last-session.json');
 
-function loadLastSession() {
+function readSessionRecord(file) {
   try {
-    const d = JSON.parse(fs.readFileSync(LAST_SESSION_FILE, 'utf8'));
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'));
     return typeof d.path === 'string' && d.path ? d.path : null;
   } catch { return null; }
+}
+
+function loadLastSession() {
+  const own = readSessionRecord(LAST_SESSION_FILE);
+  if (own) return own;
+  // If the record file was named explicitly (PI_WEBUI_LAST_SESSION), that name is
+  // the whole answer: reading the old default as well mixed two configurations -
+  // a test bridge picking up the desktop's session, a second bridge on another
+  // port resuming the first one's.
+  if (process.env.PI_WEBUI_LAST_SESSION) return null;
+  // The single file that was used before this was split per source. It is only
+  // worth reading when the path in it belongs to this world: a container path
+  // means nothing to a native pi, and a Windows path means nothing inside a
+  // container. A stale record was not harmless - the container's pi could not
+  // open it, and the switch_session that followed did not fail, it hung, so a
+  // docker bridge start had no session for two minutes and then gave up.
+  const legacy = readSessionRecord(LEGACY_LAST_SESSION_FILE);
+  if (!legacy) return null;
+  const containerPath = legacy.startsWith('/');
+  return containerPath === !!parseSessionDir() ? legacy : null;
+}
+
+function forgetLastSession() {
+  try { fs.rmSync(LAST_SESSION_FILE, { force: true }); } catch { /* nothing to forget */ }
 }
 
 function saveLastSession(p) {
@@ -650,8 +893,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/sessions')) {
+    // `remembered` is the session this bridge means to be in. The WebUI needs it
+    // to tell "the agent is in a chat I just created, whose file does not exist
+    // yet" from "the bridge restarted and lost my session" - the two look
+    // identical from the outside (a session path that is not in this list), and
+    // guessing between them is what made a new chat jump somewhere else on a
+    // quick reload.
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ sessionDir: SESSION_DIR, sessions: await scanSessions() }));
+    res.end(JSON.stringify({ sessionDir: SESSION_DIR, remembered: loadLastSession(), sessions: await scanSessions() }));
     return;
   }
   // Read-only transcript of a session file. Lets the WebUI browse other
@@ -665,23 +914,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'missing path' }));
       return;
     }
-    if (parseSessionDir()) {
-      res.writeHead(501, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'docker session dirs are not supported here' }));
-      return;
-    }
-    const root = path.resolve(SESSION_DIR);
-    const resolved = path.resolve(root, p);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    const ref = sessionRef(p);
+    if (!ref) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'path must stay inside the session dir' }));
       return;
     }
     try {
+      const text = await readSessionRef(ref);
+      if (text == null) throw new Error('session file could not be read');
       const messages = [];
       const compactions = [];
       let parent = null;
-      for (const line of fs.readFileSync(resolved, 'utf8').split('\n')) {
+      for (const line of text.split('\n')) {
         if (!line.trim()) continue;
         let e; try { e = JSON.parse(line); } catch { continue; }
         // The header records where a fork came from - deleting a fork can send
@@ -729,6 +974,82 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ commands }));
     return;
   }
+  /* Opening the WebUI to the network is a decision people should be able to make
+   * in the UI rather than by editing a JSON file next to the bridge. Reading and
+   * writing the same file the startup banner reads keeps one source of truth, and
+   * the server rebinds live, so no restart is needed. */
+  if (req.url.startsWith('/proxy/')) {
+    const parsed = splitProxyPath(req.url);
+    if (!parsed) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not a configured instance' }));
+      return;
+    }
+    proxyHttp(req, res, parsed.base, parsed.path);
+    return;
+  }
+
+  if (req.url.startsWith('/api/lan')) {
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { lan } = JSON.parse(body || '{}');
+          const cfg = { lan: !!lan };
+          fs.mkdirSync(path.dirname(LAN_CONFIG_FILE), { recursive: true });
+          fs.writeFileSync(LAN_CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+          const host = lan ? '0.0.0.0' : '127.0.0.1';
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, lan: !!lan, host, url: lan ? lanUrl(PORT) : null,
+            note: process.env.PI_WEBUI_HOST ? 'PI_WEBUI_HOST is set, so it wins on the next start' : null }));
+          // Rebind only after this response is on the wire: moving the socket
+          // closes the connection, and doing it first killed the answer that was
+          // telling the page it had worked.
+          setTimeout(() => rebind(host), 250);
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    const enabled = boundHost === '0.0.0.0' || boundHost === '::' || boundHost === '::0';
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      lan: enabled,
+      host: boundHost,
+      url: enabled ? lanUrl(PORT) : null,
+      envOverride: process.env.PI_WEBUI_HOST || null,
+    }));
+    return;
+  }
+
+  /* One small card per instance for the switcher: the agent's name and picture, so
+   * the menu can show who is who. Answers cross-origin requests (like /api/health)
+   * because that is exactly how another instance is reached. */
+  if (req.url.startsWith('/api/instance-card')) {
+    let settings = {};
+    try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify({
+      ok: true,
+      name: settings.agentName || 'pi agent',
+      avatar: settings.avatar || null,
+      avatarCrop: settings.avatarCrop || null,
+      session: agentStatus.sessionName || null,
+      busy: agentStatus.busy,
+      build: (() => {
+        try { const st = fs.statSync(path.join(__dirname, '..', 'web', 'app.js')); return Math.round(st.mtimeMs) + '-' + st.size; } catch { return null; }
+      })(),
+    }));
+    return;
+  }
+
   if (req.url.startsWith('/api/health')) {
     // Which build is this? Two machines on the same URL can be serving very
     // different copies of web/, and there was no way to tell them apart.
@@ -924,29 +1245,42 @@ const server = http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/session-file')) {
     if (req.method !== 'GET') { res.writeHead(405).end(); return; }
     const raw = new URL(req.url, 'http://localhost').searchParams.get('path') || '';
-    const file = safeSessionPath(raw);
-    if (!file) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'session not found' })); return; }
-    const st = fs.statSync(file);
+    const ref = sessionRef(raw);
+    if (!ref) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'session not found' })); return; }
+    const name = path.basename(ref.path);
+    if (ref.kind === 'docker') {
+      // Streamed straight out of the container: a long session can be tens of
+      // megabytes, and buffering it here only to hand it on would double it.
+      res.writeHead(200, {
+        'Content-Type': 'application/jsonl',
+        'Content-Disposition': `attachment; filename="${name}"`,
+      });
+      const child = spawn('docker', ['exec', ref.container, 'cat', ref.path], { stdio: ['ignore', 'pipe', 'ignore'] });
+      child.stdout.pipe(res);
+      child.on('error', () => res.destroy());
+      return;
+    }
+    const st = fs.statSync(ref.path);
     res.writeHead(200, {
       'Content-Type': 'application/jsonl',
       'Content-Length': st.size,
-      'Content-Disposition': `attachment; filename="${path.basename(file)}"`,
+      'Content-Disposition': `attachment; filename="${name}"`,
     });
-    fs.createReadStream(file).pipe(res);
+    fs.createReadStream(ref.path).pipe(res);
     return;
   }
   if (req.url.startsWith('/api/session-delete')) {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { path: raw } = JSON.parse(body || '{}');
-        const file = safeSessionPath(raw);
-        if (!file) throw new Error('session not found');
-        fs.rmSync(file);
+        const ref = sessionRef(raw);
+        if (!ref) throw new Error('session not found');
+        await deleteSessionRef(ref);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, path: file }));
+        res.end(JSON.stringify({ ok: true, path: ref.path }));
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
@@ -1394,7 +1728,11 @@ const server = http.createServer(async (req, res) => {
 
 // ---------------------------------------------------------------- agent plumbing
 
-const wss = new WebSocketServer({ server });
+// noServer + one upgrade router: the bridge's own sockets answer on /ws, and
+// anything on /proxy/ is forwarded to the instance it names. Letting the server
+// handle every upgrade itself would have aborted the proxy connections before
+// they could be routed.
+const wss = new WebSocketServer({ noServer: true });
 
 /*
  * ONE agent, shared by every connected client.
@@ -1413,6 +1751,14 @@ const wss = new WebSocketServer({ server });
  */
 let agent = null;               // the shared child process
 const clients = new Set();      // connected sockets
+// A reload closes the old socket and opens a new one a moment later. Killing the
+// agent on the first close meant every reload restarted pi, and a reload right
+// after sending a message could kill it before that message's session file had
+// been written - the session then looked like it had vanished. Wait for the
+// reconnect instead; a browser that really is closed still kills it, a few
+// seconds later.
+const IDLE_KILL_MS = parseInt(process.env.PI_WEBUI_IDLE_KILL_MS || '25000', 10);
+let agentIdleTimer = null;
 // rpc request id -> { ws, type, sessionPath }: the socket that sent it (the
 // response is routed back to it, not broadcast - ids are only unique per
 // client), plus the command so the bridge can track session changes.
@@ -1456,7 +1802,10 @@ function trackSessionChange(parsed, owner) {
   const cancelled = parsed.data && parsed.data.cancelled === true;
   if (cmd === 'switch_session' && owner.sessionPath && !cancelled) {
     saveLastSession(owner.sessionPath);
-  } else if ((cmd === 'new_session' || cmd === 'fork' || cmd === 'clone') && !cancelled) {
+  } else if ((cmd === 'prompt' || cmd === 'new_session' || cmd === 'fork' || cmd === 'clone') && !cancelled) {
+    // A prompt can be the first thing that creates a session file, and its path
+    // is reported nowhere else - re-read it, so the record matches the session
+    // the message actually landed in.
     bridgeRpc({ type: 'get_state' }, 15000)
       .then((st) => { if (st && st.sessionFile) saveLastSession(st.sessionFile); })
       .catch(() => { /* agent gone; nothing to record */ });
@@ -1507,19 +1856,61 @@ function wsSend(ws, obj) {
   }
 }
 
+let agentRestarts = [];
+let agentRestartTimer = null;
+
+/* Bring the agent back after it exited with clients still connected. Bounded: a
+ * command that cannot start at all must not respawn in a tight loop. */
+function scheduleAgentRestart() {
+  const now = Date.now();
+  agentRestarts = agentRestarts.filter((t) => now - t < 60000);
+  if (agentRestarts.length >= 5) {
+    console.error('agent keeps exiting; not restarting again for now');
+    broadcast({ bridge: 'agent_stderr', text: 'The agent keeps exiting - check the console for why.' });
+    return;
+  }
+  agentRestarts.push(now);
+  if (agentRestartTimer) return;
+  agentRestartTimer = setTimeout(() => {
+    agentRestartTimer = null;
+    if (agent || shuttingDown || clients.size === 0) return;
+    console.log('restarting the agent');
+    try { startAgent(); } catch (e) { console.error('restart failed:', e.message); }
+  }, 800);
+}
+
 function startAgent() {
   if (agent) return agent;
 
+  // pi keeps its own idea of where its config and sessions live, and nothing
+  // was telling it about the ones this bridge was pointed at: set
+  // PI_SESSION_DIR (or PI_AGENT_DIR) and the sidebar listed a directory the
+  // agent never wrote to, while the models.json and the llama endpoint saved in
+  // Settings were read from a file pi never looked at. pi honours both as env
+  // vars - PI_CODING_AGENT_DIR and PI_CODING_AGENT_SESSION_DIR - so it is told
+  // exactly what the bridge itself uses. A docker:<ctr>:<dir> session dir is a
+  // host-side alias for a path inside the container; the agent is already in
+  // there and has no use for it.
+  const childEnv = { ...process.env };
+  if (!SESSION_DIR.startsWith('docker:')) {
+    childEnv.PI_CODING_AGENT_SESSION_DIR = SESSION_DIR;
+    childEnv.PI_CODING_AGENT_DIR = PI_AGENT_DIR;
+  }
   const child = spawn(PI_COMMAND, {
     shell: true, // pi is an npm .cmd shim on Windows; shell handles both platforms
-    cwd: WORKSPACE_DIR,
-    env: process.env,
+    cwd: hostSpawnDir(),
+    env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: !isWin, // POSIX: own process group so killTree can kill the whole tree
   });
 
   let buf = '';
   child.stdout.on('data', (d) => {
+    // Only the current agent speaks for the bridge. A previous child that has
+    // been replaced can still have output in flight, and its answers are about a
+    // session nobody is in any more - that is how a client ended up looking at a
+    // fresh, empty session while the real one sat right there.
+    if (child !== agent) return;
     // Protocol requires splitting on \n only (not U+2028/U+2029 like readline).
     buf += d.toString('utf8');
     let nl;
@@ -1547,6 +1938,7 @@ function startAgent() {
         if (pendingOwner.has(parsed.id)) {
           const owner = pendingOwner.get(parsed.id);
           pendingOwner.delete(parsed.id);
+          if (DEBUG_RPC) console.log(`[rpc] -> ${parsed.command || owner.type}${parsed.success ? '' : ' FAILED: ' + (parsed.error || '')}`);
           wsSend(owner.ws, { bridge: 'rpc', payload: parsed });
           trackSessionChange(parsed, owner);
           continue;
@@ -1557,6 +1949,7 @@ function startAgent() {
   });
 
   child.stderr.on('data', (d) => {
+    if (child !== agent) return;
     broadcast({ bridge: 'agent_stderr', text: d.toString('utf8') });
   });
 
@@ -1568,11 +1961,28 @@ function startAgent() {
     });
   });
 
+  child.on('error', (err) => {
+    // Without this, a command the shell cannot run at all (a bad path, a missing
+    // docker, a workspace that does not exist here) failed in complete silence:
+    // the console showed the startup banner and nothing else, and the UI sat
+    // there empty with no reason given.
+    console.error(`could not start the agent (${PI_COMMAND}): ${err.message}`);
+    broadcast({ bridge: 'agent_stderr', text: `Could not start the agent: ${err.message}` });
+  });
+
   child.on('exit', (code, signal) => {
-    if (agent === child) agent = null;
+    const wasCurrent = agent === child;
+    if (wasCurrent) agent = null;
+    if (!wasCurrent) return;   // a replaced child; its exit is not the bridge's business
     agentStatus.busy = false;
     failBridgePending('agent exited');
+    console.log(`agent exited (code ${code}${signal ? ', signal ' + signal : ''})`);
     broadcast({ bridge: 'agent_exit', code, signal });
+    // pi can end on its own - a container settling, a provider dropping the RPC
+    // loop. Waiting for somebody to press "restart" leaves the page sitting in
+    // whatever empty session the next start would create; bringing it back with
+    // the recorded session is what the user actually wants to see.
+    if (clients.size > 0 && !shuttingDown) scheduleAgentRestart();
   });
 
   agent = child;
@@ -1582,38 +1992,100 @@ function startAgent() {
     workspace: WORKSPACE_DIR,
     sessionDir: SESSION_DIR,
   });
-  // A fresh agent starts a brand-new empty session; put it back in the one
-  // the user was in. Fire-and-forget: the commands are written to the pipe
-  // now and processed in order once the agent's RPC loop is up (a slow
-  // extension load just delays them), so anything a client sends in the
-  // meantime lands AFTER the resume, never before it.
+  // A fresh agent starts a brand-new empty session; put it back in the one the
+  // user was in. Called from here, before this start returns, so the switch is
+  // the first command on the pipe and no client can get in front of it.
   resumeLastSessionOnAgent();
   return child;
 }
 
-async function resumeLastSessionOnAgent() {
-  const last = loadLastSession();
-  if (last && (await sessionFileExists(last))) {
-    try {
-      await bridgeRpc({ type: 'switch_session', sessionPath: last }, 120000);
-      console.log(`resumed last session: ${last}`);
-    } catch (e) {
-      // e.g. the session's working directory is gone - the agent stays in
-      // its fresh session and the WebUI offers the usual folder-recreate
-      // flow when the user clicks the old session in the sidebar.
-      console.warn(`could not resume last session ${last}: ${e.message}`);
-    }
-  }
-  // Record whatever session the agent is on now (the resumed one, or the
-  // fresh one on first run / failed resume) so the next restart resumes it.
+/* Ask the agent which session it is in and remember it. This is the record a
+ * restart resumes from, so it is also taken just before the agent is stopped. */
+async function recordCurrentSession(timeoutMs = 15000) {
   try {
-    const st = await bridgeRpc({ type: 'get_state' }, 120000);
-    if (st && st.sessionFile) saveLastSession(st.sessionFile);
-  } catch { /* agent gone or slow; the next get_state records it */ }
+    const st = await bridgeRpc({ type: 'get_state' }, timeoutMs);
+    if (st && st.sessionFile) {
+      if (DEBUG_RPC) console.log(`[session] recorded ${st.sessionFile}`);
+      saveLastSession(st.sessionFile);
+      return st.sessionFile;
+    }
+  } catch { /* agent gone or too slow - the previous record still stands */ }
+  return null;
 }
+
+/* Put a freshly started agent back into the session the user was in.
+ *
+ * The switch has to be the first thing written to the agent's pipe, with nothing
+ * awaited before it. pi starts every run in a new, empty session, and that
+ * session's file does not exist until the first message arrives. This used to
+ * wait for an existence check first (a `docker exec test -f` in container mode,
+ * easily hundreds of milliseconds), while the browser connecting in the same
+ * breath sent its own get_state and prompt. Those overtook the switch: the page
+ * showed the fresh session, the prompt went into it, and the switch arriving
+ * afterwards moved the agent off it again. Send a message, reload immediately,
+ * and the session you were writing in looked like it had disappeared.
+ *
+ * Now the switch is written immediately - a missing file only makes it fail, and
+ * that is handled below - so a client's commands can only be processed after it.
+ */
+// The session the last resume landed in. A page that connects after the resume
+// has finished (the usual case: the bridge resumes within a few hundred
+// milliseconds of starting, while the browser is still opening its socket) never
+// sees the broadcast that goes with it, and renders the empty transcript of the
+// fresh session its own get_state came back with. Handing late arrivals the same
+// news is what makes the transcript come back.
+let lastResumed = null;
+
+function resumeLastSessionOnAgent() {
+  const last = loadLastSession();
+  if (!last) { recordCurrentSession(); return; }
+  bridgeRpc({ type: 'switch_session', sessionPath: last }, 30000)
+    .then(() => {
+      console.log(`resumed last session: ${last}`);
+      lastResumed = last;
+      broadcast({ bridge: 'session_resumed', path: last });
+      recordCurrentSession();
+    })
+    .catch(async (e) => {
+      // Gone, or its working directory is gone: the agent stays in its fresh
+      // session (the WebUI offers the usual folder-recreate flow when the old
+      // session is clicked in the sidebar).
+      console.warn(`could not resume last session ${last}: ${e.message}`);
+      const answer = await recordCurrentSession(8000);
+      if (!answer && agent) {
+        // The switch did not fail so much as stop: an agent that cannot even
+        // say which session it is in is wedged, and every later command would
+        // queue behind it. Drop the record that led here (so the restart cannot
+        // hit the same wall) and give it a fresh start.
+        console.warn('agent did not answer after the failed resume - restarting it');
+        forgetLastSession();
+        killTree(agent);
+        agent = null;
+        startAgent();
+        return;
+      }
+      sessionFileExists(last)
+        .then((exists) => { if (!exists) broadcast({ bridge: 'session_resume_failed', path: last }); })
+        .catch(() => { /* container gone; nothing to report */ });
+    });
+}
+
+server.on('upgrade', (req, socket, head) => {
+  const parsed = splitProxyPath(req.url);
+  if (parsed) {
+    proxyWss.handleUpgrade(req, socket, head, (client) => proxyWss.emit('connection', client, req, parsed));
+    return;
+  }
+  if ((req.url || '').startsWith('/ws')) {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    return;
+  }
+  socket.destroy();
+});
 
 wss.on('connection', (ws) => {
   clients.add(ws);
+  if (agentIdleTimer) { clearTimeout(agentIdleTimer); agentIdleTimer = null; }
   // Keepalive bookkeeping: the bridge pings every 30s (see below) and a dead
   // client is terminated once it misses a round. Without this, half-open
   // connections (sleep/wake, WebView2 network hiccups) linger in `clients`
@@ -1632,6 +2104,9 @@ wss.on('connection', (ws) => {
     workspace: WORKSPACE_DIR,
     sessionDir: SESSION_DIR,
   });
+  // ... and which session the agent was put back into, in case this page missed
+  // the broadcast while it was still connecting.
+  if (lastResumed) wsSend(ws, { bridge: 'session_resumed', path: lastResumed });
 
   ws.on('message', (data) => {
     let msg;
@@ -1653,6 +2128,7 @@ wss.on('connection', (ws) => {
       // Remember who asked (and what they asked), so the response goes back
       // to them and not to everybody (ids are only unique per client), and
       // session-changing commands keep the last-session record current.
+      if (DEBUG_RPC) console.log(`[rpc] <- ${msg.type}${msg.sessionPath ? ' ' + msg.sessionPath : ''}`);
       if (msg.id) pendingOwner.set(msg.id, { ws, type: msg.type, sessionPath: msg.sessionPath });
       agent.stdin.write(JSON.stringify(msg) + '\n');
     } else {
@@ -1666,11 +2142,20 @@ wss.on('connection', (ws) => {
     for (const [id, owner] of pendingOwner) {
       if (owner.ws === ws) pendingOwner.delete(id);
     }
-    // Last one out turns off the lights, so an abandoned agent is not left
-    // running in the background.
-    if (clients.size === 0 && agent) {
-      killTree(agent);
-      agent = null;
+    // Last one out turns off the lights (after the grace period above), so an
+    // abandoned agent is not left running in the background. The session is
+    // recorded first: this is the last moment the agent can say which session it
+    // is in, and that record is what the next start resumes from.
+    if (clients.size === 0 && agent && !agentIdleTimer) {
+      agentIdleTimer = setTimeout(async () => {
+        agentIdleTimer = null;
+        if (clients.size > 0 || !agent) return;
+        await recordCurrentSession(8000);
+        if (clients.size > 0) return;   // somebody came back while we waited
+        killTree(agent);
+        agent = null;
+      }, IDLE_KILL_MS);
+      if (agentIdleTimer.unref) agentIdleTimer.unref();
     }
   });
 });

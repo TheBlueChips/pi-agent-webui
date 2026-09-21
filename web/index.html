@@ -14,8 +14,16 @@
   <!-- ══════════ Sidebar ══════════ -->
   <aside id="sidebar">
     <div class="sidebar-head">
-      <span id="sidebar-avatar" class="avatar-wrap" hidden></span>
-      <span class="logo" id="agent-title">pi agent</span>
+      <!-- Who you are looking at. The picture and the name are the button: clicking
+           them switches instance (or adds one), right-clicking a row removes it. -->
+      <button id="btn-instance" class="instance-head" title="pi agent instances — click to switch or add another one">
+        <span id="sidebar-avatar" class="avatar-wrap" hidden></span>
+        <span class="instance-labels">
+          <span class="logo" id="instance-name">pi agent</span>
+          <span class="instance-sub" id="instance-sub">this machine</span>
+        </span>
+        <span class="instance-caret" aria-hidden="true">▾</span>
+      </button>
       <button id="btn-new-session" class="btn primary" title="Start a new session">+ New</button>
     </div>
     <div class="sidebar-search">
@@ -23,9 +31,6 @@
       <button id="btn-refresh-sessions" class="btn icon" title="Refresh session list">⟳</button>
     </div>
     <div id="session-list" class="session-list"></div>
-    <div class="sidebar-foot">
-      <button id="btn-instance" class="btn small instance-btn" title="Switch pi agent instance">this machine</button>
-    </div>
   </aside>
 
   <!-- ══════════ Main ══════════ -->
@@ -33,6 +38,12 @@
     <header id="topbar">
       <button id="btn-toggle-sidebar" class="btn icon" title="Toggle sidebar">☰</button>
       <input id="session-name" class="session-name" placeholder="Unnamed session" title="Click to rename">
+      <!-- Sessions started from this one (a forked branch, a subagent working in
+           the background) live here instead of taking over the session list. -->
+      <button id="btn-branches" class="btn small hidden" title="Sessions started from this one">⑃ <span id="branches-count">0</span></button>
+      <!-- Sessions started from this one (a forked branch, a subagent working in
+           the background) live here instead of taking over the session list. -->
+      <button id="btn-branches" class="btn small hidden" title="Sessions started from this one">⑃ <span id="branches-count">0</span></button>
       <button id="btn-reels" class="btn">Reels</button>
       <button id="reels-pill" class="reels-pill hidden" title="Close the split feed panel"><span>◧ Reels</span></button>
       <button id="btn-settings" class="btn icon" title="Settings: agent name, avatar, TTS voice, voice input, thinking, theme">⚙</button>
@@ -41,6 +52,10 @@
     </header>
 
     <div id="banner" class="banner hidden"></div>
+
+    <!-- Shown while the page is looking at another instance through the local
+         bridge. The way out is here, not in a browser's back button. -->
+    <div id="remote-banner" class="remote-banner hidden"></div>
 
     <!-- "Viewing another session" banner (the agent runs in its own). -->
     <div id="view-banner" class="view-banner hidden"></div>
@@ -240,6 +255,16 @@
       <label class="check-label"><input id="set-expand-tools" type="checkbox"> auto-expand tool call output</label>
       <label>Compaction</label>
       <label class="check-label"><input id="set-auto-continue" type="checkbox"> auto-continue the task after compaction</label>
+      <label>When the agent finishes</label>
+      <label class="check-label"><input id="set-done-sound" type="checkbox"> play a sound</label>
+      <label></label>
+      <label class="check-label"><input id="set-done-notify" type="checkbox"> desktop notification</label>
+      <label></label>
+      <label class="check-label"><input id="set-done-only-unfocused" type="checkbox"> only when this window is not focused</label>
+      <label>Network</label>
+      <label class="check-label"><input id="set-lan" type="checkbox"> let other devices on this network open this WebUI</label>
+      <label></label>
+      <div class="hint" id="lan-hint"></div>
     </div>
   </div>
 
@@ -290,6 +315,8 @@
         <input id="set-accent" type="color" value="#5b9dff">
         <button id="btn-accent-reset" class="btn small">default</button>
       </div>
+      <label></label>
+      <label class="check-label"><input id="set-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
       <label>Background</label>
       <div class="rate-row">
         <input id="set-bg-url" type="text" placeholder="image / GIF / video URL">
@@ -297,6 +324,18 @@
         <button id="btn-bg-crop" class="btn small">crop…</button>
         <button id="btn-bg-clear" class="btn small">clear</button>
         <input id="bg-input" type="file" accept="image/*,video/*,.gif,.mp4,.webm,.mov" hidden>
+      </div>
+      <label>Background transparency</label>
+      <div class="rate-row">
+        <input id="set-bg-opacity" type="range" min="0" max="100" step="5">
+        <span id="set-bg-opacity-val">100%</span>
+      </div>
+      <label>Background sound</label>
+      <label class="check-label"><input id="set-bg-audio" type="checkbox"> play a background video's audio</label>
+      <label>Background volume</label>
+      <div class="rate-row">
+        <input id="set-bg-volume" type="range" min="0" max="100" step="5">
+        <span id="set-bg-volume-val">50%</span>
       </div>
       <label>Chatbox transparency</label>
       <div class="rate-row">

@@ -103,7 +103,7 @@ async function loadSttModels() {
   const sel = $('set-stt-model');
   if (!sel) return;
   try {
-    const d = await fetch('/api/whisper-status').then((r) => r.json());
+    const d = await fetch(api('/api/whisper-status')).then((r) => r.json());
     sttModelsLoaded = true;
     sel.innerHTML = '';
     for (const m of d.models || []) {
@@ -146,7 +146,7 @@ function renderSttStatus(st) {
 
 async function refreshSttStatus() {
   try {
-    const d = await fetch('/api/whisper-status').then((r) => r.json());
+    const d = await fetch(api('/api/whisper-status')).then((r) => r.json());
     renderSttStatus(d);
     if (d.state === 'downloading') setTimeout(refreshSttStatus, 1000);
   } catch { /* ignore */ }
@@ -158,7 +158,7 @@ async function refreshSttStatus() {
  * the local server could not be started (browser voice stays available). */
 async function ensureWhisper(quiet) {
   let st = null;
-  try { st = await fetch('/api/whisper-status').then((r) => r.json()); } catch { /* bridge offline: fall through */ }
+  try { st = await fetch(api('/api/whisper-status')).then((r) => r.json()); } catch { /* bridge offline: fall through */ }
   if (st && st.state === 'ready' && (!SET.sttModel || !st.model || st.model === SET.sttModel)) {
     if (st.url && SET.sttEndpoint !== st.url) { SET.sttEndpoint = st.url; saveSettings(); }
     return st.url || SET.sttEndpoint || null;
@@ -168,7 +168,7 @@ async function ensureWhisper(quiet) {
     else if (st && (st.state === 'downloading' || st.state === 'starting')) toast(`Whisper is already ${st.state === 'downloading' ? 'downloading' : 'starting'}…`);
     else toast('Starting the local whisper server - first run downloads it, this takes a while…');
   }
-  const d = await fetch('/api/whisper-start', {
+  const d = await fetch(api('/api/whisper-start'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: SET.sttModel || null }),
@@ -219,7 +219,14 @@ function syncVoiceSettingsUi() {
   const status = $('stt-status');
   if (modelRow) modelRow.classList.toggle('hidden', !whisper);
   if (startBtn) startBtn.classList.toggle('hidden', !whisper);
-  if (endpoint && endpoint.parentElement) endpoint.parentElement.classList.toggle('hidden', !whisper);
+  // Hide the endpoint field itself, never its parent: it sits directly in the
+  // settings grid, so hiding the parent hid the whole Voice tab - pick the
+  // browser backend, save, and the tab was empty.
+  if (endpoint) {
+    endpoint.classList.toggle('hidden', !whisper);
+    const wrap = endpoint.parentElement;
+    if (wrap && wrap.classList.contains('rate-row')) wrap.classList.toggle('hidden', !whisper);
+  }
   if (note) note.classList.toggle('hidden', !whisper);
   if (status) status.classList.toggle('hidden', !whisper);
   document.querySelectorAll('#tab-voice .settings-grid > label').forEach((l) => {
@@ -375,6 +382,15 @@ const DEFAULT_SETTINGS = {
   avatarCrop: null,       // {x, y, z} — manual crop of the profile image
   bgCrop: null,           // {x, y, z} — manual crop of the background
   typeAnywhere: false,    // start typing in the composer without clicking it
+  // When the agent finishes a turn (all off until switched on in Settings)
+  doneSound: false,       // short two-note chime
+  doneNotify: false,      // desktop / Windows notification
+  doneOnlyUnfocused: true,// ...and only while this window is not the active one
+  // Appearance
+  gamerMode: false,       // let the accent colour drift through the rainbow
+  bgOpacity: 100,         // 0-100 — background image / video transparency
+  bgAudio: false,         // play a background video's audio
+  bgVolume: 50,           // 0-100
 };
 let SET = { ...DEFAULT_SETTINGS };
 try { Object.assign(SET, JSON.parse(localStorage.getItem('piwebui-settings') || '{}')); } catch { /* defaults */ }
@@ -384,7 +400,7 @@ function saveSettings() {
   applySettings();
   try { localStorage.setItem('piwebui-settings', JSON.stringify(SET)); } catch { /* cache only */ }
   // authoritative copy lives in webui-settings.json next to the project
-  fetch('/api/ui-settings', {
+  fetch(api('/api/ui-settings'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(SET),
@@ -393,7 +409,7 @@ function saveSettings() {
 
 async function loadServerSettings() {
   try {
-    const data = await fetch('/api/ui-settings').then((r) => r.json());
+    const data = await fetch(api('/api/ui-settings')).then((r) => r.json());
     if (data && Object.keys(data).length) {
       Object.assign(SET, data);
       applySettings();
@@ -403,7 +419,10 @@ async function loadServerSettings() {
 }
 
 function applySettings() {
-  $('agent-title').textContent = SET.agentName || 'pi agent';
+  // The name lives in the instance button now (it doubles as "who you are
+  // looking at"), so guard it: a page without it must not break every setting.
+  const nameEl = $('instance-name') || $('agent-title');
+  if (nameEl) nameEl.textContent = SET.agentName || 'pi agent';
   document.title = `${SET.agentName || 'Pi agent'}`;
   const tts = $('btn-tts');
   tts.textContent = S.autoTts ? 'TTS on' : 'TTS off';
@@ -435,7 +454,17 @@ function applySettings() {
     rootStyle.removeProperty('--accent');
     rootStyle.removeProperty('--accent-dim');
   }
+  // Gamer mode takes the accent over: the wheel turns once every 16 seconds, so
+  // it reads as a living theme rather than a strobe. Everything that uses
+  // --accent (buttons, rings, scrollbars, highlights) follows along.
+  if (SET.gamerMode) startGamerAccent(); else stopGamerAccent();
   applyBackgroundMedia();
+  // Background transparency, separate from the panels': a bright photo can be
+  // unusable at full strength even with the chat itself fully transparent.
+  const bgAlpha = Math.max(0, Math.min(1, (SET.bgOpacity == null ? 100 : Number(SET.bgOpacity)) / 100));
+  const bgHost = $('bg-media');
+  if (bgHost) bgHost.style.opacity = String(bgAlpha);
+  applyBgAudio(document.querySelector('#bg-media video'));
   // chat-panel transparency (0 = fully transparent, 100 = solid)
   const alpha = SET.chatOpacity == null ? 1 : Math.max(0, Math.min(1, Number(SET.chatOpacity) / 100));
   rootStyle.setProperty('--ui-alpha', String(alpha));
@@ -496,6 +525,9 @@ const S = {
   models: [],
   levels: [],
   instanceStatus: {},       // instance url -> {ok, busy, name} for the switcher
+  instanceCards: {},        // instance url -> {name, avatar} from /api/instance-card
+  remote: null,             // origin of the instance this page is looking at, or null
+  remoteName: null,         // its display name
   msgTiming: new Map(),    // message key -> {elapsedSec, prefillSec, est} for the t/s figure
   autoTts: false,
   speaking: false,
@@ -531,7 +563,10 @@ let reconnectDelay = 1000;  // backoff per failed attempt, capped at 15s
 function connect() {
   if (S.ws && S.ws.readyState === WebSocket.OPEN) return; // already connected
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // Another instance's socket is reached through the proxy on this origin, so a
+  // host that is down cannot take the page with it.
+  const wsPath = S.remote ? `/proxy/${encodeURIComponent(S.remote)}/ws` : '/ws';
+  const ws = new WebSocket(`${proto}://${location.host}${wsPath}`);
   S.ws = ws;
 
   ws.onopen = () => {
@@ -547,6 +582,8 @@ function connect() {
     if (msg.bridge === 'rpc') handleRpcMessage(msg.payload);
     else if (msg.bridge === 'agent_exit') onAgentExit(msg);
     else if (msg.bridge === 'agent_started') onAgentStarted();
+    else if (msg.bridge === 'session_resumed') onSessionResumed(msg.path);
+    else if (msg.bridge === 'session_resume_failed') toast('Could not reopen your last session - starting in a new one', 'warning');
     else if (msg.bridge === 'agent_stderr' && msg.text.trim()) console.warn('[pi stderr]', msg.text);
   };
   ws.onclose = () => {
@@ -685,6 +722,29 @@ function markStuckToolCards(label) {
   }
 }
 
+/* The bridge puts a restarted agent back into the session it was in. It takes a
+ * moment, and it is not safely ordered against the commands this page sends on
+ * connect: pi answers a get_state that arrives after a switch_session before the
+ * switch has finished loading - so the first state this page sees can be the
+ * fresh, empty session the agent started in, and the page then looks like the
+ * session you were writing in simply vanished. When the bridge says the resume
+ * is done, read the state again. It is also the only signal that a session
+ * restored after a container restart is ready. */
+async function onSessionResumed(path) {
+  if (!path) return;
+  try {
+    await rpc({ type: 'get_state' }).then((d) => applyState(d));
+    // Always re-read the transcript: a page that connected while the agent was
+    // still switching may already hold the right session path while showing the
+    // empty transcript of the fresh session the agent started in.
+    if (S.viewSession) await switchToSession(path);
+    else await refreshMessages();
+    refreshSessions().catch(() => {});
+  } catch (e) {
+    console.warn('could not pick up the resumed session:', e.message);
+  }
+}
+
 function onAgentExit(msg) {
   S.isStreaming = false;
   setConn('on');
@@ -720,28 +780,36 @@ async function initSession(resumeLast) {
 }
 
 /* A fresh pi process always starts a new empty session; on page load, reopen
- * the session the user was in instead so work continues where it left off.
- * The bridge normally resumes it already (it remembers the last session and
- * switches the restarted agent back), which makes `known` true below and this
- * a no-op. This is the fallback for when the bridge has no record yet - and
- * it prefers the session THIS browser was last in over "newest file", which
- * can be a different session on a shared agent. */
+ * the session the user was in instead so work continues where it left off. The
+ * bridge normally resumes it already, and says so in /api/sessions: in that case
+ * this does nothing.
+ *
+ * Only one situation justifies touching the agent's session here: the agent is
+ * in a session other than the one the bridge meant to resume, i.e. the bridge
+ * really did start fresh. Anything broader goes wrong in a way that is hard to
+ * see. A session has no file until its first message is written, so a chat you
+ * just created is absent from the sidebar list - which used to look exactly like
+ * a lost session. This function then picked the newest file in the list as a
+ * replacement, so sending a message and reloading right away dropped you into
+ * whatever session had been written last, quite possibly days old. That is the
+ * "my session disappeared" report, and it was this line, not the bridge. */
 async function resumeLastSession() {
   let d;
   try {
-    const res = await fetch('/api/sessions');
+    const res = await fetch(api('/api/sessions'));
     d = await res.json();
   } catch { return; /* bridge unreachable */ }
   const sessions = d.sessions || [];
+  const remembered = d.remembered || null;
   const cur = S.state.sessionFile;
-  const known = cur && sessions.some((s) => s.path === cur);
-  if (known || !sessions.length) return;
+  const find = (p) => (p ? sessions.find((s) => s.path === p) || null : null);
+  if (find(cur)) return;                       // on screen and on disk: nothing to do
+  if (!sessions.length) return;
+  if (!remembered || remembered === cur) return;   // the bridge is in the session it intended
   let target = null;
-  try {
-    const last = localStorage.getItem('piwebui-last-session');
-    if (last) target = sessions.find((s) => s.path === last) || null;
-  } catch { /* private mode */ }
-  if (!target) target = sessions[0];
+  try { target = find(localStorage.getItem(lastSessionKey())); } catch { /* private mode */ }
+  if (!target) target = find(remembered);
+  if (!target) return;                         // nothing to go back to; stay where the agent is
   if (target.path === cur) return;
   try {
     await rpc({ type: 'switch_session', sessionPath: target.path });
@@ -756,6 +824,29 @@ async function resumeLastSession() {
   }
 }
 
+/* ── which instance is this page looking at? ──────────────────────────────
+ * Switching instances used to navigate this page to the other machine. In a
+ * browser that means leaving where you were, and in the packaged app there is no
+ * address bar - so a host that is switched off stranded you on a network error
+ * with no way back. The local bridge proxies instead (/proxy/<origin>/...), so
+ * the page never leaves this origin and the switcher always works.
+ *
+ * Everything that belongs to the agent follows the instance you are looking at;
+ * anything about this machine's own WebUI - its appearance, its network switch -
+ * stays local. */
+const LOCAL_APIS = ['/api/ui-settings', '/api/lan', '/api/instance-card', '/api/system-fonts', '/proxy/'];
+function api(path) {
+  const p = String(path);
+  if (!S.remote || LOCAL_APIS.some((l) => p.startsWith(l))) return path;
+  return `/proxy/${encodeURIComponent(S.remote)}${p}`;
+}
+
+/* The session this page should return to belongs to one instance, not to "the
+ * app": keep a separate note per instance. */
+function lastSessionKey() {
+  return 'piwebui-last-session' + (S.remote ? `@${S.remote}` : '');
+}
+
 /* ───────────────────────── state / config refresh ───────────────────────── */
 
 function applyState(d) {
@@ -764,8 +855,9 @@ function applyState(d) {
     // Remember which session this browser is in, so a reload can get back to
     // it even if the bridge has no record (see resumeLastSession).
     if (d.sessionFile) {
-      try { localStorage.setItem('piwebui-last-session', d.sessionFile); } catch { /* cache only */ }
+      try { localStorage.setItem(lastSessionKey(), d.sessionFile); } catch { /* cache only */ }
     }
+    updateBranchesBtn();
     if (d.sessionName) $('session-name').value = d.sessionName;
     else if (!$('session-name').value) $('session-name').value = '';
     // otherwise the derived session name (first user message) fills in via refreshSessions
@@ -838,6 +930,13 @@ function openMenu(anchor, items, opts = {}) {
       if (it.sep) { list.appendChild(el('div', 'menu-sep', '')); group = null; continue; }
       if (it.group && it.group !== group) { group = it.group; list.appendChild(el('div', 'model-group', group)); }
       const row = el('div', 'model-item' + (it.active ? ' sel' : '') + (it.danger ? ' danger' : ''));
+      if (it.instanceUrl) row.dataset.instance = it.instanceUrl;
+      if (it.avatar || it.avatarPlaceholder) {
+        // an instance's own picture, so the switcher shows who is who
+        const img = it.avatar ? el('img', 'menu-avatar') : el('span', 'menu-avatar empty', '');
+        if (it.avatar) { img.src = it.avatar; img.alt = ''; }
+        row.appendChild(img);
+      }
       if (it.dot) row.appendChild(el('span', `menu-dot ${it.dot}`, ''));
       row.appendChild(el('span', 'model-label', it.label || ''));
       if (it.hint) row.appendChild(el('span', 'model-provider', it.hint));
@@ -847,6 +946,9 @@ function openMenu(anchor, items, opts = {}) {
         closeMenu();
         it.onPick && it.onPick(it);
       };
+      if (it.onContext) {
+        row.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); it.onContext(it, row); };
+      }
       list.appendChild(row);
     }
   };
@@ -1050,8 +1152,8 @@ async function refreshLlamaGroup() {
   if (old) old.remove();
   try {
     const [d, cfg] = await Promise.all([
-      fetch('/api/llama-models').then((r) => r.json()),
-      fetch('/api/llama-config').then((r) => r.json()),
+      fetch(api('/api/llama-models')).then((r) => r.json()),
+      fetch(api('/api/llama-config')).then((r) => r.json()),
     ]);
     llamaConfiguredUrl = cfg.url || null;
     llamaLiveServers = d.servers || [];
@@ -1112,7 +1214,7 @@ async function fixLlamaConfig(url) {
   llamaFixInFlight = true;
   toast('Updating pi config and restarting the agent…');
   try {
-    const r = await fetch('/api/llama-config', {
+    const r = await fetch(api('/api/llama-config'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
@@ -1204,7 +1306,7 @@ async function refreshCommands() {
  * menu stays current automatically as pi adds commands. */
 async function refreshBuiltinCommands() {
   try {
-    const d = await fetch('/api/builtin-commands').then((r) => r.json());
+    const d = await fetch(api('/api/builtin-commands')).then((r) => r.json());
     S.builtinCommands = Array.isArray(d.commands) ? d.commands : [];
   } catch { S.builtinCommands = []; }
 }
@@ -1482,8 +1584,15 @@ function mediaNode(src, cls) {
   let node;
   if (isVideoSrc(src)) {
     node = el('video', cls);
-    node.muted = true; node.loop = true; node.autoplay = true; node.playsInline = true;
+    // A background video is muted unless the user asked for its sound; browsers
+    // block audible autoplay until the page has been interacted with, so that
+    // case waits for the first click instead of playing silently forever.
+    const wantsSound = cls === 'bg-node' && !!SET.bgAudio;
+    node.muted = !wantsSound;
+    node.volume = Math.max(0, Math.min(1, (SET.bgVolume == null ? 50 : Number(SET.bgVolume)) / 100));
+    node.loop = true; node.autoplay = true; node.playsInline = true;
     node.setAttribute('playsinline', '');
+    if (wantsSound) armBgAudioUnlock(node);
   } else {
     node = el('img', cls);
   }
@@ -2068,7 +2177,7 @@ function tsMs(v) {
 }
 
 async function fetchSession(sessionPath) {
-  const r = await fetch(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`);
+  const r = await fetch(api(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`));
   const d = await r.json();
   if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
   return {
@@ -2336,6 +2445,9 @@ function handleEvent(msg) {
       break;
     case 'agent_settled':
       if (msg.type === 'agent_settled') {
+        // Only a turn that was actually running gets the chime - agent_settled
+        // also arrives for bookkeeping with nothing to report.
+        if (S.isStreaming) notifyTurnDone();
         S.isStreaming = false;
         autoCloseShortsIfOurs();
         // The turn total is stamped after the transcript has been finalised
@@ -2916,8 +3028,10 @@ function renderQueue() {
 const input = $('input');
 
 function autoSize() {
+  // Empty composer: back to a single line. Without this the box kept the height
+  // of whatever had been typed last, leaving a tall empty frame over the chat.
   input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+  input.style.height = input.value.trim() ? Math.min(input.scrollHeight, 200) + 'px' : '';
   syncComposerText();
   // The chat shrinks as the box grows; without this the transcript shifted up
   // and the last thing written (a compaction marker, a tool call) slid out of
@@ -2925,6 +3039,16 @@ function autoSize() {
   if (S.stickToBottom) pinSoon();
 }
 input.addEventListener('input', () => { autoSize(); updateSlashMenu(); });
+// The composer is sized to its content, so it has to be re-measured when the
+// layout width changes (font size setting, window resize, phone rotation).
+window.addEventListener('resize', () => {
+  autoSize();
+  if (!window.matchMedia('(max-width: 760px)').matches) $('sidebar').classList.remove('open');
+});
+// On a phone the sidebar is a drawer: tapping the conversation closes it.
+chat.addEventListener('click', () => {
+  if (window.matchMedia('(max-width: 760px)').matches) $('sidebar').classList.remove('open');
+});
 
 async function sendCurrent() {
   const text = input.value.trim();
@@ -3262,7 +3386,7 @@ function fileKind(f) {
  * agent can read it with its tools. Returns {path, size}. */
 async function uploadFile(file) {
   const data = await readAsDataUrl(file);
-  const d = await (await fetch('/api/upload', {
+  const d = await (await fetch(api('/api/upload'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: file.name, data: data.split(',')[1], mimeType: file.type }),
@@ -3283,7 +3407,7 @@ async function transcribeAudioFile(file) {
   // downloaded on demand), so picking whisper in settings "just works".
   if (SET.sttBackend === 'whisper') await ensureWhisper(true);
   try {
-    const d = await (await fetch('/api/transcribe', {
+    const d = await (await fetch(api('/api/transcribe'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: b64 }),
@@ -3518,7 +3642,20 @@ input.addEventListener('keydown', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !slash.open && !$('ext-dialog').open) {
+  if (e.key !== 'Escape') return;
+  // Menus open from all over - the model picker, the thinking levels, the
+  // instance switcher, the branch list - and until now Escape only closed one of
+  // them, and only while its search box had focus. Escape closes whatever is
+  // open, first, before it means "stop the agent": in a window with no reload
+  // button, a dropdown you cannot dismiss is a trap.
+  const modelMenuOpen = $('model-menu') && !$('model-menu').classList.contains('hidden');
+  if (openMenuEl || modelMenuOpen || slash.open) {
+    closeAllMenus();
+    closeSlashMenu();
+    e.preventDefault();
+    return;
+  }
+  if (!$('ext-dialog').open) {
     if (S.speaking) { speechSynthesis.cancel(); S.speaking = false; $('btn-tts').classList.remove('on'); }
     else if (S.isStreaming) stopAgent();
   }
@@ -3836,7 +3973,7 @@ $('btn-tts').onclick = () => setAutoTts(!S.autoTts);
 
 async function refreshSessions() {
   try {
-    const res = await fetch('/api/sessions');
+    const res = await fetch(api('/api/sessions'));
     const d = await res.json();
     renderSessions(d.sessions || []);
   } catch { /* ignore */ }
@@ -3900,7 +4037,12 @@ function renderSessions(sessions) {
     for (const x of sessions) if (x.parent === parentPath) hiddenForks.add(x.path);
   }
   for (const s of shown) {
-    if (hiddenForks.has(s.path)) continue;
+    // A session started from another one - a forked branch, or a subagent that
+    // went off to work in the background - is not a line in this list any more.
+    // They used to pile up here and push the sessions you actually use off the
+    // top of the sidebar; the count on the parent and the menu in the session
+    // bar keep them one click away (see openBranchesMenu).
+    if (s.parent && byPath.has(s.parent)) { hiddenForks.add(s.path); continue; }
     const item = el('div', 'session-item');
     // A session that was forked off another one: thinner row, smaller grey text
     // and an arrow in front, so the branch structure is visible in the list.
@@ -3923,17 +4065,10 @@ function renderSessions(sessions) {
     if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
     nameRow.appendChild(document.createTextNode(s.name));
     if (kids.length) {
-      // A toggle, not a badge: the branches fold away under their parent.
-      const isCollapsed = !!(SET.forkCollapsed || {})[s.path];
-      const toggle = el('span', 'fork-toggle', `${isCollapsed ? '▸' : '▾'} ${kids.length}`);
-      toggle.title = isCollapsed ? `show ${kids.length} branch${kids.length > 1 ? 'es' : ''}` : 'hide the branches';
-      toggle.onclick = (e) => {
-        e.stopPropagation();
-        SET.forkCollapsed = { ...(SET.forkCollapsed || {}), [s.path]: !isCollapsed };
-        saveSettings();
-        refreshSessions();
-      };
-      nameRow.appendChild(toggle);
+      const badge = el('span', 'fork-toggle', `⑃ ${kids.length}`);
+      badge.title = `${kids.length} session${kids.length > 1 ? 's' : ''} started from this one - click to see them`;
+      badge.onclick = (e) => { e.stopPropagation(); openBranchesMenu(badge, s.path); };
+      nameRow.appendChild(badge);
     }
     item.appendChild(nameRow);
     item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
@@ -3943,8 +4078,47 @@ function renderSessions(sessions) {
   }
 }
 
+/* Sessions started from one session: branches forked off it and subagents that
+ * kept working in the background. One menu, reachable from the session bar and
+ * from the parent's row, so they stay out of the list without being hidden. */
+function branchChildren(path) {
+  return (S.sessionsList || [])
+    .filter((x) => x.parent === path)
+    .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+}
+
+function openBranchesMenu(anchor, path) {
+  const kids = branchChildren(path);
+  if (!kids.length) { toast('Nothing was started from this session'); return; }
+  const cur = S.state.sessionFile;
+  const items = kids.map((k) => ({
+    label: k.name,
+    hint: (k.path === cur ? 'in this session · ' : '') + new Date(k.mtime).toLocaleString(),
+    active: k.path === cur || k.path === S.viewSession,
+    onPick: () => switchToSession(k.path),
+  }));
+  items.push({ sep: true });
+  items.push({ label: 'refresh the list', hint: 're-read the session directory', onPick: () => refreshSessions() });
+  openMenu(anchor, items, { title: `started from this session (${kids.length})`, width: 420 });
+}
+
+function updateBranchesBtn() {
+  const btn = $('btn-branches');
+  if (!btn) return;
+  const cur = S.state.sessionFile;
+  const kids = cur ? branchChildren(cur) : [];
+  btn.classList.toggle('hidden', !kids.length);
+  const count = $('branches-count');
+  if (count) count.textContent = String(kids.length);
+  btn.title = kids.length
+    ? `${kids.length} session${kids.length > 1 ? 's' : ''} started from this one (forks, subagents)`
+    : 'Sessions started from this one';
+  btn.onclick = (e) => { e.stopPropagation(); openBranchesMenu(btn, cur); };
+}
+
 $('session-filter').oninput = () => refreshSessions();
 $('btn-refresh-sessions').onclick = () => refreshSessions();
+updateBranchesBtn();
 
 async function switchToSession(sessionPath) {
   const agentSession = S.state.sessionFile;
@@ -3997,7 +4171,7 @@ async function switchToSession(sessionPath) {
         return;
       }
       try {
-        const r = await fetch('/api/ensure-dir', {
+        const r = await fetch(api('/api/ensure-dir'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: dir }),
@@ -4329,6 +4503,16 @@ function openSettings() {
   $('set-font-size-val').textContent = `${Number(SET.chatFontSize) || 14}px`;
   $('set-chat-opacity').value = SET.chatOpacity == null ? 100 : Number(SET.chatOpacity);
   $('set-chat-opacity-val').textContent = `${SET.chatOpacity == null ? 100 : Number(SET.chatOpacity)}%`;
+  $('set-bg-opacity').value = SET.bgOpacity == null ? 100 : Number(SET.bgOpacity);
+  $('set-bg-opacity-val').textContent = `${SET.bgOpacity == null ? 100 : Number(SET.bgOpacity)}%`;
+  $('set-bg-volume').value = SET.bgVolume == null ? 50 : Number(SET.bgVolume);
+  $('set-bg-volume-val').textContent = `${SET.bgVolume == null ? 50 : Number(SET.bgVolume)}%`;
+  $('set-bg-audio').checked = !!SET.bgAudio;
+  $('set-gamer').checked = !!SET.gamerMode;
+  $('set-done-sound').checked = !!SET.doneSound;
+  $('set-done-notify').checked = !!SET.doneNotify;
+  $('set-done-only-unfocused').checked = SET.doneOnlyUnfocused !== false;
+  refreshLanSetting().catch(() => {});
   const tOut = $('set-text-outline');
   if (tOut) tOut.checked = SET.textOutline !== false;
   const tCol = $('set-outline-color');
@@ -4487,13 +4671,46 @@ function applyBackgroundMedia() {
   const host = $('bg-media');
   const src = SET.themeBg || '';
   if (!host) return;
+  const frame = window.innerWidth / Math.max(1, window.innerHeight);
+  const current = host.querySelector('img, video');
+  // Same source: keep the element. Rebuilding it restarted a background video
+  // from the beginning every time any unrelated setting was saved.
+  if (current && current.getAttribute('src') === src) {
+    applyCrop(current, SET.bgCrop, frame);
+    applyBgAudio(current);
+    return;
+  }
   host.innerHTML = '';
   if (!src) { host.classList.add('hidden'); return; }
-  const frame = window.innerWidth / Math.max(1, window.innerHeight);
   const node = attachCrop(mediaNode(src, 'bg-node'), SET.bgCrop, frame);
   node.onerror = () => toast(isVideoSrc(src) ? 'Background video failed to load' : 'Background image failed to load', 'error');
   host.appendChild(node);
   host.classList.remove('hidden');
+}
+
+/* Volume and mute live on the element, so changing them must not rebuild the
+ * video (which would restart it from the beginning). */
+function applyBgAudio(node) {
+  if (!node || node.tagName !== 'VIDEO') return;
+  node.volume = Math.max(0, Math.min(1, (SET.bgVolume == null ? 50 : Number(SET.bgVolume)) / 100));
+  if (!SET.bgAudio) { node.muted = true; return; }
+  if (!node.muted && !node.paused) return;
+  node.muted = false;
+  node.play().catch(() => { node.muted = true; armBgAudioUnlock(node); });
+}
+
+/* Audible playback needs a user gesture: wait for the first click or key, then
+ * unmute - the setting asked for sound, so it should actually be heard. */
+function armBgAudioUnlock(node) {
+  const unlock = () => {
+    document.removeEventListener('pointerdown', unlock, true);
+    document.removeEventListener('keydown', unlock, true);
+    if (!SET.bgAudio) return;
+    node.muted = false;
+    node.play().catch(() => { /* still blocked; leave it muted */ });
+  };
+  document.addEventListener('pointerdown', unlock, true);
+  document.addEventListener('keydown', unlock, true);
 }
 
 /* The frame aspect is the window's, so a resize changes how much of a cropped
@@ -4517,6 +4734,73 @@ window.addEventListener('resize', () => {
  * Stored crop: { v:2, fx, fy, z } - fx/fy are -1..1 across the available pan
  * range (0 = centred), z is the zoom relative to the cover fit. Rendering uses
  * the same maths as before (translate + scale over a centred cover layout). */
+/* Gamer mode: the accent drifts through the colour wheel, one full turn every
+ * 16 seconds. Slow enough to read text over, fast enough to be alive. One timer
+ * for the page, and it stops the moment the setting goes off. */
+let gamerTimer = null;
+function startGamerAccent() {
+  if (gamerTimer) return;
+  const root = document.documentElement.style;
+  const t0 = Date.now();
+  const tick = () => {
+    const hue = (((Date.now() - t0) / 16000) * 360) % 360;
+    root.setProperty('--accent', `hsl(${hue.toFixed(0)} 80% 62%)`);
+    root.setProperty('--accent-dim', `hsl(${hue.toFixed(0)} 55% 28%)`);
+  };
+  tick();
+  gamerTimer = setInterval(tick, 120);
+}
+function stopGamerAccent() {
+  if (!gamerTimer) return;
+  clearInterval(gamerTimer);
+  gamerTimer = null;
+}
+
+/* ── "the agent has finished" ─────────────────────────────────────────────
+ * A turn often ends while you are looking at another window entirely. A short
+ * two-note chime and an optional desktop notification say so. Both stay off
+ * until they are switched on in Settings > General. */
+function playDoneSound() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const t = ctx.currentTime + 0.01;
+    [[784, 0], [1175, 0.13]].forEach(([freq, at]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t + at);
+      gain.gain.exponentialRampToValueAtTime(0.16, t + at + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + at + 0.3);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t + at);
+      osc.stop(t + at + 0.34);
+    });
+    setTimeout(() => { ctx.close().catch(() => { /* already closed */ }); }, 1200);
+  } catch { /* no audio available */ }
+}
+
+function notifyTurnDone() {
+  const hidden = !document.hasFocus() || document.visibilityState !== 'visible';
+  if (SET.doneOnlyUnfocused !== false && !hidden) return;
+  if (SET.doneSound) playDoneSound();
+  if (!SET.doneNotify) return;
+  try {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') {
+      const name = SET.agentName || 'pi';
+      const session = ($('session-name') && $('session-name').value.trim()) || '';
+      const note = new Notification(`${name} finished`, { body: session || 'The agent finished its turn.', tag: 'piwebui-done', silent: true });
+      note.onclick = () => { try { window.focus(); note.close(); } catch { /* ignore */ } };
+    } else if (Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  } catch { /* notifications unavailable */ }
+}
+
 let cropState = null;
 
 /* Older crops stored object-position percentages; convert them on the way in. */
@@ -4833,7 +5117,7 @@ async function loadSystemFonts() {
   if (!list) return;
   if (systemFontsLoaded) return;
   try {
-    const d = await (await fetch('/api/system-fonts')).json();
+    const d = await (await fetch(api('/api/system-fonts'))).json();
     const fonts = d.fonts || [];
     list.innerHTML = '';
     for (const f of fonts) list.appendChild(el('option', null, f));
@@ -4874,6 +5158,88 @@ $('set-chat-opacity').oninput = (e) => {
   applySettings();
 };
 $('set-chat-opacity').onchange = () => saveSettings();
+
+/* background transparency / sound / gamer mode / done indicators / network */
+$('set-bg-opacity').oninput = (e) => {
+  SET.bgOpacity = parseInt(e.target.value, 10);
+  $('set-bg-opacity-val').textContent = `${SET.bgOpacity}%`;
+  applySettings();
+};
+$('set-bg-opacity').onchange = () => saveSettings();
+$('set-bg-volume').oninput = (e) => {
+  SET.bgVolume = parseInt(e.target.value, 10);
+  $('set-bg-volume-val').textContent = `${SET.bgVolume}%`;
+  applyBgAudio(document.querySelector('#bg-media video'));
+};
+$('set-bg-volume').onchange = () => saveSettings();
+$('set-bg-audio').onchange = (e) => {
+  SET.bgAudio = e.target.checked;
+  saveSettings();
+  applyBgAudio(document.querySelector('#bg-media video'));
+  if (SET.bgAudio) toast('Background sound follows the volume slider — browsers only allow it after you click the page');
+};
+$('set-gamer').onchange = (e) => { SET.gamerMode = e.target.checked; saveSettings(); };
+$('set-done-sound').onchange = (e) => {
+  SET.doneSound = e.target.checked;
+  saveSettings();
+  if (SET.doneSound) playDoneSound();   // so you can hear what you just enabled
+};
+$('set-done-notify').onchange = (e) => {
+  SET.doneNotify = e.target.checked;
+  saveSettings();
+  if (SET.doneNotify && 'Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission().then((perm) => {
+      toast(perm === 'granted' ? 'Notifications enabled' : 'Notifications are blocked in this browser', perm === 'granted' ? undefined : 'warning');
+    });
+  }
+};
+$('set-done-only-unfocused').onchange = (e) => {
+  SET.doneOnlyUnfocused = e.target.checked;
+  saveSettings();
+};
+$('set-lan').onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    const d = await fetch(api('/api/lan'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lan: on }),
+    }).then((r) => r.json());
+    if (d.error) throw new Error(d.error);
+    toast(on ? `Network access on${d.url ? ` — ${d.url}` : ''}` : 'Network access off (this machine only)');
+    refreshLanSetting().catch(() => {});
+  } catch (err) {
+    // Moving the listening socket closes connections, so the answer can be lost
+    // even though the switch worked; ask the bridge before calling it a failure.
+    await new Promise((r) => setTimeout(r, 600));
+    try {
+      const d = await fetch(api('/api/lan')).then((r) => r.json());
+      if (!!d.lan === on) { toast(on ? 'Network access on' : 'Network access off (this machine only)'); refreshLanSetting().catch(() => {}); return; }
+    } catch { /* still unreachable */ }
+    e.target.checked = !on;
+    toast(`Could not change network access: ${err.message}`, 'error');
+  }
+};
+
+/* Network access is a file the bridge reads at startup (bridge/lan.json) and
+ * rewrites live, so this reports the bridge's own view rather than a guess. */
+async function refreshLanSetting() {
+  const box = $('set-lan');
+  const hint = $('lan-hint');
+  if (!box && !hint) return;
+  try {
+    const d = await fetch(api('/api/lan')).then((r) => r.json());
+    if (box) box.checked = !!d.lan;
+    if (hint) {
+      hint.textContent = d.lan
+        ? `Reachable from your network${d.url ? ` at ${d.url}` : ''}. Anyone who can reach it can drive this agent — there is no login.`
+          + (d.envOverride ? ' (PI_WEBUI_HOST is set, so it wins on the next start.)' : '')
+        : 'Local only. Turning this on lets every device on your network drive this agent — there is no login.';
+    }
+  } catch {
+    if (hint) hint.textContent = 'Could not read the bridge setting.';
+  }
+}
 
 /* text outline + avatar size + typing */
 $('set-text-outline').onchange = (e) => { SET.textOutline = e.target.checked; saveSettings(); };
@@ -4937,7 +5303,7 @@ async function loadPiProviders() {
   list.innerHTML = '';
   list.appendChild(el('div', 'prov-empty', 'loading…'));
   try {
-    const d = await fetch('/api/pi-providers').then((r) => r.json());
+    const d = await fetch(api('/api/pi-providers')).then((r) => r.json());
     list.innerHTML = '';
     const provs = Object.entries(d.providers || {});
     if (!provs.length) {
@@ -4955,7 +5321,7 @@ async function loadPiProviders() {
       btn.onclick = async () => {
         if (!confirm(`Remove provider "${id}" from pi's models.json?`)) return;
         try {
-          const r = await fetch(`/api/pi-providers?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+          const r = await fetch(api(`/api/pi-providers?id=${encodeURIComponent(id)}`), { method: 'DELETE' });
           const out = await r.json();
           if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
           toast(`Provider "${id}" removed`);
@@ -4978,7 +5344,7 @@ $('btn-prov-discover').onclick = async () => {
   const btn = $('btn-prov-discover');
   btn.disabled = true;
   try {
-    const r = await fetch('/api/probe-models', {
+    const r = await fetch(api('/api/probe-models'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
@@ -5002,7 +5368,7 @@ $('btn-prov-test').onclick = async () => {
   btn.disabled = true;
   btn.textContent = 'testing…';
   try {
-    const r = await fetch('/api/probe-provider', {
+    const r = await fetch(api('/api/probe-provider'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -5043,7 +5409,7 @@ $('btn-prov-add').onclick = async () => {
   const btn = $('btn-prov-add');
   btn.disabled = true;
   try {
-    const r = await fetch('/api/pi-providers', {
+    const r = await fetch(api('/api/pi-providers'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, baseUrl, api, apiKey: apiKey || undefined, models }),
@@ -5079,7 +5445,7 @@ async function loadAuthProviders() {
   const list = $('auth-logged-in');
   if (!dl || !status || !list) return;
   try {
-    const d = await fetch('/api/auth-providers').then((r) => r.json());
+    const d = await fetch(api('/api/auth-providers')).then((r) => r.json());
     authProviders = d.providers || {};
     dl.innerHTML = '';
     for (const id of Object.keys(authProviders)) dl.appendChild(el('option', null, id));
@@ -5177,7 +5543,7 @@ async function authRestartAgent() {
 async function authLogout(id) {
   if (!confirm(`Log out "${id}"?\nRemoves its credentials from auth.json (like /logout).`)) return;
   try {
-    const r = await fetch(`/api/auth-login?provider=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const r = await fetch(api(`/api/auth-login?provider=${encodeURIComponent(id)}`), { method: 'DELETE' });
     const out = await r.json();
     if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
     await authRestartAgent();
@@ -5198,7 +5564,7 @@ $('btn-auth-login').onclick = async () => {
   if (!id) { toast('Enter the provider id first', 'warning'); return; }
   if (!key) { toast('Enter the API key', 'warning'); return; }
   try {
-    const r = await fetch('/api/auth-login', {
+    const r = await fetch(api('/api/auth-login'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: id, key }),
@@ -5720,7 +6086,7 @@ async function deleteSession(s) {
   });
   if (!ok) return;
   try {
-    const r = await fetch('/api/session-delete', {
+    const r = await fetch(api('/api/session-delete'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: s.path }),
@@ -5732,7 +6098,7 @@ async function deleteSession(s) {
       // to where it was forked from when the file says, otherwise to the most
       // recent other session - either way, not a blank one.
       const parent = await sessionParent(s.path);
-      const rest = (await fetch('/api/sessions').then((x) => x.json()).catch(() => ({ sessions: [] })).then((d2) => (d2.sessions || [])))
+      const rest = (await fetch(api('/api/sessions')).then((x) => x.json()).catch(() => ({ sessions: [] })).then((d2) => (d2.sessions || [])))
         .filter((x) => x.path !== s.path)
         .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
       const target = parent && rest.some((x) => x.path === parent) ? parent : (rest[0] && rest[0].path);
@@ -5932,15 +6298,116 @@ async function pollInstances() {
     }
   }));
   updateInstanceBtn();
-  if (openMenuEl && openMenuEl._instances) openInstanceMenu(openMenuEl._anchor, true);
+  if (openMenuEl && openMenuEl._instances) refreshInstanceMenuInPlace(openMenuEl);
+}
+
+/* The other instance's name and picture, for the switcher. /api/instance-card
+ * answers cross-origin (like /api/health), so this works before switching. */
+/* Asking each instance who it is. Concurrent calls share one round of requests:
+ * the menu, the poll and the switcher itself all want this, and a call that
+ * triggers another call is how this turned into an endless fetch loop (Firefox
+ * said so out loud, and the page had to be closed). */
+let instanceCardsPromise = null;
+function refreshInstanceCards() {
+  if (instanceCardsPromise) return instanceCardsPromise;
+  instanceCardsPromise = loadInstanceCards().finally(() => { instanceCardsPromise = null; });
+  return instanceCardsPromise;
+}
+
+async function loadInstanceCards() {
+  await Promise.all(allInstances().map(async (inst) => {
+    if (inst.url === location.origin) return;
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 4000);
+      const d = await fetch(`${inst.url}/api/instance-card`, { signal: ctl.signal, cache: 'no-store' }).then((r) => r.json());
+      clearTimeout(t);
+      if (d && d.ok) S.instanceCards[inst.url] = d;
+    } catch { /* unreachable: keep whatever we had */ }
+  }));
+}
+
+function instanceAvatar(inst) {
+  if (!inst) return null;
+  if (inst.url === location.origin) return SET.avatar || null;
+  const card = S.instanceCards[inst.url];
+  return (card && card.avatar) || null;
 }
 
 function updateInstanceBtn() {
   const btn = $('btn-instance');
   if (!btn) return;
-  const extra = allInstances().length - 1;
-  btn.textContent = ((SET.agentName || '').trim() || 'this machine') + (extra ? ` +${extra}` : '');
-  btn.title = 'pi agent instances - click to switch or add another one';
+  const nameEl = $('instance-name');
+  const subEl = $('instance-sub');
+  const cur = S.remote ? (S.remoteName || S.remote) : ((SET.agentName || '').trim() || 'this machine');
+  if (nameEl) nameEl.textContent = cur;
+  const st = instanceStatus(S.remote || location.origin);
+  if (subEl) {
+    const others = allInstances().length - 1;
+    subEl.textContent = S.remote
+      ? (st && st.busy ? 'another instance · working' : st && st.ok === false ? 'another instance · unreachable' : 'another instance')
+      : `this machine${others ? ` · ${others} other${others > 1 ? 's' : ''}` : ''}`;
+  }
+  btn.title = S.remote
+    ? `Looking at ${cur} — click to switch back or elsewhere`
+    : 'pi agent instances - click to switch or add another one';
+  btn.classList.toggle('remote', !!S.remote);
+  updateRemoteBanner();
+}
+
+/* ── looking at another instance without leaving this one ─────────────────
+ * The local bridge proxies to it (/proxy/<origin>/...), so the page stays on this
+ * origin: the switcher keeps working even when that machine is off, which is the
+ * difference between a dead end and a click back. */
+async function enterRemoteMode(inst) {
+  if (!inst) return;
+  if (inst.url === location.origin) return exitRemoteMode();
+  let origin;
+  try { origin = new URL(inst.url).origin; } catch { toast('That instance URL does not look right', 'error'); return; }
+  S.remote = origin;
+  S.remoteName = inst.name || origin;
+  try { sessionStorage.setItem('piwebui-remote', JSON.stringify({ url: origin, name: S.remoteName })); } catch { /* private mode */ }
+  closeMenu();
+  toast(`Looking at ${S.remoteName} (through this machine)`);
+  await reloadForInstance();
+}
+
+function exitRemoteMode() {
+  if (!S.remote) return;
+  S.remote = null;
+  S.remoteName = null;
+  try { sessionStorage.removeItem('piwebui-remote'); } catch { /* ignore */ }
+  toast('Back to this machine');
+  reloadForInstance();
+}
+
+/* Everything on screen comes from whichever instance we are looking at, so the
+ * socket is reopened (through the proxy) and the whole UI re-read. */
+async function reloadForInstance() {
+  updateInstanceBtn();
+  S.sessionsList = [];
+  S.forkEntries = [];
+  try { $('chat').replaceChildren(); } catch { /* nothing rendered yet */ }
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch { /* already gone */ }
+  connect();
+}
+
+function updateRemoteBanner() {
+  const b = $('remote-banner');
+  if (!b) return;
+  if (!S.remote) { b.classList.add('hidden'); b.textContent = ''; return; }
+  const st = instanceStatus(S.remote);
+  // The socket is the honest signal here: an instance that is switched off has no
+  // status to read (it never appears in the poll), but there is nothing connected.
+  const down = (typeof ws === 'undefined' || !ws || ws.readyState !== 1) || (st && st.ok === false);
+  b.classList.remove('hidden');
+  b.replaceChildren();
+  b.appendChild(el('span', null,
+    `Looking at “${S.remoteName || S.remote}” — sessions, chat and models are that machine's.`
+    + (down ? ' It is not answering right now.' : '')));
+  const back = el('button', 'btn small', 'switch back to this machine');
+  back.onclick = () => exitRemoteMode();
+  b.appendChild(back);
 }
 
 function openInstanceMenu(anchor, force) {
@@ -5948,43 +6415,123 @@ function openInstanceMenu(anchor, force) {
   for (const inst of allInstances()) {
     const st = instanceStatus(inst.url);
     const here = inst.url === location.origin;
+    const looking = S.remote ? inst.url === S.remote : here;
+    const card = S.instanceCards[inst.url];
     items.push({
-      label: (here ? '● ' : '') + inst.name + (st && st.name ? `  (${st.name})` : ''),
-      hint: here ? 'this window' : String(inst.url).replace(/^https?:\/\//, ''),
+      avatar: instanceAvatar(inst),
+      avatarPlaceholder: !instanceAvatar(inst),
+      instanceUrl: inst.url,
+      label: (looking ? '● ' : '') + inst.name + (!here && card && card.name ? `  (${card.name})` : ''),
+      hint: here ? 'this machine' : String(inst.url).replace(/^https?:\/\//, ''),
       dot: st && st.busy ? 'live-dot' : (st && st.ok ? null : 'off-dot'),
-      active: here,
-      onPick: () => switchInstance(inst),
+      active: looking,
+      onPick: () => (here ? exitRemoteMode() : enterRemoteMode(inst)),
+      onContext: here ? null : (it, row) => openInstanceContextMenu(row, inst),
     });
   }
   items.push({ sep: true });
   items.push({ label: 'add another pi agent…', hint: 'other machine or port', onPick: () => addInstance() });
-  if ((SET.instances || []).length) {
-    items.push({ sep: true, group: 'remove' });
-    for (const i of SET.instances) {
-      items.push({
-        label: `remove ${i.name}`,
-        hint: i.url.replace(/^https?:\/\//, ''),
-        danger: true,
-        onPick: () => {
-          SET.instances = (SET.instances || []).filter((x) => x.id !== i.id);
-          saveSettings();
-          toast(`Removed ${i.name}`);
-        },
-      });
-    }
-  }
-  const menu = openMenu(anchor, items, { title: 'pi agents', width: 360, force });
+  const menu = openMenu(anchor, items, { title: 'pi agents', width: 360, force, hint: 'right-click an instance to remove it' });
   if (menu) menu._instances = true;
+  // Names and pictures arrive after the first open; redraw once they are in.
+  // Pictures arrive a moment later. Update the rows that are on screen instead of
+  // opening the menu again: re-opening re-ran this function, which fetched again,
+  // which re-opened again - a loop with no yield, and the page stopped responding.
+  refreshInstanceCards().then(() => {
+    if (menu && menu.isConnected) refreshInstanceMenuInPlace(menu);
+  }).catch(() => {});
+}
+
+/* Refresh what the open instance menu shows - the status dots and the pictures -
+ * without touching its structure, so nothing the user is pointing at moves. */
+function refreshInstanceMenuInPlace(menu) {
+  menu = menu || (openMenuEl && openMenuEl._instances ? openMenuEl : null);
+  if (!menu) return;
+  for (const inst of allInstances()) {
+    const row = menu.querySelector(`.model-item[data-instance="${cssEscape(inst.url)}"]`);
+    if (!row) continue;
+    const st = instanceStatus(inst.url);
+    const dot = row.querySelector('.menu-dot');
+    const wantDot = st && st.busy ? 'live-dot' : (st && st.ok ? null : 'off-dot');
+    if (dot) {
+      if (wantDot) dot.className = `menu-dot ${wantDot}`;
+      else dot.remove();
+    } else if (wantDot) {
+      row.insertBefore(el('span', `menu-dot ${wantDot}`), row.querySelector('.model-label'));
+    }
+    setRowAvatar(row, instanceAvatar(inst));
+  }
+}
+
+/* Swap the circle at the front of a row for the right picture, whether it is
+ * currently a placeholder span or an img with a stale source. */
+function setRowAvatar(row, src) {
+  const current = row.querySelector('.menu-avatar');
+  if (!src) {
+    if (current && current.tagName === 'IMG') {
+      const span = el('span', 'menu-avatar empty', '');
+      current.replaceWith(span);
+    }
+    return;
+  }
+  if (current && current.tagName === 'IMG') {
+    if (current.getAttribute('src') !== src) current.src = src;
+    return;
+  }
+  const img = el('img', 'menu-avatar');
+  img.src = src;
+  img.alt = '';
+  if (current) current.replaceWith(img);
+  else row.insertBefore(img, row.firstChild);
+}
+
+/* Attribute selectors need escaping: instance URLs are full of : and / . */
+function cssEscape(value) {
+  if (window.CSS && CSS.escape) return CSS.escape(value);
+  return String(value).replace(/["\\]/g, '\\$&');
+}
+
+/* Right-click an instance: switch to it here, open its own page, or take it off
+ * the list. Removal used to be a row at the bottom of the menu, which made the
+ * list of agents double as a list of delete buttons. */
+function openInstanceContextMenu(row, inst) {
+  const items = [
+    { label: `switch to ${inst.name} here`, hint: 'this window, through this machine', onPick: () => enterRemoteMode(inst) },
+    { label: 'open its own page', hint: String(inst.url).replace(/^https?:\/\//, ''), onPick: () => openInstancePage(inst) },
+    { sep: true },
+    {
+      label: `remove ${inst.name} from the list`,
+      hint: 'stops showing up in the switcher',
+      danger: true,
+      onPick: async () => {
+        const yes = await askDialog({
+          title: `Remove “${inst.name}”?`,
+          body: 'It stays reachable at its address; it just leaves this list.',
+          okLabel: 'remove',
+          danger: true,
+        });
+        if (!yes) return;
+        SET.instances = (SET.instances || []).filter((x) => x.url !== inst.url);
+        saveSettings();
+        updateInstanceBtn();
+        toast(`Removed ${inst.name}`);
+      },
+    },
+  ];
+  openMenu(row, items, { title: inst.name, width: 320, force: true, at: { x: row.getBoundingClientRect().left, y: row.getBoundingClientRect().bottom } });
+}
+
+/* Opening the other instance's own page navigates away and hands the URL to the
+ * other bridge, which adds us to its list so there is a way back. */
+function openInstancePage(inst) {
+  const me = (SET.agentName || '').trim() || 'this machine';
+  const sep = inst.url.includes('?') ? '&' : '?';
+  location.href = `${inst.url}${sep}from=${encodeURIComponent(location.origin)}&fromName=${encodeURIComponent(me)}`;
 }
 
 function switchInstance(inst) {
-  if (inst.url === location.origin) return;
-  toast(`Switching to ${inst.name}…`);
-  // Tell the other instance where we came from: without it you could switch away
-  // and had no way back, because its list knew nothing about this one.
-  const me = SET.instanceName || 'this machine';
-  const sep = inst.url.includes('?') ? '&' : '?';
-  location.href = `${inst.url}${sep}from=${encodeURIComponent(location.origin)}&fromName=${encodeURIComponent(me)}`;
+  if (!inst || inst.url === location.origin) return exitRemoteMode();
+  return enterRemoteMode(inst);
 }
 
 /* An instance opened through the switcher arrives with ?from=… - add it to the
@@ -6040,8 +6587,19 @@ function addInstance() {
 wireTypeAnywhere();
 applySettings();
 populateTtsVoiceSelect();
+/* A reload keeps you on the instance you were looking at - a proxied page is
+ * still this origin, and losing that on refresh would be worse than the
+ * navigation this replaced. */
+try {
+  const remembered = JSON.parse(sessionStorage.getItem('piwebui-remote') || 'null');
+  if (remembered && remembered.url && remembered.url !== location.origin) {
+    S.remote = remembered.url;
+    S.remoteName = remembered.name || remembered.url;
+  }
+} catch { /* private mode */ }
 loadServerSettings().then(() => maybeShowSetup());
 connect();
+updateInstanceBtn();
 
 /* thinking level: the button opens the same dropdown as the model picker */
 if ($('thinking-btn')) $('thinking-btn').onclick = (e) => { e.stopPropagation(); openThinkingMenu(); };
