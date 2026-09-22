@@ -387,7 +387,9 @@ const DEFAULT_SETTINGS = {
   doneNotify: false,      // desktop / Windows notification
   doneOnlyUnfocused: true,// ...and only while this window is not the active one
   // Appearance
-  gamerMode: false,       // let the accent colour drift through the rainbow
+  gamerMode: false,       // rainbow accent (settings > appearance)
+  gamerSpeed: 16,         // seconds for one full colour cycle
+  sessionFolders: [],     // [{ id, name, paths: [] }] — hand-made session groups
   bgOpacity: 100,         // 0-100 — background image / video transparency
   bgAudio: false,         // play a background video's audio
   bgVolume: 50,           // 0-100
@@ -458,6 +460,7 @@ function applySettings() {
   // it reads as a living theme rather than a strobe. Everything that uses
   // --accent (buttons, rings, scrollbars, highlights) follows along.
   if (SET.gamerMode) startGamerAccent(); else stopGamerAccent();
+  updateFavicon();
   applyBackgroundMedia();
   // Background transparency, separate from the panels': a bright photo can be
   // unusable at full strength even with the chat itself fully transparent.
@@ -478,7 +481,13 @@ function applySettings() {
   };
   const fontCss = FONT_MAP[SET.fontFamily] ?? (SET.fontFamily ? `"${SET.fontFamily}", sans-serif` : FONT_MAP['']);
   rootStyle.setProperty('--chat-font', fontCss);
-  rootStyle.setProperty('--chat-size', `${Number(SET.chatFontSize) || 14}px`);
+  const chatPx = Number(SET.chatFontSize) || 14;
+  rootStyle.setProperty('--chat-size', `${chatPx}px`);
+  // Chat text is written in fixed sizes all over the stylesheet (thinking
+  // blocks, code, tool cards, the message header). They all multiply by this
+  // ratio, so the size setting moves the whole conversation together instead of
+  // only the plain paragraphs.
+  rootStyle.setProperty('--chat-scale', String(chatPx / 14));
   // shorts button follows the chosen feed
   const reels = $('btn-reels');
   if (reels) {
@@ -536,6 +545,13 @@ const S = {
   live: null,              // in-flight assistant render {root, text, thinking, tools}
   toolCards: new Map(),    // toolCallId -> {card, body, stateEl}
   viewSession: null,       // session path being viewed (null = the agent's own session)
+  viewSubagent: null,      // subagent run whose own session is open (null = none)
+  subagentViewCount: 0,    // messages rendered in that child session
+  runStartTs: null,        // when the task you sent started (the total clock)
+  runMs: null,             // how long the last task took
+  lastRun: null,           // { ms, ts } of that task
+  collapsedForks: loadForkCollapse(),  // parent session path -> true when folded away
+  agentBusy: null,         // last /api/sessions "busy" (null = not known yet)
   liveDetached: null,      // { path, frag } — running session's live DOM, parked while viewing another
   sessionsList: [],        // last /api/sessions payload (path -> name lookup for the view banner)
   compactionLive: null,    // live "compacting…" block {root, t}
@@ -740,6 +756,16 @@ async function onSessionResumed(path) {
     if (S.viewSession) await switchToSession(path);
     else await refreshMessages();
     refreshSessions().catch(() => {});
+    // The resume is announced as soon as the switch *starts*: an agent in a
+    // container can still be reading a long session when pi answers
+    // get_messages, and the answer is then the fresh, empty context it started
+    // in - so the page kept an empty transcript until something else re-rendered
+    // it. Keep looking for a moment, and stop as soon as there is something.
+    for (let attempt = 0; !S.viewSession && attempt < 6 && !chat.children.length; attempt++) {
+      await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+      if (S.isStreaming) break;
+      await refreshMessages();
+    }
   } catch (e) {
     console.warn('could not pick up the resumed session:', e.message);
   }
@@ -769,6 +795,7 @@ async function initSession(resumeLast) {
     await refreshCommands();
     await refreshBuiltinCommands();
     await refreshMessages();
+    restoreRunClock();
     await refreshForkable();
     await refreshSessions();
     await refreshStats();
@@ -870,40 +897,157 @@ function applyState(d) {
   }
 }
 
+/* ── pretty selects ──────────────────────────────────────────────────────
+ * The settings still used the browser's own <select>, which looks nothing like
+ * the dropdown the model picker opens. Each one keeps its element (every handler
+ * and every `sel.value = x` in the app goes on working) but shows a button that
+ * opens the shared menu instead - and the button's label follows the element,
+ * including changes made from code, via a property hook. */
+function prettySelect(sel) {
+  if (!sel || sel._pretty) return;
+  sel._pretty = true;
+  const btn = el('button', 'btn pill pretty-select');
+  btn.type = 'button';
+  const label = () => {
+    const o = sel.selectedOptions && sel.selectedOptions[0];
+    const text = (o && o.textContent) || (sel.options[0] && sel.options[0].textContent) || '(none)';
+    btn.textContent = text.trim();
+    btn.title = text.trim();
+    btn.classList.toggle('disabled', !!sel.disabled);
+    btn.disabled = !!sel.disabled;
+  };
+  const open = () => {
+    const items = [...sel.options].map((o) => ({
+      label: (o.textContent || '').trim(),
+      hint: o.value && o.value !== o.textContent ? o.value : '',
+      active: o.value === sel.value,
+      onPick: () => {
+        sel.value = o.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        label();
+      },
+    }));
+    openMenu(btn, items, { title: (btn.getAttribute('data-title') || sel.title || 'choose').toLowerCase(), width: 360 });
+  };
+  btn.onclick = (e) => { e.stopPropagation(); open(); };
+  // keep the label right when the app sets the value itself
+  try {
+    const proto = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+    Object.defineProperty(sel, 'value', {
+      configurable: true,
+      get() { return proto.get.call(sel); },
+      set(v) { proto.set.call(sel, v); label(); },
+    });
+  } catch { /* a browser without the descriptor: the label still follows the user */ }
+  sel.addEventListener('change', label);
+  sel.classList.add('pretty-source');
+  // Inside a wrapper, so the pair of them is ONE cell of the settings grid: a
+  // button inserted next to the select added a second cell and shifted every
+  // label/control pair below it (which is what scrambled the settings layout).
+  const wrap = el('span', 'pretty-wrap');
+  sel.parentNode.insertBefore(wrap, sel);
+  wrap.appendChild(sel);
+  wrap.appendChild(btn);
+  label();
+}
+
+/* Every plain dropdown in the settings dialog, once. */
+function prettifySettingsSelects() {
+  const root = $('settings-dialog');
+  if (!root) return;
+  for (const sel of root.querySelectorAll('select')) {
+    if (sel.id === 'model-select' || sel.id === 'thinking-select') continue;
+    prettySelect(sel);
+  }
+}
+
 function syncSelect(sel, value) {
   if (value && [...sel.options].some((o) => o.value === value)) sel.value = value;
   if (sel && sel.id === 'model-select') updateModelBtn();
   if (sel && sel.id === 'thinking-select') updateThinkingBtn();
 }
 
+/* What is highlighted right now. selection.toString() returns an empty string in
+ * some frames even when a range is set, so fall back to the range itself. */
+function selectedText() {
+  try {
+    const sel = window.getSelection && window.getSelection();
+    if (!sel || !sel.rangeCount) return '';
+    const t = String(sel) || (sel.getRangeAt(0) && sel.getRangeAt(0).toString()) || '';
+    return t.trim();
+  } catch { return ''; }
+}
+
+/* Clipboard with feedback. writeText only works on a secure origin and can be
+ * rejected, which used to leave the copy buttons doing nothing at all. */
+async function copyText(text, okMsg = 'Copied') {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMsg);
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      toast(okMsg);
+    } catch { toast('Could not copy to the clipboard', 'error'); }
+  }
+}
+
 /* ── shared dropdown menu ─────────────────────────────────────────────────
  * The model picker's look - search box, scrollable rows, groups, accent on the
  * current entry - reused for the thinking levels, the session and turn context
  * menus and the instance switcher, so they all behave the same way. */
-let openMenuEl = null;
+/* Open dropdowns, oldest first. A right-click menu stacks on top of the menu it
+ * was opened from instead of replacing it: removing an instance from inside the
+ * switcher used to close the list you were working in. */
+const MENUS = [];
+let openMenuEl = null;   // the topmost one, for the code that only reads it
 function closeMenu() {
-  if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; }
+  const m = MENUS.pop();
+  if (!m) { openMenuEl = null; return; }
+  if (m._subagents) S.subagentMenuOpen = false;
+  m.remove();
+  openMenuEl = MENUS[MENUS.length - 1] || null;
 }
 
-/* Only one dropdown may be on screen. Every opener goes through this, and a
- * capture-phase pointerdown closes whichever menu was not clicked - so the
- * model menu and the thinking menu can never overlap, whatever route opened
- * them. */
+/* Every opener goes through this, and a capture-phase pointerdown closes whatever
+ * was not clicked - so two dropdowns can never sit on screen together by
+ * accident, whatever route opened them. A click on an open menu, or on the
+ * button that opened it, is left alone: the button's own click handler decides,
+ * which is what makes a second click on the same button close its menu. That
+ * check is why the model button toggled and the thinking level and the instance
+ * switcher did not - this handler closed their menu on pointerdown, so by the
+ * time the click arrived there was nothing left to toggle and it reopened. */
 function closeAllMenus() {
-  closeMenu();
+  while (MENUS.length) closeMenu();
   toggleModelMenu(false);
 }
 document.addEventListener('pointerdown', (e) => {
   const t = e.target;
   if (!t || !t.closest) return;
-  if (!t.closest('#model-menu') && !t.closest('#model-btn')) toggleModelMenu(false);
-  if (!t.closest('.model-menu')) closeMenu();
+  // The model picker is a menu of its own (it has a search box and its own
+  // toggle), so it is not in MENUS - but its button has to be left alone for the
+  // same reason: closing it here meant the click that followed reopened it, and
+  // the button never closed on a second click.
+  const modelAnchor = !!(t.closest('#model-btn') || t.closest('#model-menu'));
+  if (!modelAnchor) toggleModelMenu(false);
+  if (modelAnchor) return;
+  if (MENUS.some((m) => m.contains(t) || (m._anchor && m._anchor.contains(t)))) return;
+  closeAllMenus();
 }, true);
 
 function openMenu(anchor, items, opts = {}) {
-  const wasOpenFor = openMenuEl && openMenuEl._anchor === anchor;
-  closeMenu();
-  toggleModelMenu(false);
+  const wasOpenFor = MENUS.length > 0 && MENUS[MENUS.length - 1]._anchor === anchor;
+  // A submenu (the right-click menu inside the instance switcher) keeps its
+  // parent on screen; anything else replaces whatever was open.
+  if (opts.sub) toggleModelMenu(false);
+  else closeAllMenus();
   if (wasOpenFor && !opts.force) return null;   // clicking the same anchor again closes
   if (!anchor || !items || !items.length) return null;
   const menu = el('div', 'model-menu');
@@ -931,6 +1075,7 @@ function openMenu(anchor, items, opts = {}) {
       if (it.group && it.group !== group) { group = it.group; list.appendChild(el('div', 'model-group', group)); }
       const row = el('div', 'model-item' + (it.active ? ' sel' : '') + (it.danger ? ' danger' : ''));
       if (it.instanceUrl) row.dataset.instance = it.instanceUrl;
+      if (it.id) row.dataset.menuId = String(it.id);
       if (it.avatar || it.avatarPlaceholder) {
         // an instance's own picture, so the switcher shows who is who
         const img = it.avatar ? el('img', 'menu-avatar') : el('span', 'menu-avatar empty', '');
@@ -943,7 +1088,9 @@ function openMenu(anchor, items, opts = {}) {
       row.onclick = (e) => {
         e.stopPropagation();
         if (it.keepOpen) { it.onPick && it.onPick(it); return; }
-        closeMenu();
+        // The whole stack, not just this menu: picking "switch to X" inside an
+        // instance's right-click menu must not leave the switcher open behind it.
+        closeAllMenus();
         it.onPick && it.onPick(it);
       };
       if (it.onContext) {
@@ -957,11 +1104,16 @@ function openMenu(anchor, items, opts = {}) {
   if (search) {
     search.oninput = () => render(search.value);
     search.onkeydown = (e) => {
-      if (e.key === 'Escape') { e.preventDefault(); closeMenu(); }
+      if (e.key === 'Escape') { e.preventDefault(); closeAllMenus(); }
       if (e.key === 'Enter') { const first = list.querySelector('.model-item'); if (first) first.click(); }
     };
   }
-  document.body.appendChild(menu);
+  // A modal <dialog> is in the browser's top layer, so a menu appended to the
+  // body renders *under* it - the settings dropdowns opened behind the dialog and
+  // could not be clicked. Inside the dialog the menu stays on top, and its
+  // `position: fixed` coordinates are still viewport-relative.
+  (document.querySelector('dialog[open]') || document.body).appendChild(menu);
+  MENUS.push(menu);
   openMenuEl = menu;
   const r = anchor.getBoundingClientRect();
   const w = Math.max(200, Math.min(opts.width || 300, window.innerWidth - 24));
@@ -981,7 +1133,7 @@ function openMenu(anchor, items, opts = {}) {
   }
   if (search) search.focus();
   menu.addEventListener('click', (e) => e.stopPropagation());
-  setTimeout(() => document.addEventListener('click', closeMenu, { once: true }), 0);
+  setTimeout(() => document.addEventListener('click', closeAllMenus, { once: true }), 0);
   return menu;
 }
 
@@ -1387,6 +1539,15 @@ async function refreshStats() {
  * authoritative number so the ring fills in real time. */
 function setCtxRing(cu, store = true) {
   if (store) S.ctxStats = cu && cu.tokens != null && cu.contextWindow ? { ...cu } : null;
+  // The agent's own count comes back a little differently each time it is asked
+  // (it recounts the conversation as tool results land), so polling it during a
+  // turn made the ring and the label tick down and then climb again - a
+  // sawtooth. Within one turn the number only goes up.
+  if (cu && cu.tokens != null) {
+    const peak = Math.max(S.ctxTurnPeak || 0, cu.tokens);
+    S.ctxTurnPeak = peak;
+    if (S.isStreaming && peak > cu.tokens) cu = { ...cu, tokens: peak, percent: cu.contextWindow ? (peak / cu.contextWindow) * 100 : cu.percent };
+  }
   const fg = $('ctx-ring-fg');
   const txt = $('ctx-ring-text');
   const label = $('ctx-label');
@@ -1455,13 +1616,14 @@ function usageContextTokens(u) {
 function liveCtxRing(estimatedExtra) {
   if (!S.ctxStats) return;
   const b = S.ctxStats;
+  const peak = S.ctxTurnPeak || 0;
   let tokens;
   const real = usageContextTokens(S.live && S.live.lastUsage);
   if (real != null) {
-    tokens = Math.max(real, S.ctxBaseTokens || 0, S.ctxDisplayTokens || 0);
+    tokens = Math.max(real, S.ctxBaseTokens || 0, S.ctxDisplayTokens || 0, peak);
   } else {
     const estimate = (S.ctxBaseTokens != null ? S.ctxBaseTokens : (b.tokens || 0)) + (estimatedExtra || 0);
-    tokens = Math.max(estimate, S.ctxDisplayTokens || 0);
+    tokens = Math.max(estimate, S.ctxDisplayTokens || 0, peak);
   }
   setCtxRing({ ...b, tokens, percent: b.contextWindow ? (tokens / b.contextWindow) * 100 : null }, false);
 }
@@ -1486,8 +1648,14 @@ function updateTotals(extraUsage) {
 
 /* ───────────────────────── chat rendering ───────────────────────── */
 
+/* The conversation scrolls in #chat-scroll (see the stylesheet): the scrollbar
+ * reaches the bottom of the window and does not move when the composer grows.
+ * Everything that measures or moves the reading position goes through this. */
+function chatScroller() { return $('chat-scroll') || chat; }
+
 function atBottom(slack = 60) {
-  return chat.scrollHeight - chat.scrollTop - chat.clientHeight < slack;
+  const sc = chatScroller();
+  return sc.scrollHeight - sc.scrollTop - sc.clientHeight < slack;
 }
 
 /* Where does a transcript node go? Normally the chat. While another session is
@@ -1512,12 +1680,13 @@ function scrollBottom(force) {
   if (!force && S.userScrolling) return; // never pin from under an active wheel/touch gesture
   if (force || S.stickToBottom) {
     lastProgrammaticScroll = Date.now();
-    chat.scrollTop = chat.scrollHeight;
+    const sc = chatScroller();
+    sc.scrollTop = sc.scrollHeight;
   }
 }
 let lastProgrammaticScroll = 0;
 let userScrollIdle = 0;
-chat.addEventListener('scroll', () => {
+chatScroller().addEventListener('scroll', () => {
   // Only an explicit wheel/touch gesture is trusted as "the user left the
   // bottom". A scroll event that lands just after we pinned is normally the
   // browser reacting to content being inserted above the viewport (the chat
@@ -1526,7 +1695,8 @@ chat.addEventListener('scroll', () => {
   // appeared mid-turn. Real gestures set S.userScrolling and are always
   // honoured, so the guard can be strict here.
   if (!S.userScrolling && Date.now() - lastProgrammaticScroll < 250) return;
-  S.stickToBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
+  const sc = chatScroller();
+  S.stickToBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 60;
 });
 /* Re-pin once the newly inserted content has been laid out. scrollHeight read
  * in the same frame as an insert is stale, so the first pin can land short and
@@ -1540,7 +1710,7 @@ function pinSoon() {
 /* Explicit intent beats the guard above: a wheel-up or a touch drag is
  * unambiguous, so stop pinning before the browser even fires the scroll event.
  * Scrollbar drags are covered by the "dist < 4" check in the scroll handler. */
-chat.addEventListener('wheel', (e) => {
+chatScroller().addEventListener('wheel', (e) => {
   if (e.deltaY < 0) S.stickToBottom = false;
   else if (atBottom()) S.stickToBottom = true;
   S.userScrolling = true;
@@ -1550,9 +1720,9 @@ chat.addEventListener('wheel', (e) => {
     if (atBottom()) S.stickToBottom = true; // settled back at the bottom → follow again
   }, 180);
 }, { passive: true });
-chat.addEventListener('touchstart', () => { S.userScrolling = true; }, { passive: true });
-chat.addEventListener('touchmove', () => { S.stickToBottom = atBottom(); }, { passive: true });
-chat.addEventListener('touchend', () => {
+chatScroller().addEventListener('touchstart', () => { S.userScrolling = true; }, { passive: true });
+chatScroller().addEventListener('touchmove', () => { S.stickToBottom = atBottom(); }, { passive: true });
+chatScroller().addEventListener('touchend', () => {
   S.userScrolling = false;
   S.stickToBottom = atBottom();
 }, { passive: true });
@@ -1592,6 +1762,15 @@ function mediaNode(src, cls) {
     node.volume = Math.max(0, Math.min(1, (SET.bgVolume == null ? 50 : Number(SET.bgVolume)) / 100));
     node.loop = true; node.autoplay = true; node.playsInline = true;
     node.setAttribute('playsinline', '');
+    // A background picture is decoration. Without this the browser offers its
+    // own menu on it - speed, sound, loop, "save video as" - which is useless
+    // for a file the user picked locally, and it swallows the right-click that
+    // should reach the page (spell-check suggestions included).
+    node.controls = false;
+    node.disablePictureInPicture = true;
+    node.setAttribute('disablepictureinpicture', '');
+    node.setAttribute('controlslist', 'nodownload noplaybackrate noremoteplayback');
+    node.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); return false; };
     if (wantsSound) armBgAudioUnlock(node);
   } else {
     node = el('img', cls);
@@ -1605,6 +1784,475 @@ definitions live with the cropper. */
 
 /* Profile image for the chat header, the sidebar and the settings preview.
  * There is no built-in default: with no image set, only the name is shown. */
+/* ── subagents ────────────────────────────────────────────────────────────
+ * pi-subagents runs child agents inside the session. They are jobs with their
+ * own goal, tool, turn and status, and while they run the transcript shows one
+ * tool card - so a fan-out of four looks exactly like a single slow call. The
+ * extension publishes a live snapshot of every run (as a widget line) and the
+ * foreground progress arrives with the tool updates; both land here.
+ *
+ * What the panel shows per run: what it is (agent + label), what it is doing
+ * (state, current tool, turns, tools), for how long, and - on a click - what it
+ * has written so far, read from the extension's own artifact file. */
+/* Tool names that run a child agent inside this session (the pi-subagents
+ * extension registers `subagent`; `task` is the same idea under other names). */
+const SUBAGENT_TOOLS = new Set(['subagent', 'task']);
+
+const SUBAGENT_STATES = {
+  queued: 'queued', running: 'running', pending: 'waiting', complete: 'done', completed: 'done',
+  failed: 'failed', partial: 'partial', paused: 'paused', stopped: 'stopped', rejected: 'rejected',
+  detached: 'in the background', stopping: 'stopping',
+};
+
+function subagentList() {
+  const runs = S.subagents ? [...S.subagents.values()] : [];
+  // Running first, then by when they started.
+  return runs.sort((a, b) => {
+    const ra = /running|pending|queued|stopping/.test(a.state || '') ? 0 : 1;
+    const rb = /running|pending|queued|stopping/.test(b.state || '') ? 0 : 1;
+    if (ra !== rb) return ra - rb;
+    return (b.startedAt || 0) - (a.startedAt || 0);
+  });
+}
+
+function updateSubagentsBtn() {
+  const btn = $('btn-subagents');
+  if (!btn) return;
+  const runs = subagentList();
+  const live = runs.filter(isLiveRun).length;
+  // Only ever on the session the runs came from (and while one of theirs is open).
+  btn.classList.toggle('hidden', runs.length === 0);
+  btn.classList.toggle('active', !!S.viewSubagent);
+  const count = $('subagents-count');
+  if (count) count.textContent = live ? `${live}` : `${runs.length}`;
+  btn.classList.toggle('live', live > 0);
+  btn.title = live
+    ? `${live} subagent${live > 1 ? 's' : ''} running — click to see them`
+    : `${runs.length} subagent${runs.length > 1 ? 's' : ''} finished in this session`;
+}
+
+function noteSubagent(run) {
+  if (!S.subagents) S.subagents = new Map();
+  const id = String(run.id || '');
+  if (!id) return;
+  const cur = S.subagents.get(id) || {};
+  S.subagents.set(id, { ...cur, ...run, id, updatedAt: Date.now() });
+  updateSubagentsBtn();
+}
+
+function setSubagentSnapshot(d) {
+  if (!d || !Array.isArray(d.runs)) return;
+  const seen = new Set();
+  const walk = (node, parent) => {
+    if (!node || !node.id) return;
+    seen.add(String(node.id));
+    const act = node.activity || {};
+    noteSubagent({
+      id: node.id,
+      label: node.label || node.name || act.label || 'subagent',
+      kind: node.kind || 'subagent',
+      state: node.state || act.state || 'running',
+      startedAt: node.startedAt || (S.subagents.get(String(node.id)) || {}).startedAt || Date.now(),
+      endedAt: node.endedAt || null,
+      currentTool: act.currentTool || null,
+      turnCount: act.turnCount || 0,
+      toolCount: act.toolCount || 0,
+      lastActivityAt: node.updatedAt || act.lastActivityAt || null,
+      parent: parent || null,
+      background: true,
+    });
+    for (const kid of node.children || []) walk(kid, String(node.id));
+  };
+  for (const r of d.runs) walk(r, null);
+  // A background run that is no longer in the snapshot has ended (the extension
+  // drops it once it is finished and delivered).
+  for (const [id, run] of [...S.subagents]) {
+    if (run.background && !run.fromDisk && !seen.has(id) && isLiveRun(run)) {
+      noteSubagent({ id, state: run.endedAt ? run.state : 'done' });
+    }
+  }
+  if (S.subagentMenuOpen) refreshSubagentMenu();
+}
+
+function noteSubagentInspect(d) {
+  if (!d) return;
+  const id = String(d.asyncId || d.runId || d.id || '');
+  if (!id) return;
+  noteSubagent({ id, output: d.finalOutput || d.output || '', task: d.task || '', label: d.label || d.agent || '' });
+}
+
+function fmtElapsedShort(ms) {
+  if (!ms || ms < 0) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, '0')}`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`;
+}
+
+function subagentHint(r) {
+  const parts = [];
+  const state = SUBAGENT_STATES[r.state] || r.state || 'running';
+  const live = isLiveRun(r);
+  if (!!S.viewSubagent && String(S.viewSubagent.id) === String(r.id)) parts.push('open');
+  if (live) parts.push(state);
+  else if (state !== 'done') parts.push(state);
+  if (r.currentTool) parts.push(r.currentTool);
+  if (r.turnCount) parts.push(`${r.turnCount} turn${r.turnCount > 1 ? 's' : ''}`);
+  if (r.toolCount) parts.push(`${r.toolCount} tool${r.toolCount > 1 ? 's' : ''}`);
+  // How long it has been running, or how long it took: the panel is repainted
+  // once a second while a run is live, so this counts up in front of you.
+  const startedAt = r.startedAt || 0;
+  const endedAt = r.endedAt || 0;
+  const spent = startedAt ? (live || !endedAt ? Date.now() - startedAt : endedAt - startedAt) : 0;
+  if (spent > 2000) parts.push(live ? `${fmtElapsedShort(spent)} so far` : `took ${fmtElapsedShort(spent)}`);
+  if (r.currentTool && r.currentToolStartedAt) parts.push(`${fmtElapsedShort(Date.now() - r.currentToolStartedAt)} on it`);
+  if (r.totalTokens && r.totalTokens.total) parts.push(`${Math.round(r.totalTokens.total / 1000)}K tok`);
+  if (!live && r.error) parts.push(String(r.error).slice(0, 60));
+  if (r.background) parts.push('background');
+  return parts.join(' · ');
+}
+
+function openSubagentsMenu(anchor) {
+  S.subagentMenuOpen = true;
+  refreshSubagents(true).catch(() => {});   // fresh, not from the last poll
+  ensureTick();
+  const runs = subagentList();
+  const items = [];
+  // While a child's conversation is open, this is how you get back.
+  if (S.viewSubagent) {
+    items.push({ label: '← back to the conversation', hint: `return to the session “${S.viewSubagent.label || 'subagent'}” belongs to`, onPick: () => backFromSubagent() });
+    items.push({ sep: true });
+  }
+  items.push(...runs.map((r) => ({
+    id: `subagent:${r.id}`,
+    label: r.label || 'subagent',
+    hint: subagentHint(r),
+    dot: isLiveRun(r) ? 'live-dot' : (/failed|rejected/.test(r.state || '') ? 'off-dot' : null),
+    keepOpen: true,
+    onPick: () => openSubagentView(r),
+  })));
+  items.push({ sep: true });
+  items.push({ label: 'refresh the list', hint: 're-read what the extension published', onPick: () => { updateSubagentsBtn(); refreshSubagentMenu(); } });
+  const menu = openMenu(anchor, items, { title: `subagents (${runs.length})`, width: 460, force: true, align: 'right' });
+  if (menu) {
+    menu._subagents = true;
+    menu.addEventListener('remove', () => { S.subagentMenuOpen = false; });
+    // The menu is rebuilt from what is known now; a run that finishes while it is
+    // open updates in place (see refreshSubagentMenu).
+    const obs = new MutationObserver(() => { if (!menu.isConnected) { S.subagentMenuOpen = false; obs.disconnect(); } });
+    obs.observe(document.body, { childList: true });
+  }
+}
+
+function refreshSubagentMenu() {
+  const menu = openMenuEl && openMenuEl._subagents ? openMenuEl : null;
+  if (!menu) return;
+  const byId = new Map(subagentList().map((r) => [`subagent:${r.id}`, r]));
+  for (const row of menu.querySelectorAll('.model-item[data-menu-id]')) {
+    const r = byId.get(row.dataset.menuId);
+    if (!r) continue;
+    const hint = row.querySelector('.model-provider');
+    if (hint) hint.textContent = subagentHint(r);
+    const label = row.querySelector('.model-label');
+    if (label) label.textContent = r.label || 'subagent';
+  }
+  updateSubagentsBtn();
+}
+
+/* One transcript line as a readable block. */
+function subagentLineHtml(entry) {
+  const msg = entry && entry.message ? entry.message : entry;
+  const role = (msg && (msg.role || msg.type)) || 'entry';
+  let text = '';
+  const content = msg && msg.content;
+  if (typeof content === 'string') text = content;
+  else if (Array.isArray(content)) {
+    text = content.map((c) => (typeof c === 'string' ? c : (c && (c.text || c.thinking || c.output || '')) || '')).filter(Boolean).join('\n');
+  } else if (msg && msg.summary) text = msg.summary;
+  if (!text && msg && msg.command) text = `$ ${msg.command}\n${msg.output || ''}`;
+  if (!text) { try { text = JSON.stringify(msg).slice(0, 4000); } catch { text = ''; } }
+  const who = role === 'toolResult' ? `tool: ${msg.toolName || 'result'}` : role;
+  const esc = (v) => String(v).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  let body;
+  if (/^(assistant|toolResult)$/.test(role)) {
+    try { body = renderMarkdown(text); } catch { body = `<p>${esc(text)}</p>`; }
+  } else body = `<p>${esc(text).replace(/\n/g, '<br>')}</p>`;
+  return `<div class="sub-msg ${esc(role)}"><div class="sub-who">${esc(who)}</div><div class="sub-body">${body}</div></div>`;
+}
+
+/* Whatever the bridge found: a child's transcript becomes a conversation, anything
+ * else is shown as text. Returns how many messages were rendered. */
+function renderSubagentBody(body, text) {
+  const raw = String(text || '').trim();
+  if (raw.startsWith('{') && raw.includes('"role"')) {
+    const entries = [];
+    for (const line of raw.split('\n')) {
+      const l = line.trim();
+      if (!l.startsWith('{')) continue;
+      try { entries.push(JSON.parse(l)); } catch { /* a torn last line */ }
+    }
+    const msgs = entries.filter((e) => e && (e.message || e.role || e.type === 'message'));
+    if (msgs.length) {
+      body.innerHTML = msgs.map(subagentLineHtml).join('');
+      return msgs.length;
+    }
+  }
+  body.textContent = raw || 'Nothing here yet.';
+  return 0;
+}
+
+/* What a subagent wrote. The extension keeps one output file per run next to the
+ * session, which the bridge can read (also inside a container), so this needs no
+ * new protocol - and it does not disturb the running agent. */
+async function showSubagentOutput(run) {
+  const dlg = $('subagent-dialog');
+  if (!dlg) { toast('No subagent dialog available', 'error'); return; }
+  $('subagent-title').textContent = run.label || 'subagent';
+  $('subagent-meta').textContent = subagentHint(run) || 'no details';
+  const body = $('subagent-body');
+  body.innerHTML = '';
+  const q = `run=${encodeURIComponent(run.id)}&label=${encodeURIComponent(run.label || '')}`
+    + (run.dir ? `&dir=${encodeURIComponent(run.dir)}` : '');
+  if (!run.output) body.textContent = 'Loading what it wrote…';
+  dlg.showModal();
+  if (run.output) { renderSubagentBody(body, run.output); return; }
+  try {
+    const d = await fetch(api(`/api/subagent-output?${q}`)).then((r) => r.json());
+    if (d && d.error) throw new Error(d.error);
+    const text = (d && d.text) || '';
+    const shown = renderSubagentBody(body, text);
+    if (!text.trim()) body.textContent = 'Nothing written yet — a background run writes its log as it goes, and this panel reloads it.';
+    else if (shown) $('subagent-meta').textContent = `${subagentHint(run)} · ${shown} messages${d.file ? ` · ${d.file}` : ''}`;
+    else if (d.notes) $('subagent-meta').textContent = `${subagentHint(run)} · ${d.notes}`;
+    run.output = text;
+  } catch (e) {
+    body.textContent = `Could not read this run's conversation: ${e.message}`;
+  }
+}
+
+/* Fallback used when the run has no session file of its own (an older run, or an
+ * agent that keeps no session): the same conversation, rendered from the
+ * transcript artifact into the dialog. */
+
+/* ── which session's subagents, and keeping them live ─────────────────────
+ * A subagent belongs to the conversation that started it, so the panel only
+ * appears there. The list is read from the bridge (one status.json per run),
+ * which also means a reload brings the runs back instead of starting empty, and
+ * that a run is up to date even while the parent is idle waiting for it. While a
+ * child's own session is open the panel stays put - that is the way back. */
+function subagentSessionKey() {
+  if (S.viewSubagent) return S.viewSubagent.sessionId || S.state.sessionFile || '';
+  return S.viewSession || (S.state && S.state.sessionFile) || '';
+}
+function isLiveRun(r) { return /running|pending|queued|stopping/.test((r && r.state) || ''); }
+
+let subagentFetchAt = 0;
+async function refreshSubagents(force) {
+  const key = subagentSessionKey();
+  if (!key) return null;
+  const now = Date.now();
+  if (!force && now - subagentFetchAt < 700) return null;   // the tick is 1s; the bridge caches too
+  subagentFetchAt = now;
+  let d;
+  try {
+    d = await fetch(api(`/api/subagent-runs?session=${encodeURIComponent(key)}`)).then((r) => r.json());
+  } catch { return null; }
+  if (!d || !Array.isArray(d.runs)) return null;
+  if (subagentSessionKey() !== key) return null;   // the view changed while this was in flight
+  if (!S.subagents) S.subagents = new Map();
+  const seen = new Set();
+  for (const r of d.runs) {
+    const id = String(r.runId || '');
+    if (!id) continue;
+    seen.add(id);
+    const cur = S.subagents.get(id) || {};
+    noteSubagent({
+      id,
+      fromDisk: true,
+      label: r.agent || cur.label || id.slice(0, 8),
+      kind: 'subagent',
+      state: r.state || cur.state,
+      activityState: r.activityState || cur.activityState || null,
+      currentTool: r.currentTool || cur.currentTool || null,
+      currentToolStartedAt: r.currentToolStartedAt || cur.currentToolStartedAt || null,
+      turnCount: r.turnCount || cur.turnCount || 0,
+      toolCount: r.toolCount || cur.toolCount || 0,
+      startedAt: r.startedAt || cur.startedAt || Date.now(),
+      endedAt: r.endedAt || null,
+      lastActivityAt: r.lastActivityAt || null,
+      sessionFile: r.sessionFile || null,
+      sessionId: r.sessionId || null,
+      model: r.model || null,
+      totalTokens: r.totalTokens || null,
+      error: r.error || null,
+      background: r.mode ? r.mode !== 'foreground' : true,
+      task: cur.task || '',
+      output: cur.output || '',
+    });
+  }
+  // Runs the disk does not know about yet (the extension's widget reported them
+  // first) stay until they show up there too.
+  for (const [id, run] of [...S.subagents]) if (run.fromDisk && !seen.has(id)) S.subagents.delete(id);
+  updateSubagentsBtn();
+  if (S.subagentMenuOpen) refreshSubagentMenu();
+  ensureTick();
+  return d;
+}
+
+/* One timer for everything that has to move while you watch: the task clock, a
+ * running subagent's elapsed time, and a child's session as it grows. Stopped
+ * again as soon as nothing needs it. */
+let uiTick = null;
+function tickNeeded() {
+  if (S.runStartTs) return true;
+  if ($('setup-dialog') && $('setup-dialog').open) return true;   // the avatar preview fills in
+  if (S.subagentMenuOpen || S.viewSubagent) return true;
+  return subagentList().some(isLiveRun);
+}
+function ensureTick() {
+  if (tickNeeded() && !uiTick) uiTick = setInterval(onUiTick, 1000);
+  else if (!tickNeeded() && uiTick) { clearInterval(uiTick); uiTick = null; }
+}
+function onUiTick() {
+  paintRunStat();
+  if ($('setup-dialog') && $('setup-dialog').open) refreshSetupPreview();
+  if (S.subagentMenuOpen || S.viewSubagent || subagentList().some(isLiveRun)) refreshSubagents().catch(() => {});
+  if (S.subagentMenuOpen) refreshSubagentMenu();
+  if (S.viewSubagent) refreshSubagentView().catch(() => {});
+  ensureTick();
+}
+
+/* A subagent runs in a session of its own - the run status records the file - so
+ * opening one shows that conversation read-only in the same chat, with the way
+ * back one click away (and the sub-agent list still in the top bar). */
+let subagentViewAt = 0;
+async function openSubagentView(run) {
+  if (!run) return;
+  const file = run.sessionFile;
+  if (!file || !/\.jsonl$/i.test(file)) { showSubagentOutput(run); return; }   // nothing to open: the text panel
+  closeAllMenus();
+  // The agent may be mid-answer: park its live DOM first (exactly like switching
+  // sessions does), otherwise its streaming message would be written into the
+  // child's conversation.
+  if (S.isStreaming && S.live) {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(S.live.root);
+    S.liveDetached = { path: S.state.sessionFile, frag };
+  }
+  S.viewSubagent = { ...run, sessionFile: file };
+  S.viewSession = file;
+  S.subagentViewCount = 0;
+  S.stickToBottom = true;
+  subagentViewAt = 0;
+  await refreshSubagentView(true);
+  updateViewBanner();
+  updateSubagentsBtn();
+  syncSessionHighlight();
+  ensureTick();
+}
+
+async function backFromSubagent() {
+  S.viewSubagent = null;
+  S.viewSession = null;
+  S.subagentViewCount = 0;
+  await refreshMessages();
+  updateViewBanner();
+  updateSubagentsBtn();
+  syncSessionHighlight();
+  ensureTick();
+}
+
+/* Re-read the child's session while it is still writing, but only redraw when it
+ * actually grew: a redraw on every tick would fight with scrolling. */
+async function refreshSubagentView(force) {
+  if (!S.viewSubagent) return;
+  if (!force && Date.now() - subagentViewAt < 2500) return;
+  subagentViewAt = Date.now();
+  let d;
+  try { d = await fetchSession(S.viewSubagent.sessionFile); } catch { return; }
+  if (!S.viewSubagent) return;
+  const n = (d.messages || []).length;
+  if (!force && n === S.subagentViewCount) return;
+  S.subagentViewCount = n;
+  const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
+  chat.innerHTML = '';
+  transcriptTarget = chat;
+  for (const m of d.messages) {
+    if (m.role === 'user') renderUserMessage(m);
+    else if (m.role === 'assistant') renderAssistantMessage(m);
+    else if (m.role === 'toolResult') renderToolResult(m);
+    else if (m.role === 'bashExecution') renderBashExecution(m);
+    else if (m.role === 'compactionSummary') renderCompactionSummary(m);
+  }
+  transcriptTarget = null;
+  if (S.stickToBottom && distFromBottom < 80) scrollBottom(true);
+  updateViewBanner();
+}
+
+/* ── the tab icon ─────────────────────────────────────────────────────────
+ * Browsers do not animate a favicon (a GIF or a video is shown as one still
+ * frame, if at all), so the picture is drawn onto a canvas and the canvas is
+ * handed over as the icon - repainted on a slow timer when the source moves,
+ * which is what makes an animated avatar animate in the tab. */
+let favIconTimer = null;
+let favIconSource = null;
+let favIconPainted = false;
+let defaultFaviconHref = null;
+
+/* The tab icon is the agent's picture. Browsers do not animate a favicon (a GIF
+ * or a video is shown as one still frame, if at all), so the picture is drawn
+ * onto a canvas and the canvas is handed over as the icon - repainted on a slow
+ * timer while the source moves, which is what makes an animated avatar move in
+ * the tab. */
+function updateFavicon() {
+  const link = document.querySelector('link[rel="icon"]');
+  if (!link) return;
+  if (defaultFaviconHref == null) defaultFaviconHref = link.getAttribute('href') || '';
+  const src = SET.avatar || '';
+  if (src === favIconSource && (favIconTimer || favIconPainted)) return;   // already showing it
+  favIconSource = src;
+  if (favIconTimer) { clearInterval(favIconTimer); favIconTimer = null; }
+  favIconPainted = false;
+  if (S.favNode) { try { S.favNode.remove(); } catch { /* gone */ } S.favNode = null; }
+  if (!src) { link.setAttribute('href', defaultFaviconHref); favIconPainted = true; return; }
+  const animated = isVideoSrc(src) || /\.gif(\?|$)/i.test(src);
+  const media = mediaNode(src, 'fav-source');
+  if (!media) return;
+  // In the document, a few pixels off screen: a detached video does not decode
+  // frames, so a video avatar would never animate in the tab.
+  S.favNode = media;
+  document.body.appendChild(media);
+  const draw = () => {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 64; c.height = 64;
+      const g = c.getContext('2d');
+      const w = media.naturalWidth || media.videoWidth || 0;
+      const h = media.naturalHeight || media.videoHeight || 0;
+      if (!w || !h) return false;
+      // fills the square, cropped through the middle - like the avatar itself
+      const sc = Math.max(64 / w, 64 / h);
+      g.drawImage(media, (64 - w * sc) / 2, (64 - h * sc) / 2, w * sc, h * sc);
+      link.setAttribute('href', c.toDataURL('image/png'));
+      favIconPainted = true;
+      return true;
+    } catch { return false; }
+  };
+  const paint = () => { if (draw()) favIconPainted = true; };
+  // The src is set when the node is built, so its load event can already have
+  // fired - a data URL is decoded by the time we get here, and waiting for an
+  // event that will not come again left the tab showing the old icon.
+  paint();
+  if (media.complete) paint();
+  if (animated) favIconTimer = setInterval(() => { if (!document.hidden) draw(); }, 250);
+  else {
+    media.addEventListener('load', paint, { once: true });
+    media.addEventListener('loadeddata', paint, { once: true });
+    setTimeout(paint, 400);
+  }
+}
+
 function avatarNode(sizeClass) {
   if (!SET.avatar) return null;
   const wrap = el('span', `avatar-wrap${sizeClass ? ' ' + sizeClass : ''}`);
@@ -2121,7 +2769,7 @@ function lazySrc(node, src) {
 /* Live "compacting…" marker, shown the moment compaction_start arrives so the
  * user sees compaction happen in real time (with an elapsed timer). Replaced
  * by renderCompactionBlock() when compaction_end arrives. */
-function renderCompactionLive() {
+function renderCompactionLive(since) {
   const root = el('div', 'msg compaction compacting');
   const who = el('div', 'who');
   const spin = el('span', 'compaction-spin');
@@ -2131,10 +2779,14 @@ function renderCompactionLive() {
   who.appendChild(timer);
   root.appendChild(who);
   transcriptHost().appendChild(root);
-  const start = Date.now();
-  const t = setInterval(() => { timer.textContent = fmtElapsed(Date.now() - start); }, 500);
+  // `since` is the bridge's start time when the block is restored after a reload,
+  // so the elapsed time continues instead of starting from zero again.
+  let start = Number(since) || Date.now();
+  const tick = () => { timer.textContent = fmtElapsed(Date.now() - start); };
+  const t = setInterval(tick, 500);
+  tick();
   if (S.stickToBottom) scrollBottom();
-  return { root, t };
+  return { root, t, setSince: (s2) => { if (Number(s2)) { start = Number(s2); tick(); } } };
 }
 function removeCompactionLive() {
   if (S.compactionLive) {
@@ -2192,8 +2844,23 @@ async function fetchSession(sessionPath) {
 async function refreshMessages() {
   if (!S.viewSession) await refreshForkable().catch(() => {});
   resetForkQueue();
+  // Subagent runs belong to the session you are looking at. The bridge answers
+  // per session, so switching cannot show another one's jobs - and a reload gets
+  // them back from disk instead of an empty panel.
+  const subKey = subagentSessionKey();
+  if (S.subagentsFor !== subKey) {
+    S.subagents = new Map();
+    S.subagentsFor = subKey;
+    updateSubagentsBtn();
+  }
+  refreshSubagents(true).catch(() => {});
   let msgs;
   let fileMarks = [];
+  // True while what we render is a window into the session rather than all of it
+  // (the agent's post-compaction context view, or the newest N messages). A
+  // compaction marker older than the oldest message on screen has no place to go
+  // in that case - see the marker loop below.
+  let partial = false;
   if (S.viewSession) {
     // Viewing another session while the agent runs in its own: read it
     // read-only from the file (the get_messages RPC only knows the agent's
@@ -2219,6 +2886,10 @@ async function refreshMessages() {
           const newest = f.messages.reduce((acc, m) => Math.max(acc, Date.parse((m && m.timestamp) || '') || 0), 0);
           const pendingMsgs = rpcMsgs.filter((m) => (Date.parse((m && m.timestamp) || '') || 0) > newest);
           msgs = [...f.messages, ...pendingMsgs];
+        } else {
+          // pi's view is the post-compaction context: the conversation the
+          // summary replaced is not in it.
+          partial = true;
         }
       } catch { /* no file to read: keep the RPC view */ }
     }
@@ -2235,7 +2906,7 @@ async function refreshMessages() {
     }
   }
   // Keep the reading position (distance from the bottom) across the re-render.
-  const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+  const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
   chat.innerHTML = '';
   if (!S.viewSession) {
     // Only the agent's own session owns the live tool cards; a read-only
@@ -2279,6 +2950,7 @@ async function refreshMessages() {
   if (S.windowFor !== S.state.sessionFile) { S.windowFor = S.state.sessionFile; S.historyWindow = 400; }
   const win = Math.max(80, S.historyWindow || 400);
   const windowed = msgs.length > win;
+  S.historyPartial = partial || windowed;
   const skipped = new Set(windowed ? msgs.slice(0, msgs.length - win) : []);
   transcriptTarget = chat;   // this rebuild is for the transcript on screen
   for (const m of msgs) {
@@ -2332,8 +3004,14 @@ async function refreshMessages() {
       // Before the first rendered message only if it really is older than it;
       // otherwise it belongs after the newest content, not at the top.
       if (target) target.after(node);
-      else if (at && firstTs && at < firstTs) plain[0].before(node);
-      else chat.appendChild(node);
+      else if (at && firstTs && at < firstTs) {
+        // Older than everything on screen. That is only "at the top" when the
+        // whole session is rendered: while a window is shown, the messages this
+        // marker belongs between are not loaded, and pinning it to the first row
+        // put every old compaction on the ceiling. Leave it out; loading the
+        // older messages brings it back in its real place.
+        if (!S.historyPartial) plain[0].before(node);
+      } else chat.appendChild(node);
     }
     // A compaction still in flight keeps its "compacting…" indicator: the
     // re-render above wiped the DOM node it lived in.
@@ -2359,9 +3037,10 @@ async function refreshMessages() {
     const btn = el('button', 'btn small', `load ${hidden} older message${hidden > 1 ? 's' : ''}`);
     btn.onclick = () => {
       S.historyWindow = (S.historyWindow || win) + 400;
-      const keep = chat.scrollHeight - chat.scrollTop;
+      const sc0 = chatScroller();
+    const keep = sc0.scrollHeight - sc0.scrollTop;
       refreshMessages().then(() => {
-        const c = $('chat');
+        const c = chatScroller();
         c.scrollTop = c.scrollHeight - keep;
       }).catch(() => {});
     };
@@ -2369,7 +3048,12 @@ async function refreshMessages() {
     chat.insertBefore(more, chat.firstChild);
   }
   // The last turn's total belongs on the last message: bring it back after a
-  // re-render (a settle, a reload, a session re-read).
+  // re-render (a settle, a reload, a session re-read). A reload has no memory of
+  // it, so it is read back from the per-session store first.
+  if (!S.lastTurn && !S.viewSession) {
+    const kept = loadSessionUi();
+    if (kept && kept.lastTurn && kept.lastTurn.ms) S.lastTurn = kept.lastTurn;
+  }
   if (S.lastTurn && S.lastTurn.ms) {
     const bubbles = chat.querySelectorAll('.msg.assistant .bubble');
     const b = bubbles.length ? bubbles[bubbles.length - 1] : null;
@@ -2393,7 +3077,7 @@ async function refreshMessages() {
   }
   S.liveDetached = null;
   if (S.stickToBottom) scrollBottom(true);
-  else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
+  else chatScroller().scrollTop = chatScroller().scrollHeight - chatScroller().clientHeight - distFromBottom;
 }
 
 /* Full-size view of an image. The old version reused the drag-and-drop overlay,
@@ -2432,12 +3116,14 @@ function handleEvent(msg) {
       break;
     }
     case 'agent_start':
+      S.ctxTurnPeak = 0;
       S.isStreaming = true;
       // The turn clock starts here (and covers thinking, tool calls and waiting).
       // It used to be set in a second `case 'agent_start'` label further down -
       // dead code, because the first matching case wins, so every turn was
       // measured as 0.0s.
       S.turnStartTs = Date.now();
+      ensureTick();
       updateStreamUi();
       autoOpenShortsIfEnabled();
       break;
@@ -2464,10 +3150,14 @@ function handleEvent(msg) {
           refreshMessages().catch(() => {});
         }
         // Threshold/manual compactions stop the agent; keep the task going.
+        // Threshold/manual compactions stop the agent; keep the task going. When
+        // that happens the task clock keeps running - the task is not finished.
+        const autoContinues = S.compactionNeedsContinue && SET.autoContinueAfterCompaction !== false;
         if (S.compactionNeedsContinue) {
           S.compactionNeedsContinue = false;
           maybeAutoContinue();
         }
+        if (!autoContinues) finishRunClock(lastAssistantTs());
       }
       updateStreamUi();
       if (msg.type === 'agent_end') {
@@ -2512,6 +3202,15 @@ function handleEvent(msg) {
       break;
     case 'tool_execution_start':
       startToolCard(msg);
+      if (SUBAGENT_TOOLS.has(String(msg.toolName || ''))) {
+        noteSubagent({
+          id: msg.toolCallId || `fg-${Date.now()}`,
+          label: (msg.args && (msg.args.agent || msg.args.label || msg.args.name)) || 'subagent',
+          state: 'running',
+          startedAt: Date.now(),
+          background: false,
+        });
+      }
       break;
     case 'tool_execution_update': {
       const c = S.toolCards.get(msg.toolCallId);
@@ -2519,9 +3218,39 @@ function handleEvent(msg) {
         c.body.textContent = toolResultText({ content: msg.partialResult });
         c.body.classList.remove('hidden');
       }
+      // Foreground subagents report progress inside the tool result details:
+      // status, current tool, turns, tools. That is the live feed for them.
+      if (SUBAGENT_TOOLS.has(String(msg.toolName || ''))) {
+        const det = (msg.partialResult && msg.partialResult.details) || msg.details || {};
+        for (const r of det.results || []) {
+          const p2 = r.progress || {};
+          noteSubagent({
+            id: r.runId || r.id || msg.toolCallId || 'fg',
+            label: r.label || r.agent || p2.agent || 'subagent',
+            state: p2.status || 'running',
+            currentTool: p2.currentTool || null,
+            turnCount: p2.turnCount || 0,
+            toolCount: p2.toolCount || 0,
+            startedAt: (S.subagents.get(String(r.runId || r.id || msg.toolCallId || 'fg')) || {}).startedAt || Date.now(),
+            background: false,
+          });
+        }
+      }
       break;
     }
     case 'tool_execution_end': {
+      if (SUBAGENT_TOOLS.has(String(msg.toolName || ''))) {
+        const det = (msg.result && msg.result.details) || msg.details || {};
+        const kids = (det.results || []).map((r) => ({
+          id: r.runId || r.id || msg.toolCallId,
+          label: r.label || r.agent || 'subagent',
+          state: r.status === 'ok' || r.ok === true ? 'done' : (r.status || (r.error ? 'failed' : 'done')),
+          output: typeof r.content === 'string' ? r.content : (r.output || ''),
+          background: false,
+        })).filter((r) => r.id);
+        if (kids.length) for (const k of kids) noteSubagent(k);
+        else noteSubagent({ id: msg.toolCallId || 'fg', state: msg.isError ? 'failed' : 'done' });
+      }
       const c = S.toolCards.get(msg.toolCallId);
       if (c) {
         if (msg.result !== undefined && !c.body.querySelector('.diffbox')) c.body.textContent = toolResultText({ content: msg.result });
@@ -2610,6 +3339,91 @@ function handleEvent(msg) {
 /* Total time the turn took, written inside the last message of that turn. It is
  * wall-clock time from agent_start to agent_settled, so tool calls and waiting
  * are included, not just the writing. */
+/* Per-session bits of UI state that would otherwise only exist in memory: the
+ * length of the last turn (the stats row and the "turn took…" line) and whatever
+ * the agent was in the middle of. Kept in localStorage, keyed per session, so a
+ * reload comes back to the same picture. */
+function sessionUiKey() {
+  const p = S.viewSession || (S.state && S.state.sessionFile) || 'none';
+  return `piwebui-session-ui:${String(p).slice(-120)}`;
+}
+function saveSessionUi(patch) {
+  try {
+    const raw = localStorage.getItem(sessionUiKey());
+    const cur = raw ? JSON.parse(raw) : {};
+    localStorage.setItem(sessionUiKey(), JSON.stringify({ ...cur, ...patch, at: Date.now() }));
+  } catch { /* private mode / quota */ }
+}
+function loadSessionUi() {
+  try {
+    const raw = localStorage.getItem(sessionUiKey());
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    // old enough to be noise rather than state
+    if (!d || !d.at || Date.now() - d.at > 12 * 3600 * 1000) return null;
+    return d;
+  } catch { return null; }
+}
+
+/* ── the task clock (the number at the bottom) ───────────────────────────
+ * "How long did that take?" means the whole task: from the message you sent to
+ * the agent's last word, across every turn, tool call and compaction in between.
+ * It is kept per session in localStorage, so a reload keeps counting instead of
+ * starting over - and only sending a message starts a new one, because the
+ * automatic continue after a compaction is the same task, not a new one. */
+function startRunClock() {
+  S.runStartTs = Date.now();
+  S.runMs = null;
+  saveSessionUi({ runStart: S.runStartTs, runMs: null });
+  paintRunStat();
+  ensureTick();
+}
+function finishRunClock(atMs) {
+  if (!S.runStartTs) { paintRunStat(); return; }
+  const end = Number(atMs) > S.runStartTs ? Number(atMs) : Date.now();
+  S.runMs = Math.max(0, end - S.runStartTs);
+  S.runStartTs = null;
+  S.lastRun = { ms: S.runMs, ts: Date.now() };
+  saveSessionUi({ runStart: null, runMs: S.runMs });
+  paintRunStat();
+  ensureTick();
+}
+function paintRunStat() {
+  const stat = $('stat-turn');
+  if (!stat) return;
+  const live = !!S.runStartTs;
+  const ms = live ? Date.now() - S.runStartTs : (S.runMs || 0);
+  stat.classList.toggle('live', live);
+  if (!ms && !live) { stat.textContent = ''; stat.title = 'how long the task took'; return; }
+  stat.textContent = `total ${fmtElapsed(ms)}`;
+  stat.title = live
+    ? 'time since you sent your message — every turn, tool call and compaction counts'
+    : 'how long the last task took, from your message to the agent’s last word';
+}
+/* The timestamp of the agent's last word: that is when a task ended, which is a
+ * better boundary than "whenever this page noticed". */
+function lastAssistantTs() {
+  const b = [...chat.querySelectorAll('.msg.assistant')].pop();
+  return b ? Number(b.dataset.ts) || 0 : 0;
+}
+/* After a reload: still running means keep counting from the same start; already
+ * finished means show the number it stopped at. */
+function restoreRunClock() {
+  const kept = loadSessionUi();
+  if (kept) {
+    if (kept.runStart && !S.runStartTs) { S.runStartTs = kept.runStart; S.runMs = null; }
+    else if (!S.runStartTs && !S.runMs && kept.runMs) S.runMs = kept.runMs;
+  }
+  // The page may have been away when it ended: the agent is idle now, so the
+  // agent's last message is where the clock stopped.
+  if (S.runStartTs && S.agentBusy === false && !S.compacting) {
+    const endTs = lastAssistantTs();
+    if (endTs > S.runStartTs) finishRunClock(endTs);
+  }
+  paintRunStat();
+  ensureTick();
+}
+
 function stampTurnTimer() {
   const start = S.turnStartTs;
   S.turnStartTs = null;
@@ -2618,12 +3432,7 @@ function stampTurnTimer() {
   // Remembered so a later re-render (or a session reload) can put the total
   // back on the last message instead of losing it.
   S.lastTurn = { ms, ts: Date.now() };
-  const stat = $('stat-turn');
-  if (stat) {
-    stat.textContent = `turn ${fmtElapsed(ms)}`;
-    stat.title = `the last turn took ${fmtElapsed(ms)} (thinking, tool calls and waiting included)`;
-    stat.classList.remove('live');
-  }
+  saveSessionUi({ lastTurn: S.lastTurn });
   const bubbles = chat.querySelectorAll('.msg.assistant .bubble');
   const bubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
   if (!bubble) return;
@@ -2631,17 +3440,14 @@ function stampTurnTimer() {
   bubble.appendChild(el('div', 'turn-timer', `turn took ${fmtElapsed(ms)}`));
 }
 
-/* Live version while the turn is running: lives in the status bar (where the
- * total ends up) instead of inside the message being written. */
+/* The bottom indicator is the task clock now (see paintRunStat), so a turn
+ * starting only has to make sure one is running. It used to be a per-turn
+ * stopwatch here, which reset to zero on every assistant turn - so a task with
+ * five turns never showed its real total, and a reload started over. */
 function startTurnTimer() {
-  const stat = $('stat-turn');
-  const started = S.turnStartTs || Date.now();
-  if (!stat) return () => {};
-  stat.classList.add('live');
-  const tick = () => { stat.textContent = `turn ${fmtElapsed(Date.now() - started)}`; };
-  tick();
-  const t = setInterval(tick, 1000);
-  return () => clearInterval(t);
+  paintRunStat();
+  ensureTick();
+  return () => {};
 }
 
 function startLive() {
@@ -2940,8 +3746,24 @@ function updateViewBanner() {
     b.textContent = '';
     return;
   }
+  // Reading a subagent's own session: name it, say it is read-only, and keep the
+  // way back to the conversation it belongs to right here.
+  if (S.viewSubagent) {
+    const r = S.viewSubagent;
+    const parent = S.state.sessionFile;
+    const p = (S.sessionsList || []).find((x) => sameSessionPath(x.path, parent, S.sessionsList || []));
+    const pname = (p && p.name) || (parent ? parent.split(/[\\/]/).pop().replace(/\.jsonl$/, '') : 'the main session');
+    b.classList.remove('hidden');
+    b.textContent = `Subagent “${r.label || 'subagent'}” — its own session, read-only`
+      + (isLiveRun(r) ? ' (still running, this follows along)' : '')
+      + `. Back to “${pname}”. `;
+    const back = el('button', 'btn small', 'back to the conversation');
+    back.onclick = () => backFromSubagent();
+    b.appendChild(back);
+    return;
+  }
   const base = S.viewSession.split(/[\\/]/).pop();
-  const s = (S.sessionsList || []).find((x) => x.path === S.viewSession || x.fileName === base);
+  const s = (S.sessionsList || []).find((x) => sameSessionPath(x.path, S.viewSession, S.sessionsList || []));
   const name = (s && s.name) || base.replace(/\.jsonl$/, '');
   b.classList.remove('hidden');
   b.textContent = S.isStreaming
@@ -2991,6 +3813,7 @@ function flushCompactionQueue() {
   if (!S.compactionQueue.length) return;
   if (S.isStreaming || S.compacting) return; // wait until the agent is idle
   const next = S.compactionQueue.shift();
+  startRunClock();   // a queued message from the user is a new task
   sendPrompt(next.text, next.images);
   // The next agent_end/agent_settled will flush the rest of the queue.
 }
@@ -3006,6 +3829,8 @@ function maybeAutoContinue() {
   if (now - S.lastAutoContinueAt < 120000) return; // don't chain-continue forever
   S.lastAutoContinueAt = now;
   toast('Compaction done — continuing the task…', 'info');
+  // Deliberately not startRunClock(): this continues the task the user already
+  // started, so its clock keeps running (compaction time included).
   sendPrompt('Context was just compacted into a summary. Continue the current task from where it left off — use the compaction summary and the recent messages, and keep working until the task is complete.');
 }
 
@@ -3083,10 +3908,16 @@ async function sendCurrent() {
     return;
   }
 
+  // What actually goes to the agent: a skill typed by its short name gets its
+  // "skill:" prefix back here (and only here).
+  let sendText = text;
+
   if (text.startsWith('/')) {
     const sp = text.indexOf(' ');
-    const name = (sp >= 0 ? text.slice(1, sp) : text.slice(1)).toLowerCase();
+    let name = (sp >= 0 ? text.slice(1, sp) : text.slice(1)).toLowerCase();
     const arg = sp >= 0 ? text.slice(sp + 1).trim() : '';
+    sendText = skillAwareCommand(text);
+    if (sendText !== text) name = sendText.slice(1, sendText.indexOf(' ') > 0 ? sendText.indexOf(' ') : undefined).toLowerCase();
 
     // Client-local slash commands: executed by the UI, never sent to the agent.
     if (name === 'tts') { setAutoTts(!S.autoTts); resetComposer(); return; }
@@ -3118,7 +3949,8 @@ async function sendCurrent() {
     }
   }
 
-  sendPrompt(text, S.attachments.slice());
+  startRunClock();
+  sendPrompt(sendText, S.attachments.slice());
   resetComposer();
 }
 
@@ -3344,6 +4176,7 @@ async function finishEdit(newText) {
     await rpc({ type: 'fork', entryId: edit.entryId });
     await refreshMessages();
     await refreshForkable();
+    startRunClock();
     sendPrompt(newText, S.attachments.slice());
     resetComposer();
   } catch (e) {
@@ -3385,6 +4218,22 @@ function fileKind(f) {
 /* Upload a file to the workspace (bridge saves it under uploads/) so the
  * agent can read it with its tools. Returns {path, size}. */
 async function uploadFile(file) {
+  // Big files as a raw body: base64 inflates them by a third and the JSON body
+  // cap cut the request off - which surfaced as "data (base64) is required",
+  // because the server received a truncated object. A background video is often
+  // the largest file anyone uploads, and it only ever gets stored, never sent to
+  // the model.
+  if (file.size > 8 * 1024 * 1024) {
+    const q = `name=${encodeURIComponent(file.name || 'file')}&mimeType=${encodeURIComponent(file.type || '')}`;
+    const d = await (await fetch(api(`/api/upload-raw?${q}`), {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    })).json();
+    if (!d.ok) throw new Error(d.error || 'upload failed');
+    if (d.duplicate) toast(`“${file.name}” was uploaded before — reusing it`, 'warning');
+    return d;
+  }
   const data = await readAsDataUrl(file);
   const d = await (await fetch(api('/api/upload'), {
     method: 'POST',
@@ -3392,6 +4241,7 @@ async function uploadFile(file) {
     body: JSON.stringify({ name: file.name, data: data.split(',')[1], mimeType: file.type }),
   })).json();
   if (!d.ok) throw new Error(d.error || 'upload failed');
+  if (d.duplicate) toast(`“${file.name}” was uploaded before — reusing it`, 'warning');
   return d;
 }
 
@@ -3433,9 +4283,30 @@ async function transcribeAudioFile(file) {
 /* Attach any file: images go to the model as vision input; everything else
  * (PDF / audio / video / other) is uploaded to the workspace and referenced
  * by path in the prompt. Audio is transcribed when STT is available. */
+/* A picture or a video is something the user might mean as a background (the
+ * wallpaper picker takes both). Used to route a dropped file that is too big for
+ * the model to the wallpaper instead of refusing it outright. */
+function looksLikeWallpaper(file) {
+  const t = (file && file.type) || '';
+  const name = (file && file.name) || '';
+  return /^(video|image)\//.test(t) || /\.(mp4|webm|mov|m4v|ogv|mkv|gif|png|jpe?g|webp|avif|bmp|svg)$/i.test(name);
+}
+
 async function addFile(file) {
   if (file.type.startsWith('image/')) { await addImageFile(file); return; }
-  if (file.size > 100 * 1024 * 1024) { toast(`File too large (max 100 MB): ${file.name}`, 'error'); return; }
+  if (file.size > 100 * 1024 * 1024) {
+    // The cap is there because an attachment is base64'd into the request. A
+    // background is only ever stored and shown, so a wallpaper video that
+    // happens to be big was refused for no reason - it becomes the background
+    // instead of failing.
+    if (looksLikeWallpaper(file)) {
+      toast(`${file.name} is ${(file.size / 1048576).toFixed(0)} MB — too big for the agent, using it as the background`);
+      await setBackgroundFromFile(file);
+      return;
+    }
+    toast(`File too large (max 100 MB): ${file.name}`, 'error');
+    return;
+  }
   const att = { type: 'file', kind: fileKind(file), name: file.name || 'file', mimeType: file.type, size: file.size };
   try {
     att.path = (await uploadFile(file)).path;
@@ -3552,6 +4423,27 @@ const HIDDEN_BUILTINS = new Set([
   'reload', 'quit',
 ]);
 
+/* pi registers skills as `skill:<name>`. That prefix is an implementation
+ * detail: the menu shows the name you type, tab-completion inserts it, and it is
+ * put back only when the command is actually sent to the agent (see
+ * sendCurrent), so "/myskill" runs the skill without the prefix ever being on
+ * screen. */
+function commandLabel(c) {
+  return String(c.name || '').replace(/^skill:/i, '');
+}
+
+/* What the agent should actually receive. pi registers skills as `skill:<name>`,
+ * and that prefix is an implementation detail: the menu shows the short name, tab
+ * completion inserts it, and it is put back here - only on the way out. */
+function skillAwareCommand(text) {
+  const m = /^\/(\S+)([\s\S]*)$/.exec(text);
+  if (!m) return text;
+  const name = m[1].toLowerCase();
+  if (/^skill:/.test(name)) return text;
+  const skill = (S.commands || []).find((c) => /^skill:/i.test(c.name) && commandLabel(c).toLowerCase() === name);
+  return skill ? `/${String(skill.name).toLowerCase()}${m[2]}` : text;
+}
+
 function allCommands() {
   const seen = new Set();
   const out = [];
@@ -3559,9 +4451,11 @@ function allCommands() {
   // commands, then pi's built-in slash commands. Deduped by name so e.g. the
   // local /thinking toggle isn't shadowed twice.
   for (const c of [...LOCAL_COMMANDS, ...S.commands, ...S.builtinCommands]) {
-    const key = c.name.toLowerCase();
-    if (seen.has(key)) continue;
+    const key = String(c.name || '').toLowerCase();
+    const label = commandLabel(c).toLowerCase();
+    if (seen.has(key) || seen.has('label:' + label)) continue;
     seen.add(key);
+    seen.add('label:' + label);
     out.push(c);
   }
   return out;
@@ -3577,7 +4471,9 @@ function updateSlashMenu() {
   const q = m[1].toLowerCase();
   const items = allCommands()
     .filter((c) => !(c.source === 'builtin' && HIDDEN_BUILTINS.has(c.name.toLowerCase())))
-    .filter((c) => c.name.toLowerCase().includes(q) || (c.description || '').toLowerCase().includes(q))
+    .filter((c) => String(c.name || '').toLowerCase().includes(q)
+      || commandLabel(c).toLowerCase().includes(q)
+      || (c.description || '').toLowerCase().includes(q))
     .slice(0, 300);   // the list scrolls; it used to be cut off at 12, which hid every skill
   if (!items.length) { closeSlashMenu(); return; }
   openSlashMenu(items);
@@ -3589,7 +4485,7 @@ function openSlashMenu(items) {
   const menu = el('div', 'slash-menu');
   items.forEach((c, i) => {
     const row = el('div', 'slash-item' + (i === 0 ? ' sel' : ''));
-    row.appendChild(el('span', 'cmd', '/' + c.name));
+    row.appendChild(el('span', 'cmd', '/' + commandLabel(c)));
     if (c.description) row.appendChild(el('span', 'desc', c.description));
     if (c.source) {
       const label = c.source === 'local' ? 'ui' : c.source === 'builtin' ? 'pi' : c.source;
@@ -3623,7 +4519,8 @@ function moveSlashSel(d) {
 function pickSlash(i) {
   const c = slash.items[i];
   if (!c) return;
-  input.value = '/' + c.name + ' ';
+  // Tab/Enter completes to the name as it is shown (no "skill:" prefix)
+  input.value = '/' + commandLabel(c) + ' ';
   input.focus();
   closeSlashMenu();
   autoSize();
@@ -3971,12 +4868,90 @@ $('btn-tts').onclick = () => setAutoTts(!S.autoTts);
 
 /* ───────────────────────── sessions ───────────────────────── */
 
+/* Is this list row the session we mean? The path decides it. The file name is
+ * only a fallback for the bridge reporting the same session with another
+ * spelling, and only while that name is unique in the list: a subagent run
+ * transcript is also called `session.jsonl`, and matching on the bare name
+ * highlighted two dozen unrelated rows at once. */
+function sameSessionPath(a, b, all) {
+  if (!a || !b) return false;
+  const A = String(a), B = String(b);
+  if (A === B) return true;
+  const an = A.split(/[\\/]/).pop(), bn = B.split(/[\\/]/).pop();
+  if (an !== bn) return false;
+  const same = (all || []).filter((s) => String((s && s.fileName) || '').split(/[\\/]/).pop() === an);
+  return same.length === 1;
+}
+
 async function refreshSessions() {
   try {
     const res = await fetch(api('/api/sessions'));
     const d = await res.json();
-    renderSessions(d.sessions || []);
+    S.sessionsList = d.sessions || [];
+    renderSessions(S.sessionsList);
+    applyAgentStatus(d);
   } catch { /* ignore */ }
+}
+
+/* What the agent is doing, straight from the bridge: a reload in the middle of a
+ * compaction used to look like a page where nothing ever happened. */
+function applyAgentStatus(d) {
+  if (!d) return;
+  if ('busy' in d) S.agentBusy = !!d.busy;
+  if (!('compacting' in d)) return;
+  const c = d.compacting;
+  const mine = !c || !c.session || !S.state.sessionFile || sameSessionPath(c.session, S.state.sessionFile, []);
+  if (c && mine && !S.compacting) {
+    S.compacting = true;
+    if (!S.compactionLive) S.compactionLive = renderCompactionLive(c.since);
+    else if (S.compactionLive.setSince) S.compactionLive.setSince(c.since);
+    document.body.classList.add('compacting');
+  } else if (!c && S.compacting) {
+    // It finished while the page was away (or in another tab).
+    S.compacting = false;
+    S.compactionHappened = true;
+    removeCompactionLive();
+    document.body.classList.remove('compacting');
+  }
+  // The task clock: the agent is idle, so the task that was running when this page
+  // was last here is done - it stopped at the agent's last message.
+  if (S.agentBusy === false && S.runStartTs && !S.compacting) {
+    const endTs = lastAssistantTs();
+    if (endTs > S.runStartTs) finishRunClock(endTs);
+    // No message after the clock started (the page was reloaded into a session
+    // whose task ended long ago): there is no honest number to show, so drop it
+    // rather than counting idle time.
+    else if (!endTs || endTs < S.runStartTs) {
+      S.runStartTs = null;
+      S.runMs = null;
+      saveSessionUi({ runStart: null, runMs: null });
+      paintRunStat();
+      ensureTick();
+    }
+  }
+}
+
+/* The blue highlight in the session list shows which session you are looking at,
+ * so it has to be repainted the moment that changes. Switching sessions used to
+ * leave the previous row highlighted (the list only re-rendered on the 20s poll),
+ * which read as "the highlight is stuck on the session the agent is running in". */
+function syncSessionHighlight() {
+  try { renderSessions(S.sessionsList || []); } catch { /* the list is not up yet */ }
+}
+
+/* ── folding a session's forks away ──────────────────────────────────────
+ * Forks are rows under the session they came from. A parent with children gets
+ * an arrow to fold them, so a session with a dozen branches still leaves the list
+ * readable - and the fold is remembered per browser. */
+function loadForkCollapse() {
+  try { return JSON.parse(localStorage.getItem('piwebui-forks-collapsed') || '{}') || {}; } catch { return {}; }
+}
+function toggleForkCollapse(sessionPath) {
+  if (!S.collapsedForks) S.collapsedForks = {};
+  if (S.collapsedForks[sessionPath]) delete S.collapsedForks[sessionPath];
+  else S.collapsedForks[sessionPath] = true;
+  try { localStorage.setItem('piwebui-forks-collapsed', JSON.stringify(S.collapsedForks)); } catch { /* private mode */ }
+  renderSessions(S.sessionsList || []);
 }
 
 function renderSessions(sessions) {
@@ -4016,6 +4991,9 @@ function renderSessions(sessions) {
   // everything being sorted by time: a branch belongs under the session it came
   // from.
   const byPath = new Map(sessions.map((s) => [s.path, s]));
+  const collapsedForks = S.collapsedForks || {};
+  // A search shows everything: hiding a match behind a fold would be a mystery.
+  const folded = (path) => !filter && !!collapsedForks[path];
   const ordered = [];
   const placed = new Set();
   for (const s of sessions) {
@@ -4023,102 +5001,252 @@ function renderSessions(sessions) {
     if (placed.has(s.path)) continue;
     ordered.push(s);
     placed.add(s.path);
-    const kids = sessions.filter((x) => x.parent === s.path).sort((a, b) => b.mtime - a.mtime);
-    for (const k of kids) { ordered.push(k); placed.add(k.path); }
+    if (!folded(s.path)) {
+      const kids = sessions.filter((x) => x.parent === s.path).sort((a, b) => b.mtime - a.mtime);
+      for (const k of kids) { ordered.push(k); placed.add(k.path); }
+    }
   }
-  for (const s of sessions) if (!placed.has(s.path)) ordered.push(s);
+  for (const s of sessions) {
+    if (placed.has(s.path)) continue;
+    // ...but a branch whose parent is folded stays folded: this pass used to put
+    // it back, so clicking the arrow appeared to do nothing.
+    if (s.parent && byPath.has(s.parent) && folded(s.parent)) continue;
+    ordered.push(s);
+  }
 
   const shown = ordered.filter((s) => !filter || s.name.toLowerCase().includes(filter) || s.fileName.toLowerCase().includes(filter));
   if (!shown.length) list.appendChild(el('div', 'session-item s-meta', 'No sessions found'));
-  const collapsed = SET.forkCollapsed || {};
-  const hiddenForks = new Set();
-  for (const [parentPath, isCollapsed] of Object.entries(collapsed)) {
-    if (!isCollapsed) continue;
-    for (const x of sessions) if (x.parent === parentPath) hiddenForks.add(x.path);
+  // ── folders ─────────────────────────────────────────────────────────────
+  // Sessions can live in folders (Settings and the folder menu write them into
+  // the bridge's settings, so they are the same in every browser). A folder is a
+  // drop target for a session row, and folders can be dragged onto each other to
+  // change their order.
+  const folders = Array.isArray(SET.sessionFolders) ? SET.sessionFolders : [];
+  const folderOf = new Map();
+  for (const f of folders) for (const p of f.paths || []) folderOf.set(p, f.id);
+  const inFolder = new Set(shown.filter((x) => folderOf.has(x.path)).map((x) => x.path));
+  const collapsedFolders = S.collapsedFolders || {};
+
+  const addRow = (s) => {
+      const item = el('div', 'session-item');
+      // A session that was forked off another one: thinner row, smaller grey text
+      // and an arrow in front, so the branch structure is visible in the list.
+      const parentName = s.parent ? (byPath.get(s.parent) || {}).name : null;
+      if (s.parent) {
+        item.classList.add('fork');
+        item.title = parentName ? `branched from "${parentName}"` : `branched from ${s.parent}`;
+      }
+      const kids = sessions.filter((x) => x.parent === s.path);
+      const isCurrent = current && sameSessionPath(s.path, current, sessions);
+      const isViewed = S.viewSession ? sameSessionPath(s.path, S.viewSession, sessions) : false;
+      // The blue highlight follows what you are looking at; the green pulsing dot
+      // marks the session still running in the background. Highlighting both made
+      // it look like two sessions were selected at once.
+      if (S.viewSession ? isViewed : isCurrent) item.classList.add('active');
+      if (isCurrent && S.isStreaming) item.classList.add('live');
+      const nameRow = el('div', 's-name');
+      if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
+      // The arrow that folds this session's forks away (only where there are any).
+      const forkKids = sessions.filter((x) => x.parent === s.path);
+      if (forkKids.length) {
+        const open = !collapsedForks[s.path];
+        const arrow = el('span', 'fork-toggle', open ? '▾' : '▸');
+        arrow.title = open
+          ? `hide the ${forkKids.length} session${forkKids.length > 1 ? 's' : ''} forked from this one`
+          : `show the ${forkKids.length} session${forkKids.length > 1 ? 's' : ''} forked from this one`;
+        arrow.setAttribute('role', 'button');
+        arrow.setAttribute('aria-expanded', open ? 'true' : 'false');
+        arrow.onclick = (e) => { e.stopPropagation(); toggleForkCollapse(s.path); };
+        nameRow.appendChild(arrow);
+      }
+      nameRow.appendChild(document.createTextNode(s.name));
+      item.appendChild(nameRow);
+      item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
+      item.onclick = () => switchToSession(s.path);
+      item.oncontextmenu = (e) => { e.preventDefault(); openSessionMenu(s, item); };
+      // Drag a session onto a folder (or onto another session inside one) to file
+      // it; drag it onto the empty part of the list to take it out again.
+      item.draggable = true;
+      item.dataset.path = s.path;
+      item.addEventListener('dragstart', (e) => {
+        dragSession = s.path;
+        item.classList.add('dragging');
+        try { e.dataTransfer.setData('text/plain', s.path); e.dataTransfer.effectAllowed = 'move'; } catch { /* synthetic or older browsers */ }
+      });
+      item.addEventListener('dragend', () => {
+        dragSession = null;
+        item.classList.remove('dragging');
+        document.querySelectorAll('.session-folder.drop, .session-item.drop-line').forEach((n) => n.classList.remove('drop', 'drop-line'));
+      });
+      item.addEventListener('dragover', (e) => {
+        if (!dragSession || dragSession === s.path) return;
+        e.preventDefault();
+        item.classList.add('drop-line');
+      });
+      item.addEventListener('dragleave', () => item.classList.remove('drop-line'));
+      item.addEventListener('drop', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        item.classList.remove('drop-line');
+        if (!dragSession || dragSession === s.path) return;
+        const fid = folderOf.get(s.path) || null;
+        if (fid) assignToFolder(dragSession, fid, s.path);
+      });
+      list.appendChild(item);
+  };
+
+  for (const f of folders) {
+    const kids = shown.filter((x) => folderOf.get(x.path) === f.id);
+    if (filter && !kids.length) continue;          // while searching, empty folders are noise
+    list.appendChild(folderHeader(f, kids.length));
+    if (!collapsedFolders[f.id]) for (const k of kids) addRow(k);
   }
-  for (const s of shown) {
-    // A session started from another one - a forked branch, or a subagent that
-    // went off to work in the background - is not a line in this list any more.
-    // They used to pile up here and push the sessions you actually use off the
-    // top of the sidebar; the count on the parent and the menu in the session
-    // bar keep them one click away (see openBranchesMenu).
-    if (s.parent && byPath.has(s.parent)) { hiddenForks.add(s.path); continue; }
-    const item = el('div', 'session-item');
-    // A session that was forked off another one: thinner row, smaller grey text
-    // and an arrow in front, so the branch structure is visible in the list.
-    const parentName = s.parent ? (byPath.get(s.parent) || {}).name : null;
-    if (s.parent) {
-      item.classList.add('fork');
-      item.title = parentName ? `branched from "${parentName}"` : `branched from ${s.parent}`;
-    }
-    const kids = sessions.filter((x) => x.parent === s.path);
-    const isCurrent = current && (s.path === current || s.fileName === current.split(/[\\/]/).pop());
-    const isViewed = S.viewSession
-      ? (s.path === S.viewSession || s.fileName === S.viewSession.split(/[\\/]/).pop())
-      : false;
-    // The blue highlight follows what you are looking at; the green pulsing dot
-    // marks the session still running in the background. Highlighting both made
-    // it look like two sessions were selected at once.
-    if (S.viewSession ? isViewed : isCurrent) item.classList.add('active');
-    if (isCurrent && S.isStreaming) item.classList.add('live');
-    const nameRow = el('div', 's-name');
-    if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
-    nameRow.appendChild(document.createTextNode(s.name));
-    if (kids.length) {
-      const badge = el('span', 'fork-toggle', `⑃ ${kids.length}`);
-      badge.title = `${kids.length} session${kids.length > 1 ? 's' : ''} started from this one - click to see them`;
-      badge.onclick = (e) => { e.stopPropagation(); openBranchesMenu(badge, s.path); };
-      nameRow.appendChild(badge);
-    }
-    item.appendChild(nameRow);
-    item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
-    item.onclick = () => switchToSession(s.path);
-    item.oncontextmenu = (e) => { e.preventDefault(); openSessionMenu(s, item); };
-    list.appendChild(item);
+  for (const x of shown) if (!inFolder.has(x.path)) addRow(x);
+}
+
+/* ── session folders ──────────────────────────────────────────────────────
+ * Hand-organised groups of sessions: create, rename, drag sessions in, drag the
+ * folders into the order you want. The folders live in the bridge's settings, so
+ * they are the same whatever browser or machine you open the UI from. */
+function saveFolders() {
+  SET.sessionFolders = (SET.sessionFolders || []).filter((f) => f && f.id);
+  saveSettings();
+  syncSessionHighlight();
+}
+
+function newFolder(name, beforeId) {
+  const f = { id: `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name: name || 'new folder', paths: [] };
+  const list = SET.sessionFolders || (SET.sessionFolders = []);
+  const at = beforeId ? list.findIndex((x) => x.id === beforeId) : -1;
+  if (at >= 0) list.splice(at, 0, f); else list.push(f);
+  saveFolders();
+  return f;
+}
+
+async function addFolderDialog() {
+  const out = await askDialog({
+    title: 'New folder',
+    body: 'Sessions you drag into it stay in this browser setup, not in the agent.',
+    fields: [{ name: 'name', label: 'name', value: 'new folder' }],
+    okLabel: 'create',
+    require: ['name'],
+  });
+  if (!out) return;
+  newFolder(out.name);
+}
+
+function toggleFolder(id) {
+  const c = S.collapsedFolders || (S.collapsedFolders = {});
+  c[id] = !c[id];
+  try { localStorage.setItem('piwebui-folders-collapsed', JSON.stringify(c)); } catch { /* private mode */ }
+  syncSessionHighlight();
+}
+
+/* One session (or none) moving into a folder, or a folder being reordered. */
+function assignToFolder(path, folderId, beforePath) {
+  if (!path) return;
+  const folders = SET.sessionFolders || (SET.sessionFolders = []);
+  for (const f of folders) f.paths = (f.paths || []).filter((p) => p !== path);
+  const target = folders.find((f) => f.id === folderId);
+  if (target) {
+    const at = beforePath ? (target.paths || []).indexOf(beforePath) : -1;
+    if (!target.paths) target.paths = [];
+    if (at >= 0) target.paths.splice(at, 0, path); else target.paths.push(path);
+    if (S.collapsedFolders && S.collapsedFolders[folderId]) toggleFolder(folderId);
   }
+  saveFolders();
 }
 
-/* Sessions started from one session: branches forked off it and subagents that
- * kept working in the background. One menu, reachable from the session bar and
- * from the parent's row, so they stay out of the list without being hidden. */
-function branchChildren(path) {
-  return (S.sessionsList || [])
-    .filter((x) => x.parent === path)
-    .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+/* Dropping one folder onto another swaps the two: the dragged one lands exactly
+ * where the other was, which is the one rule that is easy to predict while
+ * dragging. (Inserting before it looks like nothing happened whenever the
+ * dragged folder was already earlier in the list.) */
+function reorderFolder(id, ontoId) {
+  if (!id || !ontoId || id === ontoId) return;
+  const folders = SET.sessionFolders || [];
+  const from = folders.findIndex((f) => f.id === id);
+  const to = folders.findIndex((f) => f.id === ontoId);
+  if (from < 0 || to < 0) return;
+  const [moved] = folders.splice(from, 1);
+  folders.splice(to, 0, moved);
+  saveFolders();
 }
 
-function openBranchesMenu(anchor, path) {
-  const kids = branchChildren(path);
-  if (!kids.length) { toast('Nothing was started from this session'); return; }
-  const cur = S.state.sessionFile;
-  const items = kids.map((k) => ({
-    label: k.name,
-    hint: (k.path === cur ? 'in this session · ' : '') + new Date(k.mtime).toLocaleString(),
-    active: k.path === cur || k.path === S.viewSession,
-    onPick: () => switchToSession(k.path),
-  }));
-  items.push({ sep: true });
-  items.push({ label: 'refresh the list', hint: 're-read the session directory', onPick: () => refreshSessions() });
-  openMenu(anchor, items, { title: `started from this session (${kids.length})`, width: 420 });
+function openFolderMenu(f, row) {
+  const count = (f.paths || []).length;
+  openMenu(row, [
+    { label: 'rename…', hint: f.name, onPick: async () => {
+      const out = await askDialog({ title: 'Rename folder', fields: [{ name: 'name', label: 'name', value: f.name }], okLabel: 'rename', require: ['name'] });
+      if (!out) return;
+      f.name = out.name;
+      saveFolders();
+    } },
+    { label: 'new folder below', onPick: () => newFolder('new folder', null) },
+    { label: count ? `empty it (${count} session${count > 1 ? 's' : ''})` : 'it is already empty', danger: false, onPick: () => {
+      if (!count) return;
+      f.paths = [];
+      saveFolders();
+      toast(`“${f.name}” emptied — the sessions are back in the list`);
+    } },
+    { sep: true },
+    { label: 'delete the folder', hint: 'the sessions stay', danger: true, onPick: () => {
+      SET.sessionFolders = (SET.sessionFolders || []).filter((x) => x.id !== f.id);
+      saveFolders();
+      toast(`Deleted “${f.name}”`);
+    } },
+  ], { title: f.name, width: 340, force: true, align: 'right' });
 }
 
-function updateBranchesBtn() {
-  const btn = $('btn-branches');
-  if (!btn) return;
-  const cur = S.state.sessionFile;
-  const kids = cur ? branchChildren(cur) : [];
-  btn.classList.toggle('hidden', !kids.length);
-  const count = $('branches-count');
-  if (count) count.textContent = String(kids.length);
-  btn.title = kids.length
-    ? `${kids.length} session${kids.length > 1 ? 's' : ''} started from this one (forks, subagents)`
-    : 'Sessions started from this one';
-  btn.onclick = (e) => { e.stopPropagation(); openBranchesMenu(btn, cur); };
+/* The folder row in the sidebar: caret, name, how many, and the drop targets. */
+function folderHeader(f, count) {
+  const row = el('div', 'session-folder');
+  row.dataset.folder = f.id;
+  const open = !(S.collapsedFolders || {})[f.id];
+  row.appendChild(el('span', 'folder-caret', open ? '▾' : '▸'));
+  row.appendChild(el('span', 'folder-name', f.name || 'folder'));
+  row.appendChild(el('span', 'folder-count', String(count)));
+  row.title = `${f.name} — ${count} session${count === 1 ? '' : 's'}
+click to fold, drag a session here, right-click to rename`;
+  // Dragging one folder onto another reorders them.
+  row.draggable = true;
+  row.addEventListener('dragstart', (e) => {
+    dragFolder = f.id;
+    row.classList.add('dragging');
+    try { e.dataTransfer.setData('text/plain', `folder:${f.id}`); e.dataTransfer.effectAllowed = 'move'; } catch { /* synthetic events */ }
+  });
+  row.addEventListener('dragend', () => {
+    dragFolder = null;
+    row.classList.remove('dragging');
+    document.querySelectorAll('.session-folder.drop').forEach((n) => n.classList.remove('drop'));
+  });
+  row.onclick = () => toggleFolder(f.id);
+  row.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); openFolderMenu(f, row); };
+  row.addEventListener('dragover', (e) => {
+    if (!dragSession && !dragFolder) return;
+    e.preventDefault();
+    row.classList.add('drop');
+  });
+  row.addEventListener('dragleave', () => row.classList.remove('drop'));
+  row.addEventListener('drop', (e) => {
+    e.preventDefault();
+    row.classList.remove('drop');
+    if (dragFolder) { reorderFolder(dragFolder, f.id); return; }
+    if (dragSession) assignToFolder(dragSession, f.id);
+  });
+  return row;
 }
+
+let dragSession = null;
+let dragFolder = null;
+
+/* Forks are rows in the session list again (and subagent run transcripts never
+ * reach it - the bridge keeps them out), so there is no count to keep up to
+ * date. Kept as a no-op for the callers that used to refresh the badge. */
+function updateBranchesBtn() {}
 
 $('session-filter').oninput = () => refreshSessions();
 $('btn-refresh-sessions').onclick = () => refreshSessions();
-updateBranchesBtn();
+$('btn-new-folder').onclick = () => addFolderDialog();
 
 async function switchToSession(sessionPath) {
   const agentSession = S.state.sessionFile;
@@ -4126,9 +5254,12 @@ async function switchToSession(sessionPath) {
     if (!S.viewSession) return; // already here
     // Coming back to the agent's own session: re-render it and re-attach the
     // live view (if the agent is still running).
+    S.viewSubagent = null;
     S.viewSession = null;
     await refreshMessages();
     updateViewBanner();
+    updateSubagentsBtn();
+    syncSessionHighlight();
     return;
   }
   if (S.isStreaming) {
@@ -4141,18 +5272,23 @@ async function switchToSession(sessionPath) {
       frag.appendChild(S.live.root); // detaches it from the visible chat
       S.liveDetached = { path: agentSession, frag };
     }
+    S.viewSubagent = null;
     S.viewSession = sessionPath;
     await renderSessionFromDisk(sessionPath);
+    updateSubagentsBtn();
     updateViewBanner();
+    syncSessionHighlight();
     return;
   }
   // Agent is idle: move it to the selected session so input works there.
   try {
     await rpc({ type: 'switch_session', sessionPath });
     S.state.sessionFile = sessionPath;
+    S.viewSubagent = null;
     S.viewSession = null;
     $('session-name').value = '';
     await initSession(false);
+    syncSessionHighlight();
     toast('Session switched');
   } catch (e) {
     // pi refuses to switch to a session whose recorded working directory is
@@ -4180,6 +5316,7 @@ async function switchToSession(sessionPath) {
         if (!r.ok) throw new Error(d.error || 'could not create it');
         await rpc({ type: 'switch_session', sessionPath });
         S.state.sessionFile = sessionPath;
+        S.viewSubagent = null;
         S.viewSession = null;
         $('session-name').value = '';
         await initSession(false);
@@ -4198,7 +5335,7 @@ async function renderSessionFromDisk(sessionPath) {
   try {
     const d = await fetchSession(sessionPath);
     const msgs = d.messages;
-    const distFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+    const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
     chat.innerHTML = '';
     transcriptTarget = chat;
     for (const m of msgs) {
@@ -4225,7 +5362,7 @@ async function renderSessionFromDisk(sessionPath) {
       }
     }
     if (S.stickToBottom) scrollBottom(true);
-    else chat.scrollTop = chat.scrollHeight - chat.clientHeight - distFromBottom;
+    else chatScroller().scrollTop = chatScroller().scrollHeight - chatScroller().clientHeight - distFromBottom;
   } catch (e) {
     toast(`Could not load session: ${e.message}`, 'error');
   }
@@ -4323,7 +5460,23 @@ function handleExtensionUi(req) {
     }
     case 'setWidget': {
       const bar = $('widget-bar');
-      const lines = (req.widgetLines || []).map(stripAnsi).filter((l) => l && l.trim());
+      // The pi-subagents extension publishes its live runs as a widget whose
+      // single line is `PI_SUBAGENT_ASYNC_JSON:{…}`. It is data for the panel
+      // below, not text for the widget bar (it used to be printed there as a
+      // wall of JSON).
+      const raw = (req.widgetLines || []).map(stripAnsi);
+      for (const line of raw) {
+        const i = line.indexOf('PI_SUBAGENT_ASYNC_JSON:');
+        if (i >= 0) {
+          try { setSubagentSnapshot(JSON.parse(line.slice(i + 'PI_SUBAGENT_ASYNC_JSON:'.length))); } catch { /* partial line */ }
+        }
+        const j = line.indexOf('PI_SUBAGENT_INSPECT_JSON:');
+        if (j >= 0) {
+          try { noteSubagentInspect(JSON.parse(line.slice(j + 'PI_SUBAGENT_INSPECT_JSON:'.length))); } catch { /* partial line */ }
+        }
+      }
+      const lines = raw.filter((l) => l && l.trim()
+        && l.indexOf('PI_SUBAGENT_ASYNC_JSON:') < 0 && l.indexOf('PI_SUBAGENT_INSPECT_JSON:') < 0);
       if (lines.length) bar.dataset[req.widgetKey] = lines.join('\n');
       else delete bar.dataset[req.widgetKey];
       const content = Object.values(bar.dataset).join('\n');
@@ -4408,7 +5561,72 @@ function showExtensionDialog(req) {
 
 /* ───────────────────────── toasts / banner / misc ───────────────────────── */
 
+/* ── notifications and errors, kept ──────────────────────────────────────
+ * A toast is gone five seconds later, and the one that mattered (the agent
+ * failed, the upload was refused, another instance stopped answering) is exactly
+ * the one you were not looking at. Everything the app reports also goes here,
+ * with the time, and the bell in the top bar shows them. */
+function notice(text, kind = 'info', detail) {
+  try {
+    if (!S.notices) S.notices = [];
+    S.notices.push({ t: Date.now(), text: String(text).slice(0, 500), kind, detail: detail ? String(detail).slice(0, 800) : null });
+    if (S.notices.length > 200) S.notices.splice(0, S.notices.length - 200);
+    S.noticesUnread = (S.noticesUnread || 0) + 1;
+    updateBell();
+  } catch { /* never let logging break the thing being logged */ }
+}
+
+function updateBell() {
+  const btn = $('btn-bell');
+  if (!btn) return;
+  const unread = S.noticesUnread || 0;
+  const badge = $('bell-count');
+  if (badge) {
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    badge.classList.toggle('hidden', unread === 0);
+  }
+  btn.classList.toggle('has-error', (S.notices || []).some((x) => x.kind === 'error'));
+}
+
+function openBellMenu() {
+  const items = [];
+  const list = (S.notices || []).slice().reverse();
+  for (const n of list.slice(0, 60)) {
+    const at = new Date(n.t);
+    const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const day = at.toDateString() === new Date().toDateString() ? '' : `${at.toLocaleDateString()} `;
+    items.push({
+      label: n.text,
+      hint: `${day}${time}${n.kind !== 'info' ? ` · ${n.kind}` : ''}`,
+      dot: n.kind === 'error' ? 'off-dot' : null,
+      keepOpen: true,
+      onPick: () => { if (n.detail) copyText(n.detail, 'Copied the details'); },
+    });
+  }
+  if (!items.length) items.push({ label: 'nothing yet', hint: 'notifications and errors show up here', keepOpen: true, onPick: () => {} });
+  items.push({ sep: true });
+  items.push({ label: 'clear', hint: 'empty the list', onPick: () => { S.notices = []; S.noticesUnread = 0; updateBell(); } });
+  const menu = openMenu($('btn-bell'), items, { title: 'notifications', width: 460, force: true, align: 'right' });
+  if (menu) { S.noticesUnread = 0; updateBell(); }
+}
+
+/* A failure that would otherwise only reach the developer console. */
+window.addEventListener('error', (e) => {
+  if (e && e.target && e.target.tagName && /^(IMG|VIDEO|SCRIPT|LINK)$/.test(e.target.tagName)) {
+    notice(`${e.target.tagName.toLowerCase()} failed to load: ${String(e.target.src || e.target.href || '').split('/').pop()}`, 'error');
+    return;
+  }
+  notice(`Error: ${(e && e.message) || 'unknown'}`, 'error', (e && e.error && e.error.stack) || null);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const r = e && e.reason;
+  const text = r && r.message ? r.message : String(r);
+  if (/abort/i.test(text)) return;      // our own aborted fetches
+  notice(`Unhandled: ${text}`, 'error', (r && r.stack) || null);
+});
+
 function toast(text, kind = 'info') {
+  notice(text, kind);
   const t = el('div', `toast ${kind}`, text);
   $('toasts').appendChild(t);
   setTimeout(() => t.remove(), 5000);
@@ -4509,6 +5727,11 @@ function openSettings() {
   $('set-bg-volume-val').textContent = `${SET.bgVolume == null ? 50 : Number(SET.bgVolume)}%`;
   $('set-bg-audio').checked = !!SET.bgAudio;
   $('set-gamer').checked = !!SET.gamerMode;
+  if ($('set-gamer-speed')) {
+    $('set-gamer-speed').value = String(Number(SET.gamerSpeed) || 16);
+    $('set-gamer-speed-val').textContent = `${Number(SET.gamerSpeed) || 16}s`;
+    setGamerSpeedVisible(!!SET.gamerMode);
+  }
   $('set-done-sound').checked = !!SET.doneSound;
   $('set-done-notify').checked = !!SET.doneNotify;
   $('set-done-only-unfocused').checked = SET.doneOnlyUnfocused !== false;
@@ -4532,6 +5755,7 @@ function openSettings() {
   populateTtsVoiceSelect();
   loadPiProviders();
   loadAuthProviders();
+  prettifySettingsSelects();
   $('settings-dialog').showModal();
 }
 
@@ -4616,9 +5840,13 @@ $('set-stt-endpoint').addEventListener('change', (e) => {
   saveSettings();
   toast(SET.sttEndpoint ? 'Whisper endpoint set — the mic will use it' : 'Whisper endpoint cleared — using browser voice');
 });
-$('set-stt-backend').onchange = (e) => {
+$('set-stt-backend').onchange = async (e) => {
   SET.sttBackend = e.target.value;
   saveSettings();
+  // Show what this backend needs immediately. Waiting for the dialog to be
+  // reopened (save + ⚙ again) made it look like the choice had not taken.
+  syncVoiceSettingsUi();
+  if (!sttModelsLoaded) await loadSttModels().catch(() => {});
   toast(SET.sttBackend === 'whisper'
     ? 'Voice input: Whisper server' + (SET.sttEndpoint ? ` (${SET.sttEndpoint})` : ' (auto local server)')
     : 'Voice input: browser speech recognition (Chrome/Edge only)');
@@ -4640,6 +5868,15 @@ $('bg-input').onchange = async (e) => {
   const isVideo = f.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(f.name);
   const isImage = f.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(f.name);
   if (!isVideo && !isImage) { toast('Pick an image, GIF or video file', 'warning'); return; }
+  await setBackgroundFromFile(f);
+}
+
+/* Store a picked file as the background. No size limit here on purpose: this
+ * file is never sent to the model, it is only written to the workspace and shown
+ * behind the UI. */
+async function setBackgroundFromFile(f) {
+  const isVideo = f.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(f.name);
+  const isImage = f.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(f.name);
   toast(isVideo ? 'Uploading background video…' : 'Uploading background…');
   try {
     const up = await uploadFile(f);
@@ -4738,22 +5975,38 @@ window.addEventListener('resize', () => {
  * 16 seconds. Slow enough to read text over, fast enough to be alive. One timer
  * for the page, and it stops the moment the setting goes off. */
 let gamerTimer = null;
+let gamerPhase = 0;      // where we are in the cycle, 0..1
 function startGamerAccent() {
   if (gamerTimer) return;
   const root = document.documentElement.style;
-  const t0 = Date.now();
-  const tick = () => {
-    const hue = (((Date.now() - t0) / 16000) * 360) % 360;
-    root.setProperty('--accent', `hsl(${hue.toFixed(0)} 80% 62%)`);
-    root.setProperty('--accent-dim', `hsl(${hue.toFixed(0)} 55% 28%)`);
+  let lastPaint = 0;
+  let lastTs = 0;
+  // The colour is advanced by the time that actually passed, never by a tick
+  // count or a frame count: an interval that fires late, a busy page or a hidden
+  // tab used to change the speed of the whole thing. Changing the speed setting
+  // continues from where the colour is instead of jumping, and oklch keeps the
+  // perceived speed even - a linear hsl sweep races through the greens and
+  // crawls through the blues.
+  const tick = (ts) => {
+    gamerTimer = requestAnimationFrame(tick);
+    const dt = lastTs ? Math.min(250, ts - lastTs) : 0;
+    lastTs = ts;
+    gamerPhase = (gamerPhase + dt / (Math.max(1, Number(SET.gamerSpeed) || 16) * 1000)) % 1;
+    if (ts - lastPaint < 60) return;   // ~16 fps is plenty for a colour drift
+    lastPaint = ts;
+    const hue = gamerPhase * 360;
+    root.setProperty('--accent', `oklch(68% 0.17 ${hue.toFixed(1)})`);
+    root.setProperty('--accent-dim', `oklch(38% 0.09 ${hue.toFixed(1)})`);
   };
-  tick();
-  gamerTimer = setInterval(tick, 120);
+  gamerTimer = requestAnimationFrame(tick);
 }
 function stopGamerAccent() {
   if (!gamerTimer) return;
-  clearInterval(gamerTimer);
+  cancelAnimationFrame(gamerTimer);
   gamerTimer = null;
+  const root = document.documentElement.style;
+  root.removeProperty('--accent');
+  root.removeProperty('--accent-dim');
 }
 
 /* ── "the agent has finished" ─────────────────────────────────────────────
@@ -4930,7 +6183,9 @@ function schedulePaint(frames) {
   if (!stage) return;
   const n = frames || 0;
   const tiny = stage.clientWidth < 24 || stage.clientHeight < 24;
-  if (tiny && n < 20) { requestAnimationFrame(() => schedulePaint(n + 1)); return; }
+  // Waiting for layout is a question of time, not of frames: counting frames
+  // made this give up sooner on a fast display and later on a slow one.
+  if (tiny && n < 40) { requestAnimationFrame(() => schedulePaint(n + 2)); return; }
   // Normally the stylesheet sizes the stage. Only if it really has no size -
   // an embedded webview reporting a 0x0 window before layout - put pixels in.
   if (tiny) {
@@ -5178,7 +6433,28 @@ $('set-bg-audio').onchange = (e) => {
   applyBgAudio(document.querySelector('#bg-media video'));
   if (SET.bgAudio) toast('Background sound follows the volume slider — browsers only allow it after you click the page');
 };
-$('set-gamer').onchange = (e) => { SET.gamerMode = e.target.checked; saveSettings(); };
+$('set-gamer').onchange = (e) => {
+  SET.gamerMode = e.target.checked;
+  setGamerSpeedVisible(SET.gamerMode);
+  saveSettings();
+};
+/* The speed row is a label plus its slider in the settings grid: hiding only one
+ * half left a stray label (or a stray slider) in the middle of the tab. */
+function setGamerSpeedVisible(on) {
+  const row = $('gamer-speed-row');
+  const label = $('gamer-speed-label');
+  if (row) row.classList.toggle('hidden', !on);
+  if (label) label.classList.toggle('hidden', !on);
+}
+
+/* The cycle is driven by the clock, so a new speed only has to be stored: the
+ * next frame picks it up (no restart, no visible jump). */
+$('set-gamer-speed').oninput = (e) => {
+  SET.gamerSpeed = parseInt(e.target.value, 10) || 16;
+  $('set-gamer-speed-val').textContent = `${SET.gamerSpeed}s`;
+  startGamerAccent();   // already running: the next frame just uses the new speed
+};
+$('set-gamer-speed').onchange = () => saveSettings();
 $('set-done-sound').onchange = (e) => {
   SET.doneSound = e.target.checked;
   saveSettings();
@@ -5197,39 +6473,73 @@ $('set-done-only-unfocused').onchange = (e) => {
   SET.doneOnlyUnfocused = e.target.checked;
   saveSettings();
 };
-$('set-lan').onchange = async (e) => {
-  const on = e.target.checked;
+/* Flip the network switch. Both the Settings checkbox and the first-run dialog call
+ * this: moving the listening socket drops the connections open on it, so the request
+ * can be lost even though it was on its way - which is why the retry lives here and
+ * not in either caller. */
+async function setLanAccess(on, box) {
+  const cb = box || null;
+  if (cb) cb.disabled = true;
+  lanBusy = true;
+  const post = () => fetch(api('/api/lan'), {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ lan: on }),
+  }).then((r) => r.json());
   try {
-    const d = await fetch(api('/api/lan'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lan: on }),
-    }).then((r) => r.json());
-    if (d.error) throw new Error(d.error);
-    toast(on ? `Network access on${d.url ? ` — ${d.url}` : ''}` : 'Network access off (this machine only)');
-    refreshLanSetting().catch(() => {});
-  } catch (err) {
-    // Moving the listening socket closes connections, so the answer can be lost
-    // even though the switch worked; ask the bridge before calling it a failure.
-    await new Promise((r) => setTimeout(r, 600));
-    try {
-      const d = await fetch(api('/api/lan')).then((r) => r.json());
-      if (!!d.lan === on) { toast(on ? 'Network access on' : 'Network access off (this machine only)'); refreshLanSetting().catch(() => {}); return; }
-    } catch { /* still unreachable */ }
-    e.target.checked = !on;
-    toast(`Could not change network access: ${err.message}`, 'error');
+  let d = null;
+  let lastErr = null;
+  // Moving the listening socket drops the connections open on it, so a request
+  // can be lost even though it was on its way - and a second flip made while
+  // the first is still moving hits exactly that window, which is why the switch
+  // sometimes had to be clicked twice. Keep asking: what the user asked for is
+  // what happens, as soon as the socket is there to hear it.
+  for (let attempt = 0; attempt < 6 && !d; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 300 * attempt));
+    try { d = await post(); } catch (err) { lastErr = err; }
   }
-};
+  if (!d) throw lastErr || new Error('the bridge did not answer');
+  if (d.error) throw new Error(d.error);
+  // The bridge's answer is the state it ended up in. Asking again right away
+  // raced the socket rebind (it happens 250ms later), so the box was read back
+  // as "off" and clicked straight back off - which is why it sometimes took two
+  // clicks to switch it either way.
+  box.checked = !!d.lan;
+  toast(d.lan ? `Network access on${d.url ? ` — ${d.url}` : ''}` : 'Network access off (this machine only)');
+  if (d.note) toast(d.note, 'warning');
+  setTimeout(() => refreshLanSetting().catch(() => {}), 900);
+  } catch (err) {
+  // Moving the listening socket closes connections, so the answer can be lost
+  // even though the switch worked; ask the bridge before calling it a failure.
+  await new Promise((r) => setTimeout(r, 600));
+  try {
+    const d = await fetch(api('/api/lan')).then((r) => r.json());
+    if (!!d.lan === on) { toast(on ? 'Network access on' : 'Network access off (this machine only)'); refreshLanSetting().catch(() => {}); return; }
+  } catch { /* still unreachable */ }
+  box.checked = !on;
+  toast(`Could not change network access: ${err.message}`, 'error');
+  } finally {
+  box.disabled = false;
+  lanBusy = false;
+  }
+
+  }
+
+$('set-lan').onchange = (e) => setLanAccess(e.target.checked, e.target);
 
 /* Network access is a file the bridge reads at startup (bridge/lan.json) and
  * rewrites live, so this reports the bridge's own view rather than a guess. */
+/* True while the switch is being flipped: the answer that is still coming can
+ * describe the state before the flip, and letting it write over the checkbox is
+ * the other half of "sometimes it takes two clicks". */
+let lanBusy = false;
 async function refreshLanSetting() {
   const box = $('set-lan');
   const hint = $('lan-hint');
   if (!box && !hint) return;
   try {
     const d = await fetch(api('/api/lan')).then((r) => r.json());
-    if (box) box.checked = !!d.lan;
+    if (box && !lanBusy) box.checked = !!d.lan;
     if (hint) {
       hint.textContent = d.lan
         ? `Reachable from your network${d.url ? ` at ${d.url}` : ''}. Anyone who can reach it can drive this agent — there is no login.`
@@ -5269,12 +6579,58 @@ document.querySelectorAll('#settings-tabs .tab').forEach((t) => {
   };
 });
 
-/* first-launch setup */
+/* ── first-launch setup ──────────────────────────────────────────────────
+ * The one dialog everybody sees once: who the agent is, how it looks, how it
+ * should tell you it is done, and whether other devices may reach it. Everything
+ * here is also in Settings - the point is not to make people configure a UI
+ * before they can type, it is that the handful of things worth choosing up front
+ * (a name, a face, a readable text size, notifications, network access) are
+ * actually offered. */
+let setupLanWas = null;
+
+function setSetupGamerVisible(on) {
+  const row = $('setup-gamer-speed-row');
+  const label = $('setup-gamer-speed-label');
+  if (row) row.classList.toggle('hidden', !on);
+  if (label) label.classList.toggle('hidden', !on);
+}
+
+function refreshSetupPreview() {
+  const prev = $('setup-avatar-preview');
+  if (!prev) return;
+  if (SET.avatar) {
+    const node = avatarNode();
+    prev.replaceChildren(...node.childNodes);
+    prev.style.visibility = 'visible';
+  } else {
+    prev.replaceChildren();
+    prev.style.visibility = 'hidden';
+  }
+}
+
 function maybeShowSetup() {
   if (SET.onboarded) return;
   $('setup-agent-name').value = SET.agentName === 'pi' ? '' : SET.agentName;
   $('setup-shorts-provider').value = SHORTS_FEEDS[SET.shortsProvider] ? SET.shortsProvider : 'instagram';
   $('setup-accent').value = SET.themeAccent || '#5b9dff';
+  $('setup-gamer').checked = !!SET.gamerMode;
+  $('setup-gamer-speed').value = String(Number(SET.gamerSpeed) || 16);
+  $('setup-gamer-speed-val').textContent = `${Number(SET.gamerSpeed) || 16}s`;
+  setSetupGamerVisible(!!SET.gamerMode);
+  $('setup-font-size').value = String(Number(SET.chatFontSize) || 14);
+  $('setup-font-size-val').textContent = `${Number(SET.chatFontSize) || 14}px`;
+  $('setup-done-sound').checked = !!SET.doneSound;
+  $('setup-done-notify').checked = !!SET.doneNotify;
+  $('setup-voice-autosend').checked = !!SET.voiceAutoSend;
+  $('setup-lan').checked = false;
+  setupLanWas = null;
+  // The bridge's own view of the network switch (it lives in a file, not in the
+  // UI settings), so the box starts on the truth rather than on "off".
+  fetch(api('/api/lan')).then((r) => r.json()).then((d) => {
+    setupLanWas = !!d.lan;
+    if ($('setup-lan') && $('setup-dialog').open) $('setup-lan').checked = !!d.lan;
+  }).catch(() => { /* no bridge answer: leave it off */ });
+  refreshSetupPreview();
   $('setup-dialog').showModal();
 }
 $('setup-skip').onclick = () => {
@@ -5283,17 +6639,53 @@ $('setup-skip').onclick = () => {
   $('setup-dialog').close();
 };
 $('setup-accent-reset').onclick = () => { $('setup-accent').value = '#5b9dff'; };
-$('setup-done').onclick = () => {
+$('setup-gamer').onchange = (e) => {
+  setSetupGamerVisible(e.target.checked);
+  SET.gamerMode = e.target.checked;
+  applySettings();     // so the drift starts (or stops) while you look at it
+};
+$('setup-gamer-speed').oninput = (e) => {
+  SET.gamerSpeed = parseInt(e.target.value, 10) || 16;
+  $('setup-gamer-speed-val').textContent = `${SET.gamerSpeed}s`;
+};
+$('setup-font-size').oninput = (e) => {
+  SET.chatFontSize = parseInt(e.target.value, 10) || 14;
+  $('setup-font-size-val').textContent = `${SET.chatFontSize}px`;
+  applySettings();     // picked to be read, so show it while it is picked
+};
+$('setup-done-sound').onchange = (e) => { SET.doneSound = e.target.checked; if (e.target.checked) playDoneSound(); };
+$('setup-done-notify').onchange = (e) => {
+  SET.doneNotify = e.target.checked;
+  if (e.target.checked && 'Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => {});
+  }
+};
+// The two uploads reuse the Settings inputs (and their upload, crop and clear
+// paths) instead of growing a second copy of them.
+$('setup-avatar-upload').onclick = () => $('avatar-input').click();
+$('setup-bg-upload').onclick = () => $('bg-input').click();
+$('setup-avatar-clear').onclick = () => $('btn-avatar-clear').click();
+$('setup-bg-clear').onclick = () => $('btn-bg-clear').click();
+$('setup-done').onclick = async () => {
   const name = $('setup-agent-name').value.trim();
   if (name) SET.agentName = name;
   const prov = $('setup-shorts-provider').value;
   if (SHORTS_FEEDS[prov] || prov === 'none') SET.shortsProvider = prov;
   const acc = $('setup-accent').value;
   SET.themeAccent = acc && acc !== '#5b9dff' ? acc : null;
+  SET.gamerMode = $('setup-gamer').checked;
+  SET.gamerSpeed = parseInt($('setup-gamer-speed').value, 10) || 16;
+  SET.chatFontSize = parseInt($('setup-font-size').value, 10) || 14;
+  SET.doneSound = $('setup-done-sound').checked;
+  SET.doneNotify = $('setup-done-notify').checked;
+  SET.voiceAutoSend = $('setup-voice-autosend').checked;
   SET.onboarded = true;
   saveSettings();
   $('setup-dialog').close();
+  const wantLan = $('setup-lan').checked;
   toast(`Welcome, ${SET.agentName || 'pi'}!`);
+  // Only touch the network switch when the answer changed (it rebinds a socket).
+  if (setupLanWas !== null && wantLan !== setupLanWas) setLanAccess(wantLan, $('setup-lan'));
 };
 
 /* ───────────────────────── pi providers (models.json) ───────────────────────── */
@@ -6032,7 +7424,7 @@ function askDialog(opts = {}) {
 
 function openSessionMenu(s, anchor) {
   const cur = S.state.sessionFile;
-  const isCurrent = !!(cur && (s.path === cur || s.fileName === String(cur).split(/[\\/]/).pop()));
+  const isCurrent = !!(cur && sameSessionPath(s.path, cur, S.sessionsList || []));
   openMenu(anchor, [
     { label: 'open', active: isCurrent, onPick: () => switchToSession(s.path) },
     { label: 'export…', hint: 'save the .jsonl wherever you want', onPick: () => exportSession(s) },
@@ -6128,14 +7520,22 @@ async function sessionParent(sessionPath) {
 /* Branch points of the open session (pi keeps branches in one file as a tree).
  * There is no RPC for moving the active leaf, so choosing a branch point means
  * forking there - which is how a branch gets started in the first place. */
-async function openBranchesMenu(s, anchor) {
+/* The fork tree of the session you are in: pi knows the branch points, so this
+ * is the real thing rather than a guess from the session list. Called both as
+ * openBranchesMenu(anchor) and openBranchesMenu(session, anchor) depending on
+ * where it is opened from, so the anchor is whichever argument is an element. */
+async function openBranchesMenu(a, b) {
+  const anchor = (a && a.getBoundingClientRect ? a : b) || $('session-name');
   let tree = null, leafId = null;
   try {
     const d = await rpc({ type: 'get_tree' });
     tree = d && d.tree;
     leafId = d && d.leafId;
   } catch { /* older agent */ }
-  if (!tree || !tree.length) { toast('This session has no branches yet', 'warning'); return; }
+  if (!tree || !tree.length) {
+    toast('No branch points yet — edit an earlier message, or fork from one, to start a branch', 'warning');
+    return;
+  }
   const describe = (entry) => {
     const m = entry && entry.message;
     const text = m ? String((m.content || []).map((c) => c.text || '').join(' ')).replace(/\s+/g, ' ').trim() : '';
@@ -6221,8 +7621,19 @@ function openTurnMenu(node, at) {
   const text = md ? md.innerText : '';
   if (text) {
     if (items.length) items.push({ sep: true });
-    items.push({ label: 'copy text', onPick: () => { navigator.clipboard.writeText(text); toast('Copied'); } });
+    items.push({ label: 'copy text', onPick: () => copyText(text, 'Copied the message') });
     items.push({ label: 'speak', onPick: () => speak(stripMarkdown(text)) });
+  }
+  // Right-clicking a word you just dragged over is how you copy in every other
+  // app. This menu replaces the browser's, so it has to offer it itself.
+  const selected = selectedText();
+  if (selected) {
+    items.unshift({
+      label: 'copy selection',
+      hint: selected.length > 40 ? `${selected.slice(0, 40)}…` : selected,
+      onPick: () => copyText(selected, 'Copied the selection'),
+    });
+    if (items.length > 1) items.splice(1, 0, { sep: true });
   }
   if (!items.length) return;
   openMenu(node.querySelector('.who') || node, items, { title: 'message', width: 320, at });
@@ -6518,7 +7929,7 @@ function openInstanceContextMenu(row, inst) {
       },
     },
   ];
-  openMenu(row, items, { title: inst.name, width: 320, force: true, at: { x: row.getBoundingClientRect().left, y: row.getBoundingClientRect().bottom } });
+  openMenu(row, items, { title: inst.name, width: 320, force: true, sub: true, at: { x: row.getBoundingClientRect().left, y: row.getBoundingClientRect().bottom } });
 }
 
 /* Opening the other instance's own page navigates away and hands the URL to the
@@ -6614,6 +8025,50 @@ chat.addEventListener('contextmenu', (e) => {
 
 /* instances: the button opens the switcher, and the dots refresh in the
  * background so a busy agent on another machine shows up on its own */
+if ($('btn-subagents')) {
+  $('btn-subagents').onclick = (e) => { e.stopPropagation(); openSubagentsMenu($('btn-subagents')); };
+  updateSubagentsBtn();
+}
+if ($('subagent-close')) $('subagent-close').onclick = () => $('subagent-dialog').close();
+if ($('subagent-copy')) $('subagent-copy').onclick = () => copyText($('subagent-body').textContent || '', 'Copied what it wrote');
+/* The empty part of the session list: right-click for a new folder, drop a
+ * session there to take it out of its folder. */
+(function wireSessionList() {
+  const list = $('session-list');
+  if (!list) return;
+  try {
+    const raw = localStorage.getItem('piwebui-folders-collapsed');
+    if (raw) S.collapsedFolders = JSON.parse(raw) || {};
+  } catch { /* private mode */ }
+  list.addEventListener('contextmenu', (e) => {
+    if (e.target.closest('.session-item') || e.target.closest('.session-folder')) return;
+    e.preventDefault();
+    openMenu(e.target.closest('.session-list') || list, [
+      { label: 'new folder…', hint: 'group sessions by hand', onPick: () => addFolderDialog() },
+      { label: 'refresh the list', onPick: () => refreshSessions() },
+    ], { title: 'sessions', width: 320, force: true, at: { x: e.clientX, y: e.clientY } });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragSession) return;
+    if (e.target.closest('.session-folder') || e.target.closest('.session-item')) return;
+    e.preventDefault();
+    list.classList.add('drop-here');
+  });
+  list.addEventListener('dragleave', () => list.classList.remove('drop-here'));
+  list.addEventListener('drop', (e) => {
+    list.classList.remove('drop-here');
+    if (e.target.closest('.session-folder') || e.target.closest('.session-item')) return;
+    if (!dragSession) return;
+    e.preventDefault();
+    assignToFolder(dragSession, null);   // out of every folder
+  });
+})();
+
+if ($('btn-bell')) {
+  $('btn-bell').onclick = (e) => { e.stopPropagation(); openBellMenu(); };
+  updateBell();
+}
+
 if ($('btn-instance')) {
   $('btn-instance').onclick = (e) => { e.stopPropagation(); openInstanceMenu($('btn-instance')); };
   updateInstanceBtn();

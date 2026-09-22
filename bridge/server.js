@@ -54,23 +54,41 @@ function lanUrl(port) {
 // Existing connections are dropped on purpose: they were opened on the old
 // address, and the page reconnects on its own.
 let rebinding = false;
+let rebindTarget = null;
 // Where the socket is bound right now. Comparing against HOST (the value from the
 // environment at startup) made switching back to localhost a no-op: HOST was
 // still 127.0.0.1 while the server was actually on 0.0.0.0.
 let boundHost = null;   // set right after HOST is defined
+
+/* Move the listening socket to another address. A request that arrives while a
+ * move is already running is remembered and applied straight after it, never
+ * dropped: flipping the switch twice in quick succession used to lose the second
+ * flip (the config file said "off" while the socket was still on the network),
+ * which is the other half of "sometimes I have to click twice". */
 function rebind(host) {
-  if (rebinding || host === boundHost) return;
+  rebindTarget = host;
+  if (rebinding) return;
   rebinding = true;
-  const done = () => {
-    server.listen(PORT, host, () => { bindNow(host); });
+  const step = () => {
+    const target = rebindTarget;
+    rebindTarget = null;
+    if (target == null) { rebinding = false; return; }
+    if (target === boundHost) { step(); return; }
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      server.listen(PORT, target, () => { bindNow(target); step(); });
+    };
+    try { if (server.closeAllConnections) server.closeAllConnections(); } catch { /* older node */ }
+    server.close(() => done());
+    // A socket that refuses to close must not wedge the queue.
+    setTimeout(done, 2000);
   };
-  try { if (server.closeAllConnections) server.closeAllConnections(); } catch { /* older node */ }
-  server.close(() => done());
-  setTimeout(() => { if (rebinding) { rebinding = false; done(); } }, 2000);
+  step();
 }
 function bindNow(host) {
   boundHost = host;
-  rebinding = false;
   console.log(`listening on ${host}:${PORT}${host === '0.0.0.0' ? ` (network: ${lanUrl(PORT) || 'no address'})` : ' (this machine only)'}`);
 }
 
@@ -341,6 +359,266 @@ async function deleteSessionRef(ref) {
   fs.rmSync(ref.path);
 }
 
+/* ── what a subagent wrote ───────────────────────────────────────────────
+ * pi-subagents keeps one artifact set per run inside the session directory
+ * (`subagent-artifacts/<runId>_<agent>_output.md`, plus `_meta.json` and a
+ * transcript), and a background run keeps its working files in a run directory
+ * (`…/async-subagent-runs/<runId>/output-N.log`) whose path reaches us through
+ * the tool result's details.asyncDir. Both are read here, through `docker exec`
+ * when the agent lives in a container, so the panel works the same either way.
+ *
+ * The run id is a uuid and the run directory has to sit under a pi-subagents run
+ * root, so this cannot be pointed at an arbitrary file. */
+const SUBAGENT_TAIL = 200 * 1024;
+
+function tailText(text, bytes = SUBAGENT_TAIL) {
+  if (!text) return '';
+  if (text.length <= bytes) return text;
+  const cut = text.slice(text.length - bytes);
+  const nl = cut.indexOf('\n');
+  return `… (showing the end of ${Math.round(text.length / 1024)} KB)
+${nl >= 0 ? cut.slice(nl + 1) : cut}`;
+}
+
+async function subagentArtifact(runId, wantLabel) {
+  const remote = parseSessionDir();
+  const localDir = path.join(SESSION_DIR, 'subagent-artifacts');
+  let names = [];
+  if (remote) {
+    const out = await dockerCapture(remote.container, ['sh', '-c', `ls -1 '${path.posix.join(remote.dir, 'subagent-artifacts')}' 2>/dev/null`], 20000);
+    names = out.split('\n').map((x) => x.trim()).filter(Boolean);
+  } else {
+    try { names = fs.readdirSync(localDir); } catch { names = []; }
+  }
+  let mine = names.filter((f) => f.startsWith(`${runId}_`));
+  if (!mine.length && wantLabel) mine = names.filter((f) => f.includes(`_${wantLabel}_`) || f.includes(`_${wantLabel}.`));
+  if (!mine.length) return null;
+  // Prefer the final answer; label is the agent name when the extension put it in
+  // the file name (`<runId>_<agent>_output.md`).
+  const pick = (suffix) => mine.find((f) => f.endsWith(suffix)) || null;
+  // The child's own conversation is the transcript; the output is only its last
+  // message. Trying several spellings, because the run id in the tool result and
+  // the id in the file name are not always the same thing.
+  const byLabel = wantLabel ? mine.filter((f) => f.includes(`_${wantLabel}`)) : [];
+  const file = pick('_transcript.jsonl')
+    || (byLabel.find((f) => f.endsWith('_transcript.jsonl')) || null)
+    || pick('_output.md') || (byLabel.find((f) => f.endsWith('.md')) || null)
+    || pick('_resolved.md') || pick('_summary.md') || pick('_meta.json')
+    || byLabel[0] || mine[0];
+  if (!file) return null;
+  const target = remote ? path.posix.join(remote.dir, 'subagent-artifacts', file)
+    : path.join(localDir, file);
+  const text = remote ? await dockerCapture(remote.container, ['cat', target], 30000)
+    : (() => { try { return fs.readFileSync(target, 'utf8'); } catch { return ''; } })();
+  if (!text) return null;
+  return { file, text: file.endsWith('.jsonl') ? tailText(text) : text };
+}
+
+async function subagentRunLog(asyncDir) {
+  if (typeof asyncDir !== 'string' || !asyncDir) return null;
+  // Only ever a run directory: this path comes over the wire.
+  const posix = String(asyncDir).replaceAll(String.fromCharCode(92), '/');
+  if (!/pi-subagents[^/]*\/async-subagent-runs\//.test(posix)) return null;
+  const dir = parseSessionDir() ? path.posix.normalize(posix) : path.normalize(asyncDir);
+  if (parseSessionDir()) {
+    const out = await dockerCapture(parseSessionDir().container, ['sh', '-c',
+      `ls -1t '${dir}'/output-*.log '${dir}'/status.json 2>/dev/null | head -5`], 20000);
+    const first = out.split('\n').map((x) => x.trim()).filter(Boolean)[0];
+    if (!first) return null;
+    const text = await dockerCapture(parseSessionDir().container, ['cat', first], 30000);
+    return text ? { file: path.posix.basename(first), text: tailText(text) } : null;
+  }
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch { return null; }
+  const logs = files.filter((f) => /^output-.*\.log$/.test(f)).sort();
+  const pick = logs.length ? logs[logs.length - 1] : (files.includes('status.json') ? 'status.json' : null);
+  if (!pick) return null;
+  try { return { file: pick, text: tailText(fs.readFileSync(path.join(dir, pick), 'utf8')) }; } catch { return null; }
+}
+
+/* ── live subagent runs ──────────────────────────────────────────────────
+ * pi-subagents keeps one status.json per async run under its temp root, with the
+ * fields a panel wants while a child works: state, current tool, turns, tools,
+ * start and end time - and, once the child has started, the session file it is
+ * running in. Reading those directly (instead of waiting for the parent
+ * transcript's widget line) is what makes the panel tick in real time, and what
+ * lets a click open the child's own conversation rather than a text dump.
+ *
+ * All of it is read in one pass per poll and cached for a moment: the panel asks
+ * about once a second, and inside Docker every read is a `docker exec`. */
+const RUN_CACHE = { at: 0, data: null };
+const ARTIFACT_CACHE = { at: 0, names: null };
+const RUN_ARTIFACT_TTL = 5000;
+
+function runStateFromStatus(s) {
+  if (!s || typeof s !== 'object') return null;
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const id = str(s.runId);
+  if (!id) return null;
+  const tok = s.totalTokens && typeof s.totalTokens === 'object' ? num(s.totalTokens.total) : null;
+  return {
+    runId: id,
+    agent: str(s.agent),
+    mode: str(s.mode),
+    state: str(s.state),
+    activityState: str(s.activityState),
+    currentTool: str(s.currentTool),
+    currentToolStartedAt: num(s.currentToolStartedAt),
+    turnCount: num(s.turnCount) || 0,
+    toolCount: num(s.toolCount) || 0,
+    startedAt: num(s.startedAt),
+    endedAt: num(s.endedAt),
+    lastActivityAt: num(s.lastActivityAt),
+    // sessionFile is the child's own session, sessionId the one it came from.
+    sessionFile: str(s.sessionFile),
+    sessionId: str(s.sessionId),
+    sessionName: str(s.sessionName),
+    model: str(s.model),
+    error: str(s.error),
+    totalTokens: tok ? { total: tok } : null,
+    asyncDir: null,
+  };
+}
+
+/* The temp root pi-subagents uses: "pi-subagents-<scope>" directories under the
+ * system temp dir, or whatever PI_SUBAGENTS_TEMP_ROOT was set to. */
+function asyncRunRoots() {
+  const roots = [];
+  const configured = (process.env.PI_SUBAGENTS_TEMP_ROOT || '').trim();
+  if (configured) roots.push(path.join(configured, 'async-subagent-runs'));
+  try {
+    for (const name of fs.readdirSync(os.tmpdir())) {
+      if (!/^pi-subagents-/.test(name)) continue;
+      roots.push(path.join(os.tmpdir(), name, 'async-subagent-runs'));
+    }
+  } catch { /* nothing to look in */ }
+  return roots;
+}
+
+/* The run status does not carry the agent name for every kind of run (workflow
+ * children leave it empty); the recovery descriptor beside it always does, and
+ * it repeats the child's own session file. */
+function runStateFromDescriptor(st, d) {
+  if (!st || !d || typeof d !== 'object') return st;
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  if (!st.agent) st.agent = str(d.agent);
+  if (!st.sessionFile) st.sessionFile = str(d.sessionFile);
+  return st;
+}
+
+function readJsonFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+function readRunDirsLocal() {
+  const runs = [];
+  for (const root of asyncRunRoots()) {
+    let dirs = [];
+    try { dirs = fs.readdirSync(root); } catch { continue; }
+    for (const name of dirs) {
+      const dir = path.join(root, name);
+      const st = runStateFromStatus(readJsonFile(path.join(dir, 'status.json')));
+      if (!st) continue;
+      runStateFromDescriptor(st, readJsonFile(path.join(dir, 'recovery-descriptor.json')));
+      st.asyncDir = dir;
+      runs.push(st);
+    }
+  }
+  return runs;
+}
+
+async function readRunDirsDocker(remote) {
+  // One exec for all of them: the loop prints a marker per file (and for the
+  // recovery descriptor beside it), so the output can be split apart again.
+  const sh = 'for f in /tmp/pi-subagents-*/async-subagent-runs/*/status.json; do '
+    + '[ -f "$f" ] || continue; d=${f%/status.json}; printf "@@FILE %s\\n" "$d"; cat "$f"; printf "\\n"; '
+    + 'if [ -f "$d/recovery-descriptor.json" ]; then printf "@@REC %s\\n" "$d"; cat "$d/recovery-descriptor.json"; printf "\\n"; fi; done 2>/dev/null';
+  const out = await dockerCapture(remote.container, ['sh', '-c', sh], 20000).catch(() => '');
+  const states = new Map();
+  for (const chunk of String(out || '').split('@@').slice(1)) {
+    const nl = chunk.indexOf(String.fromCharCode(10));
+    if (nl < 0) continue;
+    const head = chunk.slice(0, nl).trim();          // "FILE <dir>" or "REC <dir>"
+    // The markers are not the same length ("FILE " is five characters, "REC " is
+    // four) - slicing a fixed five cut the leading slash off the REC path, so the
+    // descriptor was looked up under a different directory and never merged.
+    const kind = head.startsWith('REC') ? 'REC' : 'FILE';
+    const dir = head.slice(kind === 'REC' ? 4 : 5).trim();
+    if (!dir) continue;
+    const body = chunk.slice(nl + 1).split('@@')[0];
+    let json = null;
+    try { json = JSON.parse(body); } catch { continue; }
+    if (kind === 'FILE') {
+      const st = runStateFromStatus(json);
+      if (st) states.set(dir, st);
+    } else if (kind === 'REC') {
+      const st = states.get(dir);
+      if (st) runStateFromDescriptor(st, json);
+    }
+  }
+  const runs = [];
+  for (const [dir, st] of states) { st.asyncDir = dir; runs.push(st); }
+  return runs;
+}
+
+/* Artifact file names are the only place the agent name of a run appears
+ * (<runId>_<agent>_transcript.jsonl), so they label the rows. */
+/* pi-subagents writes the artifact set next to the session it belongs to
+ * (<session dir>/subagent-artifacts), which is where the agent name in
+ * "<runId>_<agent>_transcript.jsonl" can be read from. */
+async function artifactNamesIn(dir) {
+  if (!dir) return [];
+  const now = Date.now();
+  const hit = ARTIFACT_CACHE.names && ARTIFACT_CACHE.names.get(dir);
+  if (hit && now - hit.at < RUN_ARTIFACT_TTL) return hit.names;
+  const remote = parseSessionDir();
+  let names = [];
+  if (remote) {
+    const out = await dockerCapture(remote.container, ['sh', '-c',
+      `ls -1 '${path.posix.join(dir, 'subagent-artifacts')}' 2>/dev/null`], 20000).catch(() => '');
+    names = String(out || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  } else {
+    try { names = fs.readdirSync(path.join(dir, 'subagent-artifacts')); } catch { names = []; }
+  }
+  if (!ARTIFACT_CACHE.names) ARTIFACT_CACHE.names = new Map();
+  ARTIFACT_CACHE.names.set(dir, { at: now, names });
+  return names;
+}
+
+async function listSubagentRuns() {
+  const now = Date.now();
+  const remote = parseSessionDir();
+  const ttl = remote ? 1500 : 400;
+  if (RUN_CACHE.data && now - RUN_CACHE.at < ttl) return RUN_CACHE.data;
+  let runs = [];
+  try { runs = remote ? await readRunDirsDocker(remote) : readRunDirsLocal(); } catch { runs = []; }
+  try {
+    // One listing per session directory, reused for every run that came from it.
+    const listing = new Map();
+    for (const r of runs) {
+      const dir = r.sessionId ? path.dirname(r.sessionId) : null;
+      if (!dir) continue;
+      if (!listing.has(dir)) listing.set(dir, await artifactNamesIn(dir).catch(() => []));
+      const hit = (listing.get(dir) || []).find((n) => n.startsWith(`${r.runId}_`));
+      if (hit) r.agent = hit.slice(r.runId.length + 1).split('_')[0] || r.agent;
+      if (!r.mode) r.mode = 'single';
+    }
+  } catch { /* labels are a nicety */ }
+  runs.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  RUN_CACHE.at = now;
+  RUN_CACHE.data = runs;
+  return runs;
+}
+
+/* Path comparison for session files coming from different places (a settings
+ * file, a container, a transcript). */
+function sameSessionFilePath(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const norm = (v) => String(v).replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, '').toLowerCase();
+  return !!a && !!b && norm(a) === norm(b);
+}
+
 /* ── reaching another instance from this one ─────────────────────────────
  * Switching instances used to navigate this page to the other machine. In a
  * browser that means leaving where you were; in the packaged app there is no
@@ -548,11 +826,21 @@ function titleFromHead(head) {
   return title;
 }
 
+/* A transcript that belongs to a subagent run rather than to a conversation:
+ * pi-subagents writes one per child under `subagent-artifacts/`, and a
+ * background run keeps its own `…/run-N/session.jsonl` in the temp root. They
+ * are reached through the extension's own panel, not by switching to them - and
+ * in the sidebar they buried every real session (all of them are called
+ * `session.jsonl`, so they also matched each other on name). */
+function isSubagentTranscript(p) {
+  return /(^|[\\/])(subagent-artifacts|async-subagent-runs|chain-runs|subagent-results)([\\/]|$)/.test(p) || /(^|[\\/])(run|step)-\d+[\\/]/.test(p);
+}
+
 function scanLocalSessions() {
   let files;
   try {
     files = fs.readdirSync(SESSION_DIR, { recursive: true })
-      .filter((f) => f.endsWith('.jsonl'))
+      .filter((f) => f.endsWith('.jsonl') && !isSubagentTranscript(f))
       .map((f) => path.join(SESSION_DIR, f));
   } catch {
     return [];
@@ -611,7 +899,7 @@ async function scanDockerSessions(container, dir) {
       mtime: Math.floor(parseFloat(mtime) * 1000),
       size: parseInt(size, 10) || 0,
     };
-  }).filter((f) => f.path.endsWith('.jsonl'));
+  }).filter((f) => f.path.endsWith('.jsonl') && !isSubagentTranscript(f.path));
 
   // Pull a title out of each file head + any explicit renames from the tail.
   const heads = await execCapture('docker', ['exec', container, 'sh', '-c',
@@ -688,8 +976,15 @@ function agentSourceLabel() {
   return 'native';
 }
 const LAST_SESSION_FILE = process.env.PI_WEBUI_LAST_SESSION
-  || stateFile(`last-session-${agentSourceLabel()}.json`);
-// The single-file name used before that; still read, so nobody loses their place.
+  || stateFile(`webui-last-session-${agentSourceLabel()}.json`);
+// Why this is not `last-session-<source>.json` any more: that name belongs to pi
+// itself. pi's CLI/TUI keeps its own "where was I" record under exactly that
+// name in the agent dir, so the bridge and the CLI were writing over each other.
+// Restarting the bridge then resumed whatever session the CLI last used - which
+// is not the session this WebUI was in, and was sometimes a session another pi
+// had open. The WebUI now keeps its own file; a browser that has been here
+// before still recovers its session from localStorage, and the bridge records it
+// again from the first switch.
 const LEGACY_LAST_SESSION_FILE = path.join(__dirname, '..', 'last-session.json');
 
 function readSessionRecord(file) {
@@ -703,16 +998,19 @@ function loadLastSession() {
   const own = readSessionRecord(LAST_SESSION_FILE);
   if (own) return own;
   // If the record file was named explicitly (PI_WEBUI_LAST_SESSION), that name is
-  // the whole answer: reading the old default as well mixed two configurations -
-  // a test bridge picking up the desktop's session, a second bridge on another
-  // port resuming the first one's.
+  // the whole answer: reading other names as well mixed two configurations - a
+  // test bridge picking up the desktop's session, a second bridge on another port
+  // resuming the first one's.
   if (process.env.PI_WEBUI_LAST_SESSION) return null;
-  // The single file that was used before this was split per source. It is only
-  // worth reading when the path in it belongs to this world: a container path
-  // means nothing to a native pi, and a Windows path means nothing inside a
-  // container. A stale record was not harmless - the container's pi could not
-  // open it, and the switch_session that followed did not fail, it hung, so a
-  // docker bridge start had no session for two minutes and then gave up.
+  // Container records are ours alone (a pi inside a container keeps its own file
+  // in the container's agent dir), so the old per-source name is still worth
+  // reading there. The native one is skipped deliberately: it is pi's own CLI
+  // record, and resuming from it is what dropped the WebUI into whichever session
+  // the terminal used last instead of the one this WebUI was in.
+  if (!parseSessionDir()) return null;
+  // The single file used before records were split per source. Only worth reading
+  // when the path in it belongs to this world: a container path means nothing to
+  // a native pi, and the switch_session that followed did not fail, it hung.
   const legacy = readSessionRecord(LEGACY_LAST_SESSION_FILE);
   if (!legacy) return null;
   const containerPath = legacy.startsWith('/');
@@ -900,7 +1198,15 @@ const server = http.createServer(async (req, res) => {
     // guessing between them is what made a new chat jump somewhere else on a
     // quick reload.
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ sessionDir: SESSION_DIR, remembered: loadLastSession(), sessions: await scanSessions() }));
+    res.end(JSON.stringify({
+      sessionDir: SESSION_DIR,
+      remembered: loadLastSession(),
+      sessions: await scanSessions(),
+      // What the agent is doing right now, so a page that reloads in the middle
+      // of it (or a second tab) shows the same thing as the one that started it.
+      busy: agentStatus.busy,
+      compacting: agentStatus.compacting,
+    }));
     return;
   }
   // Read-only transcript of a session file. Lets the WebUI browse other
@@ -1014,12 +1320,22 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
-    const enabled = boundHost === '0.0.0.0' || boundHost === '::' || boundHost === '::0';
+    const bound = boundHost === '0.0.0.0' || boundHost === '::' || boundHost === '::0';
+    // Report what the switch was *set* to, not only what the socket is bound to
+    // right now: moving the socket takes a moment, and answering from `boundHost`
+    // during it told the page "it is still off" - so the checkbox flipped back
+    // and the switch needed a second click. `bound` still tells the truth about
+    // the socket, for anyone who needs it.
+    let wanted = null;
+    try { wanted = !!JSON.parse(fs.readFileSync(LAN_CONFIG_FILE, 'utf8')).lan; } catch { /* no file yet */ }
+    const enabled = wanted == null ? bound : wanted;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       lan: enabled,
+      bound,
       host: boundHost,
       url: enabled ? lanUrl(PORT) : null,
+      pending: enabled !== bound,
       envOverride: process.env.PI_WEBUI_HOST || null,
     }));
     return;
@@ -1075,9 +1391,53 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Every async subagent run this bridge can see. `session` filters to the runs
+  // started from that session, so a panel only ever shows its own subagents -
+  // and a reload gets them back from disk instead of an empty list.
+  if (req.url.startsWith('/api/subagent-runs')) {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const want = (q.get('session') || '').trim();
+    try {
+      const all = await listSubagentRuns();
+      const runs = want ? all.filter((r) => sameSessionFilePath(r.sessionId, want)) : all;
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true, runs, total: all.length }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // Local speech-to-text: started on request, never on boot. The Whisper
   // backend downloads ~200 MB of whisper.cpp plus the chosen model, so it waits
   // until someone actually picks it.
+  if (req.url.startsWith('/api/subagent-output')) {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const run = (q.get('run') || '').trim();
+    const label = (q.get('label') || '').trim().replace(/[^\w.-]/g, '');
+    const dir = (q.get('dir') || '').trim();
+    if (!/^[\w.-]{6,80}$/.test(run)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing or odd run id' }));
+      return;
+    }
+    try {
+      let got = await subagentRunLog(dir).catch(() => null);
+      let notes = got ? `live log: ${got.file}` : '';
+      if (!got || !got.text || !got.text.trim()) {
+        const art = await subagentArtifact(run, label).catch(() => null);
+        if (art) { got = art; notes = `${notes ? notes + ' · ' : ''}artifact: ${art.file}`; }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: !!got, text: got ? got.text : '', file: got ? got.file : null, notes }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   if (req.url.startsWith('/api/whisper-status')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(whisperStatus()));
@@ -1357,7 +1717,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url.startsWith('/api/upload')) {
+  // Exact route: "/api/upload-raw" also starts with "/api/upload", and reading a
+  // raw body as JSON gave "Unexpected token ' '" on the first big upload.
+  if (req.url.startsWith('/api/upload?') || req.url === '/api/upload') {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     let body = '';
     const MAX = 256 * 1024 * 1024; // base64 of ~190 MB
@@ -1368,15 +1730,97 @@ const server = http.createServer(async (req, res) => {
         if (typeof name !== 'string' || !name) throw new Error('name is required');
         if (typeof data !== 'string' || !data) throw new Error('data (base64) is required');
         const safe = name.replace(/[^\w.\- ()\[\]]/g, '_').slice(0, 120);
+        const buf = Buffer.from(data, 'base64');
         const dir = UPLOAD_DIRS[0];
         fs.mkdirSync(dir, { recursive: true });
+        // The same bytes are the same file: uploading the same screenshots again
+        // (the usual way this happens) used to write another copy next to the
+        // first one, with a new timestamp and the same content. The hash index
+        // lives in the upload directory so it survives a bridge restart.
+        const hash = crypto.createHash('sha256').update(buf).digest('hex');
+        const indexFile = path.join(dir, '.uploads-by-hash.json');
+        let index = {};
+        try { index = JSON.parse(fs.readFileSync(indexFile, 'utf8')) || {}; } catch { /* first run */ }
+        const known = index[hash];
+        if (known) {
+          try {
+            const st = fs.statSync(known);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, path: known, size: st.size, mimeType: mimeType || null, duplicate: true }));
+            return;
+          } catch { delete index[hash]; }   // the file was removed by hand
+        }
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         const file = path.join(dir, `${stamp}-${safe}`);
-        fs.writeFileSync(file, Buffer.from(data, 'base64'));
+        fs.writeFileSync(file, buf);
+        index[hash] = file;
+        try { fs.writeFileSync(indexFile, JSON.stringify(index)); } catch { /* index is a nicety */ }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, path: file, size: fs.statSync(file).size, mimeType: mimeType || null }));
+        res.end(JSON.stringify({ ok: true, path: file, size: buf.length, mimeType: mimeType || null }));
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  /* Upload without base64: the file *is* the body, so a 300 MB background video
+   * costs 300 MB instead of 400 and never hits a JSON body cap. The base64 route
+   * above stays for the small stuff (and for old pages). */
+  if (req.url.startsWith('/api/upload-raw')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    const q = new URL(req.url, 'http://x').searchParams;
+    const rawName = String(q.get('name') || 'file');
+    const safe = rawName.replace(/[^\w.\- ()\[\]]/g, '_').slice(0, 120);
+    const dir = UPLOAD_DIRS[0];
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+    const tmp = path.join(dir, `.incoming-${process.pid}-${Date.now()}`);
+    const hash = crypto.createHash('sha256');
+    const out = fs.createWriteStream(tmp);
+    const MAX_RAW = Number(process.env.PI_WEBUI_MAX_UPLOAD || 4 * 1024 * 1024 * 1024);
+    let got = 0;
+    let failed = null;
+    const cleanup = () => { try { fs.rmSync(tmp, { force: true }); } catch { /* gone */ } };
+    req.on('data', (c) => {
+      got += c.length;
+      if (got > MAX_RAW) { failed = `file is larger than the ${Math.round(MAX_RAW / 1073741824)} GB upload limit`; req.destroy(); return; }
+      hash.update(c);
+    });
+    req.on('error', () => { cleanup(); });
+    out.on('error', (e) => { failed = e.message; cleanup(); });
+    req.pipe(out);
+    out.on('finish', () => {
+      if (failed) {
+        if (!res.headersSent) { res.writeHead(failed.indexOf('larger') === 0 ? 413 : 500, { 'Content-Type': 'application/json' }); }
+        res.end(JSON.stringify({ error: failed }));
+        return;
+      }
+      try {
+        const digest = hash.digest('hex');
+        const indexFile = path.join(dir, '.uploads-by-hash.json');
+        let index = {};
+        try { index = JSON.parse(fs.readFileSync(indexFile, 'utf8')) || {}; } catch { /* first run */ }
+        const known = index[digest];
+        if (known) {
+          try {
+            const st = fs.statSync(known);
+            cleanup();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, path: known, size: st.size, duplicate: true }));
+            return;
+          } catch { delete index[digest]; }
+        }
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const file = path.join(dir, `${stamp}-${safe}`);
+        fs.renameSync(tmp, file);
+        index[digest] = file;
+        try { fs.writeFileSync(indexFile, JSON.stringify(index)); } catch { /* index is a nicety */ }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: file, size: got }));
+      } catch (e) {
+        cleanup();
+        res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
       }
     });
@@ -1820,15 +2264,27 @@ function broadcast(obj, except) {
 
 // Tiny activity tracker for /api/health, which other instances poll to show a
 // pulsing dot. agent_start .. agent_settled is exactly "a turn is running".
-const agentStatus = { busy: false, sessionName: null };
+const agentStatus = { busy: false, sessionName: null, compacting: null };
 function noteAgentActivity(obj) {
   if (!obj || typeof obj !== 'object') return;
+  const sf = obj.sessionFile || (obj.session && obj.session.file) || null;
+  if (sf) agentStatus.sessionFile = sf;
   switch (obj.type) {
     case 'agent_start': agentStatus.busy = true; break;
     case 'agent_settled':
     case 'agent_end': agentStatus.busy = false; break;
     case 'session_info_changed': if (obj.name) agentStatus.sessionName = obj.name; break;
     case 'agent_exit': agentStatus.busy = false; break;
+    // A compaction is long (it reads the whole conversation and asks a model to
+    // summarise it), and the "compacting…" block only lived in the page that
+    // started it: reload while it runs and the page looked idle, with no way to
+    // tell a finished compaction from one that never happened.
+    case 'compaction_start':
+      agentStatus.compacting = { since: Date.now(), session: agentStatus.sessionFile || null, automatic: !!obj.automatic };
+      break;
+    case 'compaction_end':
+      agentStatus.compacting = null;
+      break;
     default: break;
   }
 }

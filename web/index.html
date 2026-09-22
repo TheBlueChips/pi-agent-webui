@@ -28,6 +28,7 @@
     </div>
     <div class="sidebar-search">
       <input id="session-filter" type="search" placeholder="Filter sessions…">
+      <button id="btn-new-folder" class="btn icon" title="New folder — group sessions by hand (or drag one onto it)">＋</button>
       <button id="btn-refresh-sessions" class="btn icon" title="Refresh session list">⟳</button>
     </div>
     <div id="session-list" class="session-list"></div>
@@ -38,16 +39,17 @@
     <header id="topbar">
       <button id="btn-toggle-sidebar" class="btn icon" title="Toggle sidebar">☰</button>
       <input id="session-name" class="session-name" placeholder="Unnamed session" title="Click to rename">
-      <!-- Sessions started from this one (a forked branch, a subagent working in
-           the background) live here instead of taking over the session list. -->
-      <button id="btn-branches" class="btn small hidden" title="Sessions started from this one">⑃ <span id="branches-count">0</span></button>
-      <!-- Sessions started from this one (a forked branch, a subagent working in
-           the background) live here instead of taking over the session list. -->
-      <button id="btn-branches" class="btn small hidden" title="Sessions started from this one">⑃ <span id="branches-count">0</span></button>
+      <!-- Subagents the agent has running right now: a job that takes minutes
+           should not look like a spinner somewhere in the transcript. -->
+      <button id="btn-subagents" class="btn small hidden" title="Subagents running in this session">sub-agents <span id="subagents-count">0</span></button>
       <button id="btn-reels" class="btn">Reels</button>
       <button id="reels-pill" class="reels-pill hidden" title="Close the split feed panel"><span>◧ Reels</span></button>
       <button id="btn-settings" class="btn icon" title="Settings: agent name, avatar, TTS voice, voice input, thinking, theme">⚙</button>
       <button id="btn-tts" class="btn toggle" title="Speak agent replies out loud (TTS)">TTS off</button>
+      <!-- Everything the app said and everything that went wrong, with the time
+           it happened: toasts vanish after five seconds, and an error that came
+           and went while you were reading the chat was simply gone. -->
+      <button id="btn-bell" class="btn small bell" title="Recent notifications and errors">Notifications<span id="bell-count" class="bell-count hidden">0</span></button>
       <span id="conn-dot" class="conn-dot" title="Connection status"></span>
     </header>
 
@@ -60,8 +62,15 @@
     <!-- "Viewing another session" banner (the agent runs in its own). -->
     <div id="view-banner" class="view-banner hidden"></div>
 
+    <!-- The chat column scrolls, not the message list inside it. The scrollbar
+         then runs all the way to the bottom of the window (like the session list)
+         instead of stopping at the top of the composer, and typing - which makes
+         the composer taller - does not shorten it. The composer is docked to the
+         bottom of this scroller, so it stays where it is while you scroll. -->
+    <div id="chat-scroll">
     <div id="chat"></div>
 
+    <div id="composer-dock">
     <div id="queue-bar" class="queue-bar hidden"></div>
     <div id="widget-bar" class="widget-bar hidden"></div>
     <div id="status-bar" class="status-bar hidden"></div>
@@ -76,7 +85,7 @@
       <div class="composer-row">
         <button id="btn-attach" class="btn icon" title="Attach image / PDF / audio / video">+</button>
         <input id="file-input" type="file" accept="image/*,application/pdf,audio/*,video/*,.pdf" multiple hidden>
-        <textarea id="input" rows="1" placeholder="Message the agent" autocomplete="off"></textarea>
+        <textarea id="input" rows="1" placeholder="Message the agent" autocomplete="off" spellcheck="true"></textarea>
         <button id="btn-mic" class="btn icon" title="Voice to text">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
         </button>
@@ -103,6 +112,8 @@
         <select id="thinking-select" title="Thinking level"></select>
         <button id="thinking-btn" class="btn pill" title="Thinking level">off</button>
       </div>
+    </div>
+    </div>
     </div>
 
     <!-- Searchable model list (the hidden select above stays the source of truth) -->
@@ -194,10 +205,44 @@
 <!-- First-launch setup (one-time) -->
 <dialog id="setup-dialog">
   <h3>Welcome to Pi Agent</h3>
-  <p class="setup-sub">One-time setup — you can change all of this later in ⚙ Settings.</p>
+  <p class="setup-sub">One-time setup — everything here can be changed later in ⚙ Settings.</p>
   <div class="settings-grid">
     <label>Agent name</label>
     <input id="setup-agent-name" type="text" placeholder="pi" autocomplete="off">
+    <label>Profile image</label>
+    <div class="avatar-row">
+      <span id="setup-avatar-preview" class="avatar-wrap avatar-big"></span>
+      <button id="setup-avatar-upload" class="btn small">upload…</button>
+      <button id="setup-avatar-clear" class="btn small">clear</button>
+    </div>
+    <label>Theme color</label>
+    <div class="rate-row">
+      <input id="setup-accent" type="color" value="#5b9dff">
+      <button id="setup-accent-reset" class="btn small">default</button>
+    </div>
+    <label></label>
+    <label class="check-label"><input id="setup-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
+    <label id="setup-gamer-speed-label" class="hidden">Colour cycle</label>
+    <div class="rate-row hidden" id="setup-gamer-speed-row">
+      <input id="setup-gamer-speed" type="range" min="4" max="60" step="2" value="16">
+      <span id="setup-gamer-speed-val">16s</span>
+    </div>
+    <label>Text size</label>
+    <div class="rate-row">
+      <input id="setup-font-size" type="range" min="12" max="22" step="1" value="14">
+      <span id="setup-font-size-val">14px</span>
+    </div>
+    <label>Background</label>
+    <div class="rate-row">
+      <button id="setup-bg-upload" class="btn small">upload a picture or video…</button>
+      <button id="setup-bg-clear" class="btn small">clear</button>
+    </div>
+    <label>When the agent finishes</label>
+    <label class="check-label"><input id="setup-done-sound" type="checkbox"> play a sound</label>
+    <label></label>
+    <label class="check-label"><input id="setup-done-notify" type="checkbox"> desktop notification</label>
+    <label>Voice input</label>
+    <label class="check-label"><input id="setup-voice-autosend" type="checkbox"> send as soon as the mic stops</label>
     <label>Shorts feed</label>
     <select id="setup-shorts-provider">
       <option value="instagram">Instagram Reels</option>
@@ -205,12 +250,14 @@
       <option value="youtube">YouTube Shorts</option>
       <option value="none">None (hide the button)</option>
     </select>
-    <label>Theme color</label>
-    <div class="rate-row">
-      <input id="setup-accent" type="color" value="#5b9dff">
-      <button id="setup-accent-reset" class="btn small">default</button>
-    </div>
+    <label>Network</label>
+    <label class="check-label"><input id="setup-lan" type="checkbox"> let other devices on this network open this WebUI</label>
   </div>
+  <p class="setup-sub">Worth knowing: the <b>sub-agents</b> button in the top bar shows what each child agent is
+    doing and opens its own conversation, fork paths in the session list can be <b>folded away</b> with the
+    arrow, the timer at the bottom counts the whole task (and survives a reload), background images and videos have
+    no size limit (they are stored, never sent to the model), and voice input can run on a local
+    <b>Whisper</b> model from Settings → Voice.</p>
   <div class="dialog-buttons">
     <button id="setup-skip" class="btn">skip</button>
     <button id="setup-done" class="btn primary">Let's go</button>
@@ -218,7 +265,18 @@
 </dialog>
 
 <!-- Settings dialog -->
-<dialog id="settings-dialog">
+<!-- What one subagent wrote, read from the extension's own artifact file. -->
+  <dialog id="subagent-dialog">
+    <h3 id="subagent-title">subagent</h3>
+    <div id="subagent-meta" class="dim"></div>
+    <pre id="subagent-body" class="subagent-body"></pre>
+    <div class="dialog-row">
+      <button id="subagent-copy" class="btn small">copy</button>
+      <button id="subagent-close" class="btn primary">close</button>
+    </div>
+  </dialog>
+
+  <dialog id="settings-dialog">
   <h3>Settings</h3>
   <div class="tabs" id="settings-tabs">
     <button class="tab active" data-tab="general">General</button>
@@ -317,6 +375,11 @@
       </div>
       <label></label>
       <label class="check-label"><input id="set-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
+      <label id="gamer-speed-label" class="hidden">Colour cycle</label>
+      <div class="rate-row hidden" id="gamer-speed-row">
+        <input id="set-gamer-speed" type="range" min="4" max="60" step="2" value="16">
+        <span id="set-gamer-speed-val">16s</span>
+      </div>
       <label>Background</label>
       <div class="rate-row">
         <input id="set-bg-url" type="text" placeholder="image / GIF / video URL">
