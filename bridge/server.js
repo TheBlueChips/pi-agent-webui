@@ -994,9 +994,27 @@ function readSessionRecord(file) {
   } catch { return null; }
 }
 
+/* Sync check for a local path, null when it is a container path (those can only
+ * be asked about with an exec, which is why the async version exists). */
+function sessionFileExistsNow(p) {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  if (parseSessionDir()) return null;
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
 function loadLastSession() {
   const own = readSessionRecord(LAST_SESSION_FILE);
-  if (own) return own;
+  if (own) {
+    // A record whose session is gone is worse than no record: resuming it fails,
+    // and with a pi that does not answer the failed switch wedges the agent until
+    // it is restarted. Drop it here instead, before anything is asked of the agent.
+    if (sessionFileExistsNow(own) === false) {
+      console.warn(`forgetting last session (gone): ${own}`);
+      forgetLastSession();
+      return null;
+    }
+    return own;
+  }
   // If the record file was named explicitly (PI_WEBUI_LAST_SESSION), that name is
   // the whole answer: reading other names as well mixed two configurations - a
   // test bridge picking up the desktop's session, a second bridge on another port
@@ -2495,6 +2513,20 @@ let lastResumed = null;
 function resumeLastSessionOnAgent() {
   const last = loadLastSession();
   if (!last) { recordCurrentSession(); return; }
+  // Ask whether the file is still there *before* switching: a record left behind
+  // by a session that has since been deleted (or by another bridge that used a
+  // different session dir) used to produce a failed switch, a "could not reopen
+  // your last session" toast and - with a pi that does not answer - a wedged
+  // agent that had to be restarted. None of that is a resume.
+  sessionFileExists(last).then((exists) => {
+    if (exists) return resumeInto(last);
+    console.warn(`forgetting last session (gone): ${last}`);
+    forgetLastSession();
+    recordCurrentSession();
+  }).catch(() => resumeInto(last));   // a docker failure: let the agent decide
+}
+
+function resumeInto(last) {
   bridgeRpc({ type: 'switch_session', sessionPath: last }, 30000)
     .then(() => {
       console.log(`resumed last session: ${last}`);
