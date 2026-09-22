@@ -278,6 +278,9 @@
 
   <dialog id="settings-dialog">
   <h3>Settings</h3>
+  <!-- While you are looking at another instance, its own face (name, picture,
+       background) is not something these settings change. -->
+  <div class="hint hidden" id="remote-settings-note"></div>
   <div class="tabs" id="settings-tabs">
     <button class="tab active" data-tab="general">General</button>
     <button class="tab" data-tab="voice">Voice</button>

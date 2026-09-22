@@ -389,7 +389,8 @@ const DEFAULT_SETTINGS = {
   // Appearance
   gamerMode: false,       // rainbow accent (settings > appearance)
   gamerSpeed: 16,         // seconds for one full colour cycle
-  sessionFolders: [],     // [{ id, name, paths: [] }] — hand-made session groups
+  sessionFolders: [],     // the first instance's set; kept as the source for the one-time migration
+  sessionFoldersByInstance: null,  // { instanceOrigin: [{ id, name, paths }] } — folders are per instance
   bgOpacity: 100,         // 0-100 — background image / video transparency
   bgAudio: false,         // play a background video's audio
   bgVolume: 50,           // 0-100
@@ -414,6 +415,7 @@ async function loadServerSettings() {
     const data = await fetch(api('/api/ui-settings')).then((r) => r.json());
     if (data && Object.keys(data).length) {
       Object.assign(SET, data);
+      migrateFolders();
       applySettings();
     }
     settingsLoaded = true;
@@ -424,14 +426,14 @@ function applySettings() {
   // The name lives in the instance button now (it doubles as "who you are
   // looking at"), so guard it: a page without it must not break every setting.
   const nameEl = $('instance-name') || $('agent-title');
-  if (nameEl) nameEl.textContent = SET.agentName || 'pi agent';
-  document.title = `${SET.agentName || 'Pi agent'}`;
+  if (nameEl) nameEl.textContent = displayAgentName() || 'pi agent';
+  document.title = `${displayAgentName() || 'Pi agent'}`;
   const tts = $('btn-tts');
   tts.textContent = S.autoTts ? 'TTS on' : 'TTS off';
   tts.classList.toggle('on', S.autoTts);
   // reflect in already-rendered "who" lines
   document.querySelectorAll('.msg.assistant .who .agent-name-label').forEach((e) => {
-    e.textContent = SET.agentName || 'pi';
+    e.textContent = displayAgentName() || 'pi';
   });
   refreshAvatars();
   // thinking blocks visibility
@@ -795,6 +797,7 @@ async function initSession(resumeLast) {
     await refreshCommands();
     await refreshBuiltinCommands();
     await refreshMessages();
+    await loadRemoteLook().catch(() => {});   // another instance's face and background
     restoreRunClock();
     await refreshForkable();
     await refreshSessions();
@@ -861,7 +864,12 @@ async function resumeLastSession() {
  * Everything that belongs to the agent follows the instance you are looking at;
  * anything about this machine's own WebUI - its appearance, its network switch -
  * stays local. */
-const LOCAL_APIS = ['/api/ui-settings', '/api/lan', '/api/instance-card', '/api/system-fonts', '/proxy/'];
+/* Endpoints that belong to *this* machine's WebUI and must never be sent to
+ * another instance: the UI settings (appearance, folders, instances, the agent
+ * name you edit here), the network switch, the instance card, the font list of
+ * this machine, the voice backend (whisper runs here), and the proxy itself. */
+const LOCAL_APIS = ['/api/ui-settings', '/api/lan', '/api/instance-card', '/api/system-fonts',
+                    '/api/whisper-status', '/api/whisper-start', '/api/whisper-log', '/api/proxy/', '/proxy/'];
 function api(path) {
   const p = String(path);
   if (!S.remote || LOCAL_APIS.some((l) => p.startsWith(l))) return path;
@@ -2050,7 +2058,15 @@ function isLiveRun(r) { return /running|pending|queued|stopping/.test((r && r.st
 let subagentFetchAt = 0;
 async function refreshSubagents(force) {
   const key = subagentSessionKey();
-  if (!key) return null;
+  if (!key) {
+    // No session yet: nothing to attribute runs to, and "all runs on this
+    // machine" is not an answer (it put the panel on sessions that never ran
+    // one). Empty until we know.
+    if (S.subagents && S.subagents.size) { S.subagents = new Map(); updateSubagentsBtn(); }
+    else if (S.subagents) S.subagents = new Map();
+    updateSubagentsBtn();
+    return null;
+  }
   const now = Date.now();
   if (!force && now - subagentFetchAt < 700) return null;   // the tick is 1s; the bridge caches too
   subagentFetchAt = now;
@@ -2209,7 +2225,7 @@ function updateFavicon() {
   const link = document.querySelector('link[rel="icon"]');
   if (!link) return;
   if (defaultFaviconHref == null) defaultFaviconHref = link.getAttribute('href') || '';
-  const src = SET.avatar || '';
+  const src = instanceMediaUrl(instanceLook().avatar) || '';
   if (src === favIconSource && (favIconTimer || favIconPainted)) return;   // already showing it
   favIconSource = src;
   if (favIconTimer) { clearInterval(favIconTimer); favIconTimer = null; }
@@ -2253,10 +2269,84 @@ function updateFavicon() {
   }
 }
 
-function avatarNode(sizeClass) {
-  if (!SET.avatar) return null;
+/* ── the instance's own face ─────────────────────────────────────────────
+ * Agent name, picture and background belong to the *instance* you are looking
+ * at, not to this browser: while you are on another machine you should see that
+ * machine's agent, its picture and its background. Its card carries the name and
+ * picture (fetched cross-origin, like the switcher does) and its own
+ * /api/ui-settings, through the proxy, carries the background. Nothing here is
+ * ever written back to that instance - its settings are its own. */
+function instanceLook() {
+  if (!S.remote) {
+    return {
+      name: (SET.agentName || '').trim() || 'pi',
+      avatar: SET.avatar || null,
+      avatarCrop: SET.avatarCrop || null,
+      themeBg: SET.themeBg || null,
+      bgCrop: SET.bgCrop || null,
+      local: true,
+    };
+  }
+  const card = S.instanceCards[S.remote] || {};
+  const look = (S.remoteLook && S.remoteLook.origin === S.remote) ? S.remoteLook : {};
+  return {
+    name: look.agentName || card.name || S.remoteName || S.remote,
+    avatar: look.avatar || card.avatar || null,
+    avatarCrop: look.avatarCrop || card.avatarCrop || null,
+    themeBg: look.themeBg || null,
+    bgCrop: look.bgCrop || null,
+    local: false,
+  };
+}
+
+/* A picture stored on another instance is served by *that* bridge, so a relative
+ * /api/... URL has to go through the proxy - otherwise this page (or this
+ * machine's bridge) is asked for a file that only exists over there, and the
+ * avatar simply does not appear. */
+function instanceMediaUrl(src) {
+  const v = src || '';
+  if (!v || !S.remote) return v;
+  if (/^(data:|https?:|blob:)/i.test(v)) return v;
+  return v.startsWith('/api/') ? `/proxy/${encodeURIComponent(S.remote)}${v}` : v;
+}
+
+function displayAgentName() {
+  return instanceLook().name || 'pi';
+}
+
+/* The other instance's own UI settings, read (never written) through the proxy.
+ * An older bridge without the endpoint, or one that is unreachable, just leaves
+ * the card's name and picture in place. */
+async function loadRemoteLook() {
+  if (!S.remote) { S.remoteLook = null; return null; }
+  const origin = S.remote;
+  if (S.remoteLook && S.remoteLook.origin === origin && Date.now() - (S.remoteLook.at || 0) < 30000) return S.remoteLook;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 6000);
+    const d = await fetch(`/proxy/${encodeURIComponent(origin)}/api/ui-settings`, { signal: ctl.signal, cache: 'no-store' })
+      .then((r) => r.json());
+    clearTimeout(t);
+    if (S.remote !== origin) return null;                 // switched again meanwhile
+    S.remoteLook = (d && typeof d === 'object') ? { ...d, origin, at: Date.now() } : null;
+  } catch {
+    if (S.remote === origin) S.remoteLook = null;         // card only
+  }
+  // The switcher's label should read the same name the chat does.
+  const look = instanceLook();
+  if (S.remote && look.name) S.remoteName = look.name;
+  updateInstanceBtn();
+  applySettings();
+  return S.remoteLook;
+}
+
+function avatarNode(sizeClass, forceLocal) {
+  const look = forceLocal ? null : instanceLook();
+  if (forceLocal ? !SET.avatar : !look.avatar) return null;
+  const src = forceLocal ? SET.avatar : instanceMediaUrl(look.avatar);
+  const crop = forceLocal ? SET.avatarCrop : look.avatarCrop;
   const wrap = el('span', `avatar-wrap${sizeClass ? ' ' + sizeClass : ''}`);
-  const node = attachCrop(mediaNode(SET.avatar, 'avatar'), SET.avatarCrop, 1);
+  const node = attachCrop(mediaNode(src, 'avatar'), crop, 1);
   wrap.appendChild(node);
   return wrap;
 }
@@ -2279,8 +2369,10 @@ function refreshAvatars() {
   if (prev) {
     // Only the user's own image here, so "clear" visibly clears it (the app
     // icon fallback in the RN shell is not something you can crop or delete).
+    // The dialog edits this machine's own settings, so its preview shows this
+    // machine's picture even while you are looking at another instance.
     if (SET.avatar) {
-      const node = avatarNode();
+      const node = avatarNode(undefined, true);
       prev.replaceChildren(...node.childNodes);
       prev.style.visibility = 'visible';
     } else {
@@ -2296,7 +2388,7 @@ function makeMsgShell(role, who) {
   if (role.includes('assistant')) {
     const av = avatarNode();
     if (av) head.appendChild(av);
-    head.appendChild(el('span', 'agent-name-label', SET.agentName || 'pi'));
+    head.appendChild(el('span', 'agent-name-label', displayAgentName() || 'pi'));
     head.appendChild(el('span', 'who-text', ` · ${who}`));
   } else {
     head.appendChild(el('span', 'who-text', who));
@@ -3345,7 +3437,8 @@ function handleEvent(msg) {
  * reload comes back to the same picture. */
 function sessionUiKey() {
   const p = S.viewSession || (S.state && S.state.sessionFile) || 'none';
-  return `piwebui-session-ui:${String(p).slice(-120)}`;
+  // ...and per instance: the same path on two machines is two different sessions.
+  return `piwebui-session-ui:${instanceKey()}:${String(p).slice(-120)}`;
 }
 function saveSessionUi(patch) {
   try {
@@ -3834,10 +3927,42 @@ function maybeAutoContinue() {
   sendPrompt('Context was just compacted into a summary. Continue the current task from where it left off — use the compaction summary and the recent messages, and keep working until the task is complete.');
 }
 
+/* ── the bars above the composer ─────────────────────────────────────────
+ * Extensions set and clear their status/widget while the agent works, and a
+ * widget is often cleared for a single frame between updates. Hiding and showing
+ * the bar with it changed the height of the composer dock, which resized the
+ * transcript area - so the whole conversation moved up and down with every
+ * update. That is what "the UI jumps while the agent is running" was.
+ *
+ * A bar that goes empty now keeps its place for a moment (the next update is
+ * usually on its way), and CSS gives it a stable height while it is up. */
+const BAR_HIDE_MS = 3000;
+const barHideTimers = new Map();
+
+function setBarContent(bar, text) {
+  if (!bar) return;
+  const key = bar.id || 'bar';
+  const pending = barHideTimers.get(key);
+  if (pending) { clearTimeout(pending); barHideTimers.delete(key); }
+  if (String(text || '').trim()) {
+    bar.textContent = text;
+    bar.classList.remove('hidden');
+    return;
+  }
+  barHideTimers.set(key, setTimeout(() => {
+    barHideTimers.delete(key);
+    // Only if nothing arrived in the meantime (an extension can re-set it).
+    if (!String(bar.textContent || '').trim()) {
+      bar.textContent = '';
+      bar.classList.add('hidden');
+    }
+  }, BAR_HIDE_MS));
+}
+
 function renderQueue() {
   const bar = $('queue-bar');
   const items = [...S.queue.steering.map((m) => ({ kind: 'steering', m })), ...S.queue.followUp.map((m) => ({ kind: 'after turn', m }))];
-  if (!items.length) { bar.classList.add('hidden'); bar.innerHTML = ''; return; }
+  if (!items.length) { setBarContent(bar, ''); bar.innerHTML = ''; return; }
   bar.classList.remove('hidden');
   bar.innerHTML = '';
   bar.appendChild(el('span', null, 'queued '));
@@ -5021,7 +5146,7 @@ function renderSessions(sessions) {
   // the bridge's settings, so they are the same in every browser). A folder is a
   // drop target for a session row, and folders can be dragged onto each other to
   // change their order.
-  const folders = Array.isArray(SET.sessionFolders) ? SET.sessionFolders : [];
+  const folders = sessionFolders();
   const folderOf = new Map();
   for (const f of folders) for (const p of f.paths || []) folderOf.set(p, f.id);
   const inFolder = new Set(shown.filter((x) => folderOf.has(x.path)).map((x) => x.path));
@@ -5107,16 +5232,53 @@ function renderSessions(sessions) {
 /* ── session folders ──────────────────────────────────────────────────────
  * Hand-organised groups of sessions: create, rename, drag sessions in, drag the
  * folders into the order you want. The folders live in the bridge's settings, so
- * they are the same whatever browser or machine you open the UI from. */
-function saveFolders() {
-  SET.sessionFolders = (SET.sessionFolders || []).filter((f) => f && f.id);
+ * they are the same whatever browser or machine you open the UI from - and they
+ * are kept *per instance*: a folder list holding this machine's session paths has
+ * no meaning over another instance's sessions (they are different files), so the
+ * other instance simply has its own. The sets are stored locally, keyed by that
+ * instance's origin; its own settings are never written to. */
+function instanceKey() { return S.remote || location.origin; }
+
+function sessionFolders() {
+  const m = SET.sessionFoldersByInstance || {};
+  const list = m[instanceKey()];
+  if (Array.isArray(list)) return list;
+  // The single list from before folders were per instance: adopt it for this
+  // machine (and only this one) rather than showing no folders at all.
+  migrateFolders();
+  const after = (SET.sessionFoldersByInstance || {})[instanceKey()];
+  return Array.isArray(after) ? after : [];
+}
+
+function ensureFolders() {
+  const key = instanceKey();
+  const m = SET.sessionFoldersByInstance || (SET.sessionFoldersByInstance = {});
+  if (!Array.isArray(m[key])) m[key] = [];
+  return m[key];
+}
+
+function setFolders(list) {
+  const m = SET.sessionFoldersByInstance || (SET.sessionFoldersByInstance = {});
+  m[instanceKey()] = (list || []).filter((f) => f && f.id);
   saveSettings();
+}
+
+/* Folders used to be one list for everything. Keep them as this machine's when
+ * the per-instance store is still empty. */
+function migrateFolders() {
+  if (SET.sessionFoldersByInstance || !Array.isArray(SET.sessionFolders) || !SET.sessionFolders.length) return;
+  SET.sessionFoldersByInstance = { [location.origin]: SET.sessionFolders };
+  saveSettings();
+}
+
+function saveFolders() {
+  setFolders(sessionFolders().filter((f) => f && f.id));
   syncSessionHighlight();
 }
 
 function newFolder(name, beforeId) {
   const f = { id: `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name: name || 'new folder', paths: [] };
-  const list = SET.sessionFolders || (SET.sessionFolders = []);
+  const list = ensureFolders();
   const at = beforeId ? list.findIndex((x) => x.id === beforeId) : -1;
   if (at >= 0) list.splice(at, 0, f); else list.push(f);
   saveFolders();
@@ -5145,7 +5307,7 @@ function toggleFolder(id) {
 /* One session (or none) moving into a folder, or a folder being reordered. */
 function assignToFolder(path, folderId, beforePath) {
   if (!path) return;
-  const folders = SET.sessionFolders || (SET.sessionFolders = []);
+  const folders = ensureFolders();
   for (const f of folders) f.paths = (f.paths || []).filter((p) => p !== path);
   const target = folders.find((f) => f.id === folderId);
   if (target) {
@@ -5163,7 +5325,7 @@ function assignToFolder(path, folderId, beforePath) {
  * dragged folder was already earlier in the list.) */
 function reorderFolder(id, ontoId) {
   if (!id || !ontoId || id === ontoId) return;
-  const folders = SET.sessionFolders || [];
+  const folders = sessionFolders();
   const from = folders.findIndex((f) => f.id === id);
   const to = folders.findIndex((f) => f.id === ontoId);
   if (from < 0 || to < 0) return;
@@ -5190,7 +5352,7 @@ function openFolderMenu(f, row) {
     } },
     { sep: true },
     { label: 'delete the folder', hint: 'the sessions stay', danger: true, onPick: () => {
-      SET.sessionFolders = (SET.sessionFolders || []).filter((x) => x.id !== f.id);
+      setFolders(sessionFolders().filter((x) => x.id !== f.id));
       saveFolders();
       toast(`Deleted “${f.name}”`);
     } },
@@ -5453,9 +5615,12 @@ function handleExtensionUi(req) {
       break;
     case 'setStatus': {
       const bar = $('status-bar');
-      bar.classList.remove('hidden');
-      bar.dataset[req.statusKey] = stripAnsi(req.statusText);
-      bar.textContent = Object.values(bar.dataset).join(' · ');
+      // A key cleared with an empty text removes that line; the bar stays up
+      // while anything is left (and for a moment after the last line goes).
+      const key = req.statusKey || 'status';
+      const text = stripAnsi(req.statusText || '').trim();
+      if (text) bar.dataset[key] = text; else delete bar.dataset[key];
+      setBarContent(bar, Object.values(bar.dataset).join(' · '));
       break;
     }
     case 'setWidget': {
@@ -5479,9 +5644,7 @@ function handleExtensionUi(req) {
         && l.indexOf('PI_SUBAGENT_ASYNC_JSON:') < 0 && l.indexOf('PI_SUBAGENT_INSPECT_JSON:') < 0);
       if (lines.length) bar.dataset[req.widgetKey] = lines.join('\n');
       else delete bar.dataset[req.widgetKey];
-      const content = Object.values(bar.dataset).join('\n');
-      bar.textContent = content;
-      bar.classList.toggle('hidden', !content.trim());
+      setBarContent(bar, Object.values(bar.dataset).join('\n'));
       break;
     }
     case 'setTitle':
@@ -5695,6 +5858,13 @@ function populateTtsVoiceSelect() {
 }
 
 function openSettings() {
+  const note = $('remote-settings-note');
+  if (note) {
+    if (S.remote) {
+      note.classList.remove('hidden');
+      note.textContent = `You are looking at ${S.remoteName || S.remote}. Its agent name, picture and background come from that instance — the settings here are this machine's own UI.`;
+    } else note.classList.add('hidden');
+  }
   $('set-agent-name').value = SET.agentName === 'pi' ? '' : SET.agentName;
   $('set-agent-name').placeholder = SET.agentName || 'pi';
   const prev = $('set-avatar-preview');
@@ -5906,20 +6076,25 @@ $('btn-bg-crop').onclick = () => openCropper('bg');
  * a body background-image could not be zoomed or panned by hand. */
 function applyBackgroundMedia() {
   const host = $('bg-media');
-  const src = SET.themeBg || '';
+  // Another instance brings its own background (its own file, served by its own
+  // bridge) - showing this machine's picture behind another machine's chat was
+  // the "background carries over" report. How it is shown (volume, crop applied)
+  // stays this machine's preference.
+  const look = instanceLook();
+  const src = instanceMediaUrl(look.themeBg) || '';
   if (!host) return;
   const frame = window.innerWidth / Math.max(1, window.innerHeight);
   const current = host.querySelector('img, video');
   // Same source: keep the element. Rebuilding it restarted a background video
   // from the beginning every time any unrelated setting was saved.
   if (current && current.getAttribute('src') === src) {
-    applyCrop(current, SET.bgCrop, frame);
+    applyCrop(current, look.bgCrop, frame);
     applyBgAudio(current);
     return;
   }
   host.innerHTML = '';
   if (!src) { host.classList.add('hidden'); return; }
-  const node = attachCrop(mediaNode(src, 'bg-node'), SET.bgCrop, frame);
+  const node = attachCrop(mediaNode(src, 'bg-node'), look.bgCrop, frame);
   node.onerror = () => toast(isVideoSrc(src) ? 'Background video failed to load' : 'Background image failed to load', 'error');
   host.appendChild(node);
   host.classList.remove('hidden');
@@ -6044,7 +6219,7 @@ function notifyTurnDone() {
   try {
     if (!('Notification' in window)) return;
     if (Notification.permission === 'granted') {
-      const name = SET.agentName || 'pi';
+      const name = displayAgentName();
       const session = ($('session-name') && $('session-name').value.trim()) || '';
       const note = new Notification(`${name} finished`, { body: session || 'The agent finished its turn.', tag: 'piwebui-done', silent: true });
       note.onclick = () => { try { window.focus(); note.close(); } catch { /* ignore */ } };
@@ -6507,14 +6682,14 @@ async function setLanAccess(on, box) {
   box.checked = !!d.lan;
   toast(d.lan ? `Network access on${d.url ? ` — ${d.url}` : ''}` : 'Network access off (this machine only)');
   if (d.note) toast(d.note, 'warning');
-  setTimeout(() => refreshLanSetting().catch(() => {}), 900);
+  renderLanHint(d, box);          // the IP line, immediately - no second round trip
   } catch (err) {
   // Moving the listening socket closes connections, so the answer can be lost
   // even though the switch worked; ask the bridge before calling it a failure.
   await new Promise((r) => setTimeout(r, 600));
   try {
     const d = await fetch(api('/api/lan')).then((r) => r.json());
-    if (!!d.lan === on) { toast(on ? 'Network access on' : 'Network access off (this machine only)'); refreshLanSetting().catch(() => {}); return; }
+    if (!!d.lan === on) { renderLanHint(d, box); toast(on ? 'Network access on' : 'Network access off (this machine only)'); return; }
   } catch { /* still unreachable */ }
   box.checked = !on;
   toast(`Could not change network access: ${err.message}`, 'error');
@@ -6533,22 +6708,38 @@ $('set-lan').onchange = (e) => setLanAccess(e.target.checked, e.target);
  * describe the state before the flip, and letting it write over the checkbox is
  * the other half of "sometimes it takes two clicks". */
 let lanBusy = false;
-async function refreshLanSetting() {
+/* The IP line under the switch, from the bridge's own answer. */
+function renderLanHint(d, box) {
+  const hint = $('lan-hint');
+  if (box && !lanBusy) box.checked = !!d.lan;
+  if (!hint || !d) return;
+  hint.textContent = d.lan
+    ? `Reachable from your network${d.url ? ` at ${d.url}` : ''}. Anyone who can reach it can drive this agent — there is no login.`
+      + (d.envOverride ? ' (PI_WEBUI_HOST is set, so it wins on the next start.)' : '')
+    : 'Local only. Turning this on lets every device on your network drive this agent — there is no login.';
+}
+
+/* Flipping the switch moves the listening socket, which drops the connections
+ * open on it - so this read can fail for a moment even though nothing is wrong,
+ * and it used to give up right there and leave "Could not read the bridge
+ * setting." on screen until the dialog was reopened. Ask again instead. */
+async function refreshLanSetting(attempts = 4) {
   const box = $('set-lan');
   const hint = $('lan-hint');
-  if (!box && !hint) return;
-  try {
-    const d = await fetch(api('/api/lan')).then((r) => r.json());
-    if (box && !lanBusy) box.checked = !!d.lan;
-    if (hint) {
-      hint.textContent = d.lan
-        ? `Reachable from your network${d.url ? ` at ${d.url}` : ''}. Anyone who can reach it can drive this agent — there is no login.`
-          + (d.envOverride ? ' (PI_WEBUI_HOST is set, so it wins on the next start.)' : '')
-        : 'Local only. Turning this on lets every device on your network drive this agent — there is no login.';
-    }
-  } catch {
-    if (hint) hint.textContent = 'Could not read the bridge setting.';
+  if (!box && !hint) return null;
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((r) => setTimeout(r, 250 * i));
+    try {
+      const d = await fetch(api('/api/lan'), { cache: 'no-store' }).then((r) => r.json());
+      if (d && 'lan' in d) { renderLanHint(d, box); return d; }
+      lastErr = new Error('unexpected answer');
+    } catch (e) { lastErr = e; }
   }
+  // The toggle's own answer is better information than this, so only say so when
+  // there is nothing else on screen.
+  if (hint && !lanBusy && !hint.textContent) hint.textContent = 'Could not read the bridge setting.';
+  return lastErr;
 }
 
 /* text outline + avatar size + typing */
@@ -6599,7 +6790,7 @@ function refreshSetupPreview() {
   const prev = $('setup-avatar-preview');
   if (!prev) return;
   if (SET.avatar) {
-    const node = avatarNode();
+    const node = avatarNode(undefined, true);
     prev.replaceChildren(...node.childNodes);
     prev.style.visibility = 'visible';
   } else {
@@ -7734,6 +7925,9 @@ async function loadInstanceCards() {
       const d = await fetch(`${inst.url}/api/instance-card`, { signal: ctl.signal, cache: 'no-store' }).then((r) => r.json());
       clearTimeout(t);
       if (d && d.ok) S.instanceCards[inst.url] = d;
+      // The card may carry no picture at all (nothing set there, or an older
+      // bridge): fall back to that instance's settings, through the proxy.
+      if (d && d.ok && !d.avatar && S.remote === inst.url) loadRemoteLook().catch(() => {});
     } catch { /* unreachable: keep whatever we had */ }
   }));
 }
@@ -7793,13 +7987,52 @@ function exitRemoteMode() {
 }
 
 /* Everything on screen comes from whichever instance we are looking at, so the
- * socket is reopened (through the proxy) and the whole UI re-read. */
+ * socket is reopened (through the proxy) and the whole UI re-read.
+ *
+ * The socket *is* the agent connection, and it used to be closed through a name
+ * that does not exist here - so the old (local) socket stayed open, connect()
+ * saw an open socket and did nothing, and from then on the HTTP calls went to the
+ * new instance while every RPC still went to the old agent. That is what made
+ * "+ new" create the session on the wrong machine. Closing S.ws and clearing it
+ * first is the whole fix for that; the rest is dropping the state that belonged
+ * to the instance we just left. */
 async function reloadForInstance() {
-  updateInstanceBtn();
+  try { if (S.ws) { S.ws.onclose = null; S.ws.onerror = null; S.ws.close(); } } catch { /* already gone */ }
+  S.ws = null;
+  // The instance's look (name, picture, background) before anything is drawn.
+  S.remoteLook = null;
+  S.viewSession = null;
+  S.viewSubagent = null;
+  S.subagents = new Map();
+  S.subagentsFor = null;
   S.sessionsList = [];
   S.forkEntries = [];
+  S.compactionMarks = [];
+  S.compactionLive = null;
+  S.compacting = false;
+  S.ctxStats = null;
+  S.ctxDisplayTokens = null;
+  S.ctxBaseTokens = null;
+  S.ctxTurnPeak = 0;
+  S.totals = { read: 0, write: 0 };
+  S.lastTurn = null;
+  S.runStartTs = null;
+  S.runMs = null;
+  S.state = {};
+  S.queue = { steering: [], followUp: [] };
+  S.isStreaming = false;
+  document.body.classList.remove('compacting');
   try { $('chat').replaceChildren(); } catch { /* nothing rendered yet */ }
-  try { if (ws) { ws.onclose = null; ws.close(); } } catch { /* already gone */ }
+  try { renderQueue(); updateStreamUi(); updateViewBanner(); } catch { /* not wired yet */ }
+  updateSubagentsBtn();
+  syncSessionHighlight();
+  // The other instance's identity (and its background), then reconnect: the
+  // socket's onopen runs the whole init against the new one.
+  await loadRemoteLook().catch(() => {});
+  // Unconditionally, both directions: on the way *back* loadRemoteLook() returns
+  // early, and the picture and background would have stayed the other instance's.
+  applySettings();
+  updateInstanceBtn();
   connect();
 }
 
@@ -7810,7 +8043,7 @@ function updateRemoteBanner() {
   const st = instanceStatus(S.remote);
   // The socket is the honest signal here: an instance that is switched off has no
   // status to read (it never appears in the poll), but there is nothing connected.
-  const down = (typeof ws === 'undefined' || !ws || ws.readyState !== 1) || (st && st.ok === false);
+  const down = (!S.ws || S.ws.readyState !== 1) || (st && st.ok === false);
   b.classList.remove('hidden');
   b.replaceChildren();
   b.appendChild(el('span', null,
