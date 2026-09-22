@@ -1041,6 +1041,23 @@ function forgetLastSession() {
 
 function saveLastSession(p) {
   if (typeof p !== 'string' || !p) return;
+  // Only ever a session belonging to *this* bridge. The record is what the agent
+  // is resumed into, and it used to be able to hold a path from another world -
+  // pi's own CLI session, a test bridge's file, another instance's session - and
+  // resuming one of those is "it opened the wrong session" (or two pis in the
+  // same session). A path outside this bridge's session dir is never recorded.
+  const remote = parseSessionDir();
+  const roots = remote ? [remote.dir] : SESSION_DIRS;
+  const norm = (v) => String(v).replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, '');
+  const want = norm(p);
+  const inside = roots.some((r) => {
+    const root = norm(r);
+    return !!root && (want === root || want.startsWith(root + '/'));
+  });
+  if (!inside) {
+    console.warn(`not recording a session outside this bridge's session dir: ${p}`);
+    return;
+  }
   try {
     fs.writeFileSync(LAST_SESSION_FILE, JSON.stringify({ path: p, at: Date.now() }, null, 2) + '\n');
   } catch (e) {
