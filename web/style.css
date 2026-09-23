@@ -126,18 +126,29 @@ body.sidebar-hidden #sidebar { display: none; }
 .session-list.drop-here { outline: 1px dashed var(--accent); outline-offset: -3px; border-radius: 8px; }
 
 .session-item.active { background: var(--accent-dim); border-color: var(--accent); }
-/* The arrow that folds a session's forks away: small, quiet, and only on the
-   session that actually has forks under it. */
+/* The arrow that folds a session's forks away. It was a 10px glyph - too small to
+   hit, especially on a phone - so it is a real button-sized target now (the row
+   itself is still clickable for switching sessions). */
 .session-item .fork-toggle {
-  display: inline-block; width: 10px; margin-right: 4px; font-size: 10px;
-  line-height: 1; opacity: .55; cursor: pointer; user-select: none;
-  transition: opacity .12s ease, transform .12s ease;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto;
+  min-width: 24px; height: 22px; padding: 0 6px; margin: 0;
+  font-size: 13px; line-height: 1; font-weight: 600;
+  border-radius: 7px; cursor: pointer; user-select: none;
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  transition: background .12s ease, transform .12s ease;
 }
+.session-item .fork-toggle:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); transform: scale(1.06); }
 .session-item .fork-toggle:hover { opacity: 1; color: var(--accent); }
 
 .session-item .s-name {
   font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  /* the fold arrow is a real button, so the row has to make room for it instead of
+     letting it sit on top of the date/size line below */
+  display: flex; align-items: center; gap: 6px; min-height: 22px;
 }
+.session-item .s-name > .name-text { overflow: hidden; text-overflow: ellipsis; }
 .session-item .s-meta { font-size: 11px; color: var(--text-dim); }
 .sidebar-foot {
   border-top: 1px solid var(--border);
@@ -448,6 +459,11 @@ body.hide-thinking details.thinking { display: none; }
 .settings-grid textarea {
   width: 100%; box-sizing: border-box;
   font: 12px var(--mono); resize: vertical;
+}
+/* a row that will take the file you are dragging over it */
+.drop-ok {
+  outline: 2px dashed var(--accent); outline-offset: 3px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 8px;
 }
 .avatar-row { display: flex; align-items: center; gap: 8px; }
 .rate-row { display: flex; align-items: center; gap: 8px; }
@@ -995,7 +1011,17 @@ body { display: flex; }
 
   /* the stats row wraps into as many lines as it needs, and the least important
      numbers step aside rather than colliding */
-  #stats-bar { flex-wrap: wrap; row-gap: 4px; padding: 4px 6px; }
+  /* One row, scrolled sideways instead of wrapped: wrapped, the model and thinking
+     controls ended up on a second row that fell off the bottom of a short screen
+     (and a taller dock is also what pushed them out of reach). The two controls
+     come first so they are always the visible part. */
+  #stats-bar { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; padding: 4px 6px; gap: 10px; scrollbar-width: none; }
+  #stats-bar::-webkit-scrollbar { height: 0; }
+  #stats-bar #model-btn, #stats-bar #thinking-btn { order: -1; flex: 0 0 auto; }
+  #stats-bar .stats-spacer { order: -1; flex: 0 0 4px; }
+  #stats-bar > span { flex: 0 0 auto; }
+  /* and the dock can never be taller than what it sits in */
+  #composer-dock { max-height: 100%; overflow-y: auto; }
   .stats-spacer { display: none; }
   #stat-turn { display: none; }
   #ctx-label { max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1235,3 +1261,15 @@ body.hide-tools .msg.tool { display: none; }
   border: 1px solid var(--border); border-radius: 12px; padding: 16px;
   box-shadow: 0 24px 70px rgba(0, 0, 0, .65);
 }
+
+/* ── this round ──────────────────────────────────────────────────────────
+   A message that has nothing left to show once thinking and/or tool calls are
+   hidden used to stay as a bare header with token counts (a column of empty
+   boxes), the llama.cpp group heading, and the dismiss button for a banner that
+   would otherwise come back on its own. */
+.msg.assistant[data-hollow="1"] { display: none; }
+.prov-group {
+  margin: 2px 0 8px; font-size: 11.5px; letter-spacing: .3px; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.banner-x { margin-left: 8px; padding: 2px 8px; line-height: 1.2; }

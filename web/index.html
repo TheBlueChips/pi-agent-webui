@@ -358,14 +358,29 @@
       <label>Whisper endpoint</label>
       <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8081/inference (filled in automatically)">
       <label>TTS backend</label>
-      <select id="set-tts-backend"><option value="browser">Browser voices</option><option value="endpoint">Local TTS server (Piper etc.)</option></select>
-      <label>TTS server URL</label>
+      <select id="set-tts-backend">
+        <option value="browser">Browser voices (built in, nothing to set up)</option>
+        <option value="endpoint">Local TTS server — Piper, Kokoro, openedai-speech…</option>
+        <option value="fish">Fish Audio (cloud — cloned voices)</option>
+        <option value="openai">OpenAI-compatible cloud (OpenAI, Groq, DeepInfra…)</option>
+      </select>
+      <label id="tts-endpoint-label">TTS server URL</label>
       <input id="set-tts-endpoint" type="text" placeholder="http://localhost:8880/v1/audio/speech">
-      <label>TTS model / voice</label>
+      <label id="tts-model-label">TTS model / voice</label>
       <div class="rate-row">
         <input id="set-tts-model" type="text" placeholder="model, e.g. piper">
         <input id="set-tts-voice-name" type="text" placeholder="voice, e.g. en_US-amy-medium">
       </div>
+      <label id="tts-cloud-key-label" class="hidden">Cloud API key</label>
+      <input id="set-tts-apikey" class="hidden" type="password" placeholder="sk-… — kept on this machine, sent by the bridge" autocomplete="off">
+      <label id="tts-cloud-model-label" class="hidden">Cloud model</label>
+      <input id="set-tts-cloud-model" class="hidden" type="text" placeholder="fish: s1 · openai: tts-1 or gpt-4o-mini-tts">
+      <label id="tts-cloud-voice-label" class="hidden">Cloud voice</label>
+      <input id="set-tts-cloud-voice" class="hidden" type="text" placeholder="fish: a reference id · openai: alloy / nova / …">
+      <label id="tts-cloud-url-label" class="hidden">Service URL</label>
+      <input id="set-tts-cloud-url" class="hidden" type="text" placeholder="https://api.fish.audio · https://api.openai.com">
+      <label></label>
+      <div class="hint hidden" id="tts-cloud-note"></div>
     </div>
   </div>
 

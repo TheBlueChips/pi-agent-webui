@@ -206,6 +206,48 @@ function wireVoiceSettings() {
 
 /* Show only what the chosen backend needs: the browser needs nothing, whisper
  * needs a model, an endpoint and a start button. */
+/* Which TTS fields belong to the chosen backend. The local-server fields are for
+ * `endpoint`; the cloud ones for `fish` / `openai` (they go through the bridge,
+ * which keeps the key). */
+function syncTtsSettingsUi() {
+  const backend = $('set-tts-backend');
+  if (!backend) return;
+  const mode = backend.value;
+  const cloud = mode === 'fish' || mode === 'openai';
+  const show = (id, on) => {
+    const el = $(id);
+    if (!el) return;
+    el.classList.toggle('hidden', !on);
+    if (id.startsWith('tts-') && id.endsWith('-label')) return;
+    const wrap = el.parentElement;
+    if (wrap && wrap.classList.contains('rate-row') && (id === 'set-tts-model' || id === 'set-tts-voice-name')) {
+      wrap.classList.toggle('hidden', !on);
+    }
+  };
+  show('tts-endpoint-label', mode === 'endpoint');
+  show('set-tts-endpoint', mode === 'endpoint');
+  show('tts-model-label', mode === 'endpoint');
+  show('set-tts-model', mode === 'endpoint');
+  show('set-tts-voice-name', mode === 'endpoint');
+  show('tts-cloud-key-label', cloud);
+  show('set-tts-apikey', cloud);
+  show('tts-cloud-model-label', cloud);
+  show('set-tts-cloud-model', cloud);
+  show('tts-cloud-voice-label', cloud);
+  show('set-tts-cloud-voice', cloud);
+  show('tts-cloud-url-label', cloud);
+  show('set-tts-cloud-url', cloud);
+  const note = $('tts-cloud-note');
+  if (note) {
+    note.classList.toggle('hidden', !cloud);
+    note.textContent = mode === 'fish'
+      ? 'Fish Audio: paste your API key and the reference id of the voice to use (or leave it blank for the default). The bridge makes the call, so the key never travels through the page.'
+      : mode === 'openai'
+        ? 'Any OpenAI-compatible service: /v1/audio/speech with a model and a voice. Set the URL for anything other than OpenAI itself (Groq, DeepInfra, a self-hosted proxy).'
+        : '';
+  }
+}
+
 function syncVoiceSettingsUi() {
   const backend = $('set-stt-backend');
   if (!backend) return;
@@ -359,7 +401,11 @@ const DEFAULT_SETTINGS = {
   sttBackend: 'browser',  // 'browser' (built in, default) | 'whisper' (local server, downloaded on demand)
   sttModel: 'ggml-base.en.bin', // whisper.cpp model id
   instances: [],          // other pi agents to switch between: [{id, name, url}]
-  ttsBackend: 'browser',  // 'browser' | 'endpoint'
+  ttsBackend: 'browser',  // 'browser' | 'endpoint' (local server) | 'fish' | 'openai' (cloud, via the bridge)
+  ttsApiKey: '',          // cloud voices: kept in the bridge's settings and sent by the bridge
+  ttsCloudModel: '',      // fish: s1 ; openai-compatible: tts-1, gpt-4o-mini-tts, …
+  ttsCloudVoice: '',      // fish: reference id ; openai-compatible: alloy, nova, …
+  ttsCloudUrl: '',        // blank = the service's own endpoint
   ttsEndpoint: '',        // OpenAI-compatible /v1/audio/speech server (Piper etc.)
   ttsModel: 'piper',
   ttsVoiceName: '',
@@ -399,9 +445,16 @@ let SET = { ...DEFAULT_SETTINGS };
 try { Object.assign(SET, JSON.parse(localStorage.getItem('piwebui-settings') || '{}')); } catch { /* defaults */ }
 let settingsLoaded = false;
 
-function saveSettings() {
+function saveSettings(force) {
   applySettings();
   try { localStorage.setItem('piwebui-settings', JSON.stringify(SET)); } catch { /* cache only */ }
+  // The server REPLACES its settings file with what is posted, so saving before
+  // the server's own copy has been read would erase the user's settings (avatar,
+  // wallpaper, folders, ...) and replace them with this browser's defaults. That
+  // happened whenever the first settings fetch was slow or failed and the
+  // first-run dialog was dismissed. `force` is only for callers that already
+  // know they hold the server's copy.
+  if (!settingsLoaded && !force) return;
   // authoritative copy lives in webui-settings.json next to the project
   fetch(api('/api/ui-settings'), {
     method: 'POST',
@@ -439,25 +492,15 @@ function applySettings() {
   // thinking blocks visibility
   document.body.classList.toggle('hide-thinking', SET.showThinking === false);
   document.body.classList.toggle('hide-tools', SET.showToolCalls === false);
+  markHollowMessages();
   const stt = $('set-show-tools');
   if (stt) stt.checked = SET.showToolCalls !== false;
   const st = $('set-show-thinking');
   if (st) st.checked = SET.showThinking !== false;
   // theme
-  const rootStyle = document.documentElement.style;
-  // text outline: a 4-way shadow keeps glyphs readable when the panels are
-  // translucent and the background image shows through.
-  document.body.classList.toggle('text-outline', SET.textOutline !== false);
-  rootStyle.setProperty('--outline-color', SET.textOutlineColor || '#000000');
+  applyThemeColours();
   const avSize = Math.max(16, Math.min(120, Number(SET.avatarSize) || 34));
-  rootStyle.setProperty('--avatar-size', `${avSize}px`);
-  if (SET.themeAccent) {
-    rootStyle.setProperty('--accent', SET.themeAccent);
-    rootStyle.setProperty('--accent-dim', `color-mix(in srgb, ${SET.themeAccent} 35%, #171b22)`);
-  } else {
-    rootStyle.removeProperty('--accent');
-    rootStyle.removeProperty('--accent-dim');
-  }
+  document.documentElement.style.setProperty('--avatar-size', `${avSize}px`);
   // Gamer mode takes the accent over: the wheel turns once every 16 seconds, so
   // it reads as a living theme rather than a strobe. Everything that uses
   // --accent (buttons, rings, scrollbars, highlights) follows along.
@@ -472,6 +515,7 @@ function applySettings() {
   applyBgAudio(document.querySelector('#bg-media video'));
   // chat-panel transparency (0 = fully transparent, 100 = solid)
   const alpha = SET.chatOpacity == null ? 1 : Math.max(0, Math.min(1, Number(SET.chatOpacity) / 100));
+  const rootStyle = document.documentElement.style;
   rootStyle.setProperty('--ui-alpha', String(alpha));
   // chat font + text size. SET.fontFamily is either a preset key ('', mono,
   // serif, rounded) or a raw system font family name from the picker.
@@ -798,6 +842,7 @@ async function initSession(resumeLast) {
     await refreshBuiltinCommands();
     await refreshMessages();
     await loadRemoteLook().catch(() => {});   // another instance's face and background
+    loadDraft();
     restoreRunClock();
     await refreshForkable();
     await refreshSessions();
@@ -869,7 +914,8 @@ async function resumeLastSession() {
  * name you edit here), the network switch, the instance card, the font list of
  * this machine, the voice backend (whisper runs here), and the proxy itself. */
 const LOCAL_APIS = ['/api/ui-settings', '/api/lan', '/api/instance-card', '/api/system-fonts',
-                    '/api/whisper-status', '/api/whisper-start', '/api/whisper-log', '/api/proxy/', '/proxy/'];
+                    '/api/whisper-status', '/api/whisper-start', '/api/whisper-log', '/api/tts',
+                    '/api/proxy/', '/proxy/'];
 function api(path) {
   const p = String(path);
   if (!S.remote || LOCAL_APIS.some((l) => p.startsWith(l))) return path;
@@ -1327,7 +1373,10 @@ async function refreshLlamaGroup() {
     // model twice. Match on the model id as well - these ids are unique per
     // file on the server.
     const knownIds = new Set(S.models.map((m) => m.id));
-    const group = el('optgroup', null, 'llama.cpp (local)');
+    const group = el('optgroup', null, 'llama.cpp (found on this machine or the LAN)');
+    // A sweep that finishes after the menu was built left it stale - which is why
+    // the models from the LAN only showed up on the second open.
+    const before = ($('model-select').querySelector('optgroup[data-llama]') || {}).innerHTML || '';
     group.dataset.llama = '1';
     let unregistered = null;
     for (const srv of llamaLiveServers) {
@@ -1345,10 +1394,17 @@ async function refreshLlamaGroup() {
     if (group.children.length) sel.appendChild(group);
     if (unregistered) showLlamaMismatch(unregistered);
     else hideLlamaMismatch();
+    const after = ($('model-select').querySelector('optgroup[data-llama]') || {}).innerHTML || '';
+    const menu = $('model-menu');
+    if (after !== before && menu && !menu.classList.contains('hidden')) {
+      renderModelMenu($('model-search') ? $('model-search').value : '');
+      updateModelBtn();
+    }
   } catch { /* bridge offline or no llama.cpp server */ }
 }
 
 function showLlamaMismatch(srv) {
+  if (SET.llamaDismissed === srv.url) return;      // told once, not again
   const short = srv.url.replace(/^https?:\/\//, '');
   const configured = (llamaConfiguredUrl && llamaConfiguredUrl !== srv.url)
     ? `pi is configured for ${llamaConfiguredUrl.replace(/^https?:\/\//, '')} (unreachable)`
@@ -1356,7 +1412,14 @@ function showLlamaMismatch(srv) {
   showBanner('warn',
     `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it. pi needs the pi-llama-cpp extension to register it (install with: pi install npm:pi-llama-cpp), then point pi at this server and restart.`,
     'Point pi here & reload',
-    () => fixLlamaConfig(srv.url));
+    () => fixLlamaConfig(srv.url),
+    () => {
+      // Kept in the settings, so it does not come back for this server on the
+      // next poll, reload or browser. A *different* server still gets a mention.
+      SET.llamaDismissed = srv.url;
+      saveSettings();
+      toast('llama.cpp hint dismissed — the server is still listed in Settings → Pi providers');
+    });
   llamaMismatchBanner = true;
 }
 
@@ -1694,6 +1757,14 @@ function scrollBottom(force) {
 }
 let lastProgrammaticScroll = 0;
 let userScrollIdle = 0;
+let readingSaveTimer = null;
+function saveReadingSoon() {
+  if (readingSaveTimer) clearTimeout(readingSaveTimer);
+  readingSaveTimer = setTimeout(() => { readingSaveTimer = null; saveReading(); }, 400);
+}
+chatScroller().addEventListener('scroll', saveReadingSoon);
+window.addEventListener('pagehide', saveReading);
+
 chatScroller().addEventListener('scroll', () => {
   // Only an explicit wheel/touch gesture is trusted as "the user left the
   // bottom". A scroll event that lands just after we pinned is normally the
@@ -1889,6 +1960,16 @@ function noteSubagentInspect(d) {
   noteSubagent({ id, output: d.finalOutput || d.output || '', task: d.task || '', label: d.label || d.agent || '' });
 }
 
+/* Bytes as something a person reads: KB while that is meaningful, then MB, then
+ * GB. A session at 30 MB was shown as "30720.0 KB". */
+function fmtSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 function fmtElapsedShort(ms) {
   if (!ms || ms < 0) return '';
   const s = Math.round(ms / 1000);
@@ -1966,6 +2047,36 @@ function refreshSubagentMenu() {
     if (label) label.textContent = r.label || 'subagent';
   }
   updateSubagentsBtn();
+}
+
+/* Turning off the thinking and tool-call blocks left their messages behind as
+ * bare headers with token counts - a column of empty boxes. A message with nothing
+ * visible left is marked and hidden. */
+function bubbleHasVisibleText(bubble, hideThinking, hideTools) {
+  for (const n of bubble.querySelectorAll('.md, .md *')) {
+    if (hideThinking && n.closest('details.thinking')) continue;
+    if (n.closest('.tool-card')) continue;              // cards count via the toggle below
+    if (n.children.length) continue;                    // text sits in the leaves
+    if ((n.textContent || '').trim()) return true;
+  }
+  return false;
+}
+
+function markHollowMessages() {
+  const hideThinking = SET.showThinking === false;
+  const hideTools = SET.showToolCalls === false;
+  for (const m of chat.querySelectorAll('.msg.assistant')) {
+    if (!hideThinking && !hideTools) { delete m.dataset.hollow; continue; }
+    const bubble = m.querySelector('.bubble');
+    if (!bubble) continue;
+    const hasThinking = !!bubble.querySelector('details.thinking, .thinking');
+    const hasTools = !!bubble.querySelector('.tool-card');
+    const visible = bubbleHasVisibleText(bubble, hideThinking, hideTools)
+      || (hasThinking && !hideThinking)
+      || (hasTools && !hideTools);
+    if (visible) delete m.dataset.hollow;
+    else m.dataset.hollow = '1';
+  }
 }
 
 /* One transcript line as a readable block. */
@@ -2124,7 +2235,15 @@ function tickNeeded() {
   if (S.runStartTs) return true;
   if ($('setup-dialog') && $('setup-dialog').open) return true;   // the avatar preview fills in
   if (S.subagentMenuOpen || S.viewSubagent) return true;
+  // a newly rendered message still has to take over the animated avatar
+  if (lastMsgHead() !== liveAvatarSlot) return true;
   return subagentList().some(isLiveRun);
+}
+
+/* The header of the newest assistant message (the one that gets the animation). */
+function lastMsgHead() {
+  const heads = document.querySelectorAll('.msg.assistant .who');
+  return heads.length ? heads[heads.length - 1] : null;
 }
 function ensureTick() {
   if (tickNeeded() && !uiTick) uiTick = setInterval(onUiTick, 1000);
@@ -2132,6 +2251,7 @@ function ensureTick() {
 }
 function onUiTick() {
   paintRunStat();
+  animateLastMsgAvatar();          // the newest message owns the animated avatar
   if ($('setup-dialog') && $('setup-dialog').open) refreshSetupPreview();
   if (S.subagentMenuOpen || S.viewSubagent || subagentList().some(isLiveRun)) refreshSubagents().catch(() => {});
   if (S.subagentMenuOpen) refreshSubagentMenu();
@@ -2192,6 +2312,7 @@ async function refreshSubagentView(force) {
   if (!force && n === S.subagentViewCount) return;
   S.subagentViewCount = n;
   const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
+  releaseVideosIn(chat);          // a detached <video> keeps its decoder and buffers
   chat.innerHTML = '';
   transcriptTarget = chat;
   for (const m of d.messages) {
@@ -2340,30 +2461,202 @@ async function loadRemoteLook() {
   return S.remoteLook;
 }
 
-function avatarNode(sizeClass, forceLocal) {
+/* ── a video avatar is decoded ONCE ─────────────────────────────────────
+ * An avatar can be a video. It used to be a live <video> in every place an
+ * avatar appears - and the chat header exists on every assistant message, so a
+ * long transcript ran 200 decoders of the same file. A GPU only hardware-decodes
+ * a handful of streams, so the rest fell back to software: the whole UI went CPU
+ * bound and laggy, and each element held its own buffers.
+ *
+ * So: the sidebar keeps the animation (one decoder), everything else shows a
+ * still frame captured from that video once, as a data URL. */
+const avatarStillCache = new Map();   // src -> dataURL | 'pending' | 'failed'
+const avatarStillPending = new Set();
+
+/* The picture to show for `src`: the source itself for a normal image, a still
+ * for a video (null until the capture finishes, so no <video> is ever created
+ * for a message header). */
+function avatarStillSrc(src) {
+  if (!src) return null;
+  if (!isVideoSrc(src)) return src;
+  const hit = avatarStillCache.get(src);
+  if (hit === 'failed') return null;
+  if (hit && hit !== 'pending') return hit;
+  if (!avatarStillPending.has(src)) captureAvatarStill(src);
+  return null;
+}
+
+/* Decode one frame off-screen, draw it square (the crop frame's default shape)
+ * and keep the PNG. Never hangs: a timeout falls back to a failed mark. */
+function captureAvatarStill(src) {
+  avatarStillPending.add(src);
+  avatarStillCache.set(src, 'pending');
+  const v = document.createElement('video');
+  v.muted = true;
+  v.playsInline = true;
+  v.preload = 'auto';
+  let settled = false;
+  const finish = (ok) => {
+    if (settled) return;
+    settled = true;
+    avatarStillPending.delete(src);
+    if (ok) {
+      try {
+        const w = v.videoWidth || 96;
+        const h = v.videoHeight || 96;
+        const side = Math.max(1, Math.min(w, h));
+        const size = Math.min(160, side);
+        const c = document.createElement('canvas');
+        c.width = size;
+        c.height = size;
+        c.getContext('2d').drawImage(v, (w - side) / 2, (h - side) / 2, side, side, 0, 0, size, size);
+        avatarStillCache.set(src, c.toDataURL('image/png'));
+      } catch (e) {
+        avatarStillCache.set(src, 'failed');
+      }
+    } else {
+      avatarStillCache.set(src, 'failed');
+    }
+    releaseMedia(v);
+    refreshAvatars();          // swap the still in
+  };
+  v.addEventListener('loadeddata', () => { try { v.currentTime = 0.05; } catch (e) { finish(!!v.videoWidth); } }, { once: true });
+  v.addEventListener('seeked', () => finish(!!v.videoWidth), { once: true });
+  v.addEventListener('loadedmetadata', () => { if (!v.videoWidth) finish(false); }, { once: true });
+  v.addEventListener('error', () => finish(false), { once: true });
+  setTimeout(() => finish(!!v.videoWidth), 5000);
+  v.src = src;
+}
+
+/* Detaching a <video> is not enough: it keeps its resource, decoder and
+ * buffers until the source is cleared. Dropping the old avatar nodes without
+ * this is what leaked memory as videos were re-rendered. */
+function releaseMedia(node) {
+  if (!node || node.tagName !== 'VIDEO') return;
+  try { node.pause(); } catch (e) { /* ignore */ }
+  node.removeAttribute('src');
+  try { node.load(); } catch (e) { /* ignore */ }
+}
+
+/* Everything before a transcript rebuild: free the decoders first. */
+function releaseVideosIn(root) {
+  if (!root || !root.querySelectorAll) return;
+  root.querySelectorAll('video').forEach(releaseMedia);
+}
+
+/* What an avatar slot should show right now. `still` asks for the transcript
+ * version (a picture); ready=false means "leave the slot alone", not "empty". */
+function avatarWant(forceLocal, still) {
   const look = forceLocal ? null : instanceLook();
   if (forceLocal ? !SET.avatar : !look.avatar) return null;
   const src = forceLocal ? SET.avatar : instanceMediaUrl(look.avatar);
   const crop = forceLocal ? SET.avatarCrop : look.avatarCrop;
+  if (!still) return { src, crop, ready: true };
+  const shown = avatarStillSrc(src);
+  return { src: shown, crop, ready: !!shown };
+}
+
+function avatarNode(sizeClass, forceLocal, still) {
+  return avatarNodeFrom(avatarWant(forceLocal, still), sizeClass);
+}
+
+function avatarNodeFrom(want, sizeClass) {
+  if (!want || !want.ready) return null;
   const wrap = el('span', `avatar-wrap${sizeClass ? ' ' + sizeClass : ''}`);
-  const node = attachCrop(mediaNode(src, 'avatar'), crop, 1);
+  const node = attachCrop(mediaNode(want.src, 'avatar'), want.crop, 1);
+  // remember which crop this node was built with, so a crop change can rebuild it
+  if (node) node.dataset.crop = JSON.stringify(want.crop || null);
   wrap.appendChild(node);
   return wrap;
 }
 
+/* Put exactly this picture (and crop) into an avatar slot, doing nothing when it
+ * is already there - replacing a video node restarts it. */
+function putAvatarIn(slot, want) {
+  if (!slot || !want || !want.ready) return false;
+  if (avatarSlotMatches(slot, want)) return false;
+  const node = avatarNodeFrom(want, undefined);
+  if (!node) return false;
+  const old = slot.querySelector('.avatar-wrap');
+  slot.insertBefore(node, slot.firstChild);
+  if (old) { releaseVideosIn(old); old.remove(); }
+  return true;
+}
+
+/* The newest message keeps the animated avatar and every older one shows the
+ * still, so a transcript of any length runs two decoders at most (this one and
+ * the sidebar) no matter how many messages are on screen. Called after renders
+ * and from the ticker, and it does nothing when the same slot is already live. */
+let liveAvatarSlot = null;
+function animateLastMsgAvatar() {
+  const heads = document.querySelectorAll('.msg.assistant .who');
+  const last = heads.length ? heads[heads.length - 1] : null;
+  if (liveAvatarSlot && liveAvatarSlot !== last) {
+    const still = avatarWant(false, true);
+    if (still && still.ready) putAvatarIn(liveAvatarSlot, still);   // hand the animation over
+    liveAvatarSlot = null;
+  }
+  if (!last) return;
+  const live = avatarWant(false, false);
+  if (!live || !live.ready) return;
+  putAvatarIn(last, live);
+  liveAvatarSlot = last;
+}
+
+/* Is the slot already showing exactly this picture with exactly this crop?
+ * Both matter: the source alone would ignore a new crop (the preview kept its
+ * old one), and rebuilding on every settings apply is what started videos over. */
+function avatarSlotMatches(slot, want) {
+  if (!slot || !want || !want.ready) return false;
+  const cur = slot.querySelector('.avatar-wrap, img, video');
+  const media = cur ? (cur.matches('img, video') ? cur : cur.querySelector('img, video')) : null;
+  if (!media) return false;
+  if (media.getAttribute('src') !== want.src) return false;
+  return (media.dataset.crop || '') === JSON.stringify(want.crop || null);
+}
+
 /* Re-render every avatar after the image, its crop or its size changes. */
+/* Put an avatar in a slot without restarting it: a video (or GIF) avatar was
+ * rebuilt on every settings apply, which sent it back to the first frame. If the
+ * same picture is already there, let it keep playing. */
+function putAvatar(slot, node) {
+  if (!slot) return;
+  const want = node && node.querySelector('img, video');
+  if (want && avatarSlotMatches(slot, { src: want.getAttribute('src'), crop: JSON.parse(want.dataset.crop || 'null'), ready: true })) return;   // keep it running
+  releaseVideosIn(slot);
+  slot.replaceChildren(...(node ? node.childNodes : []));
+}
+
 function refreshAvatars() {
-  document.querySelectorAll('.msg.assistant .who').forEach((who) => {
+  // Compare before building: creating a node just to throw it away left a
+  // detached <video> (with its own resource load) behind on every settings
+  // apply, which is the avatar memory leak.
+  const still = avatarWant(false, true);
+  const heads = [...document.querySelectorAll('.msg.assistant .who')];
+  const lastHead = heads.length ? heads[heads.length - 1] : null;
+  heads.forEach((who) => {
+    // the newest message is animated instead (see animateLastMsgAvatar)
+    if (who === lastHead) return;
+    if (!still || !still.ready) return;              // pending or unset: leave the slot as it is
+    if (avatarSlotMatches(who, still)) return;       // already showing this picture and crop
+    const node = avatarNode(undefined, false, true);
+    if (!node) return;
     const old = who.querySelector('.avatar-wrap');
-    if (old) old.remove();
-    const node = avatarNode();
-    if (node) who.insertBefore(node, who.firstChild);
+    who.insertBefore(node, who.firstChild);
+    if (old) { releaseVideosIn(old); old.remove(); }
   });
+  animateLastMsgAvatar();
   const side = $('sidebar-avatar');
   if (side) {
-    const node = avatarNode();
-    if (node) { side.replaceChildren(...node.childNodes); side.hidden = false; }
-    else { side.replaceChildren(); side.hidden = true; }
+    // The sidebar is the one place that keeps an animated avatar.
+    const live = avatarWant(false, false);
+    if (avatarSlotMatches(side, live)) {
+      side.hidden = false;
+    } else {
+      const node = live ? avatarNode(undefined, false, false) : null;
+      putAvatar(side, node);
+      side.hidden = !node;
+    }
   }
   const prev = $('set-avatar-preview');
   if (prev) {
@@ -2371,11 +2664,14 @@ function refreshAvatars() {
     // icon fallback in the RN shell is not something you can crop or delete).
     // The dialog edits this machine's own settings, so its preview shows this
     // machine's picture even while you are looking at another instance.
-    if (SET.avatar) {
-      const node = avatarNode(undefined, true);
-      prev.replaceChildren(...node.childNodes);
+    const local = avatarWant(true, false);
+    if (avatarSlotMatches(prev, local)) {
       prev.style.visibility = 'visible';
+    } else if (local) {
+      const node = avatarNode(undefined, true);
+      if (node) { releaseVideosIn(prev); prev.replaceChildren(...node.childNodes); prev.style.visibility = 'visible'; }
     } else {
+      releaseVideosIn(prev);
       prev.replaceChildren();
       prev.style.visibility = 'hidden';
     }
@@ -2386,7 +2682,8 @@ function makeMsgShell(role, who) {
   const root = el('div', `msg ${role}`);
   const head = el('div', 'who');
   if (role.includes('assistant')) {
-    const av = avatarNode();
+    // a still frame, not a live video: see the note above avatarStillSrc()
+    const av = avatarNode(undefined, false, true);
     if (av) head.appendChild(av);
     head.appendChild(el('span', 'agent-name-label', displayAgentName() || 'pi'));
     head.appendChild(el('span', 'who-text', ` · ${who}`));
@@ -2529,6 +2826,7 @@ function renderAssistantMessage(msg, timing) {
   timing = timingFor(msg, timing);
   const { root, tools, bubble } = makeMsgShell('assistant', timeStr(msg.timestamp));
   root._msg = msg;
+  ensureTick();     // the newest message takes the animated avatar over from the old one
   const textBlocks = [];
   let stats = usageStats(msg.usage, timing && timing.elapsedSec, timing && timing.prefillSec);
   if (!stats && timing && timing.est) stats = estStatsText(timing.est, timing.elapsedSec);
@@ -2999,6 +3297,7 @@ async function refreshMessages() {
   }
   // Keep the reading position (distance from the bottom) across the re-render.
   const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
+  releaseVideosIn(chat);
   chat.innerHTML = '';
   if (!S.viewSession) {
     // Only the agent's own session owns the live tool cards; a read-only
@@ -3039,7 +3338,13 @@ async function refreshMessages() {
   // A session with thousands of messages (and images in them) freezes the tab
   // while every row is built. Counters still cover all of it, but only the
   // newest slice is rendered; the rest loads on demand from the button below.
-  if (S.windowFor !== S.state.sessionFile) { S.windowFor = S.state.sessionFile; S.historyWindow = 400; }
+  if (S.windowFor !== S.state.sessionFile) {
+    S.windowFor = S.state.sessionFile;
+    // How much of the session was on screen last time: a reload used to come back
+    // with the default 400 and an "load older" button where your reading was.
+    const kept = loadSessionUi();
+    S.historyWindow = Math.max(80, Number(kept && kept.reading && kept.reading.ws) || 400);
+  }
   const win = Math.max(80, S.historyWindow || 400);
   const windowed = msgs.length > win;
   S.historyPartial = partial || windowed;
@@ -3074,6 +3379,19 @@ async function refreshMessages() {
     }
   }
   transcriptTarget = null;
+  // Put the message that is being streamed right now back: it is not in the
+  // session file yet, so the rebuild above could not have rendered it, and it
+  // used to be dropped from the DOM - the streamed text disappeared until the
+  // turn ended and it came back as a finished message.
+  if (S.live && !S.live.root.isConnected && !S.viewSession && !S.liveDetached) {
+    chat.appendChild(S.live.root);
+    pinSoon();
+  }
+  markHollowMessages();
+  // A rebuild (a reload, a compaction re-read, a resize) must not move the reader.
+  // restoreReading() itself decides, from what was recorded, whether they were
+  // following the bottom - a fresh page has no idea, so the guard cannot live here.
+  requestAnimationFrame(() => restoreReading(5));
   // A compaction marker sits at the end of the transcript, so typing or a new
   // answer never pushes it out of sight.
   if (!S.viewSession) {
@@ -3130,10 +3448,12 @@ async function refreshMessages() {
     btn.onclick = () => {
       S.historyWindow = (S.historyWindow || win) + 400;
       const sc0 = chatScroller();
-    const keep = sc0.scrollHeight - sc0.scrollTop;
+      const keep = sc0.scrollHeight - sc0.scrollTop;
+      saveReading();
       refreshMessages().then(() => {
         const c = chatScroller();
         c.scrollTop = c.scrollHeight - keep;
+        saveReading();
       }).catch(() => {});
     };
     more.appendChild(btn);
@@ -3435,6 +3755,62 @@ function handleEvent(msg) {
  * length of the last turn (the stats row and the "turn took…" line) and whatever
  * the agent was in the middle of. Kept in localStorage, keyed per session, so a
  * reload comes back to the same picture. */
+/* ── the reading position ────────────────────────────────────────────────
+ * A resize reflows the transcript and the browser leaves the scroll somewhere
+ * else (measured: ~14,000px off in a long session), and a reload came back at the
+ * bottom with the "load older" window reset - so it looked like everything had
+ * been forgotten. The topmost message on screen and how far it sat from the top
+ * is what gets remembered (an id survives content growing below it), together
+ * with how much history was loaded. */
+function readingAnchor() {
+  const sc = chatScroller();
+  const nodes = [...chat.querySelectorAll('.msg')];
+  for (const n of nodes) {
+    const r = n.getBoundingClientRect();
+    const top = sc.getBoundingClientRect().top;
+    if (r.bottom > top + 4) {
+      return { ts: n.dataset.ts || null, off: Math.round(r.top - top), ws: S.historyWindow || null,
+               pinned: !!S.stickToBottom };
+    }
+  }
+  return { ts: null, off: 0, ws: S.historyWindow || null, pinned: !!S.stickToBottom };
+}
+
+function saveReading() {
+  if (S.viewSession || !S.state.sessionFile) return;
+  const a = readingAnchor();
+  saveSessionUi({ reading: { ...a, at: Date.now() } });
+}
+
+/* Where the reader was, on a fresh page: a reload does not know whether they
+ * were following the bottom or reading something old, and "the bottom" is the
+ * wrong guess when a position was recorded with them *not* following it. */
+function restoreReading(retries = 3, force) {
+  if (S.viewSession) return;
+  const kept = loadSessionUi();
+  const a = kept && kept.reading;
+  if (!a || !a.ts) return;
+  if (Date.now() - (a.at || 0) > 7 * 24 * 3600 * 1000) return;
+  const wanted = force === true || a.pinned === false;
+  if (!wanted) return;
+  if (a.pinned === false) S.stickToBottom = false;      // we are not following the bottom
+  const sc = chatScroller();
+  const node = chat.querySelector(`.msg[data-ts="${CSS.escape(String(a.ts))}"]`);
+  if (!node) {
+    if (retries > 0) setTimeout(() => restoreReading(retries - 1, force), 300);
+    return;
+  }
+  const top = sc.getBoundingClientRect().top;
+  sc.scrollTop += Math.round(node.getBoundingClientRect().top - top) - (a.off || 0);
+  // The layout keeps settling for a while (images, tool cards, the dock's height,
+  // the window's own load), and every settle moves the anchor a little. Follow it
+  // for a couple of seconds rather than landing short.
+  const delays = [60, 200, 450, 900, 1600];
+  const step = delays.length - Math.max(0, retries);
+  if (retries > 0 && step >= 0) setTimeout(() => restoreReading(retries - 1, force), delays[Math.min(step, delays.length - 1)]);
+  else if (retries > 0) setTimeout(() => restoreReading(retries - 1, force), 1600);
+}
+
 function sessionUiKey() {
   const p = S.viewSession || (S.state && S.state.sessionFile) || 'none';
   // ...and per instance: the same path on two machines is two different sessions.
@@ -3988,12 +4364,31 @@ function autoSize() {
   // view while typing.
   if (S.stickToBottom) pinSoon();
 }
-input.addEventListener('input', () => { autoSize(); updateSlashMenu(); });
+let draftSaveTimer = null;
+function saveDraftSoon() {
+  if (draftSaveTimer) clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(() => { draftSaveTimer = null; saveDraft(); }, 400);
+}
+input.addEventListener('input', () => { autoSize(); updateSlashMenu(); saveDraftSoon(); });
 // The composer is sized to its content, so it has to be re-measured when the
 // layout width changes (font size setting, window resize, phone rotation).
+let resizeReadingTimer = null;
 window.addEventListener('resize', () => {
   autoSize();
   if (!window.matchMedia('(max-width: 760px)').matches) $('sidebar').classList.remove('open');
+  // A reflow moves the scroll position with it (the transcript's height changes).
+  // Put the reader back where they were - twice, because the dock's own height
+  // settles a frame later.
+  if (!S.stickToBottom) {
+    if (resizeReadingTimer) clearTimeout(resizeReadingTimer);
+    restoreReading(1);
+    resizeReadingTimer = setTimeout(() => { resizeReadingTimer = null; restoreReading(1); }, 250);
+  }
+  // A reflow can leave the view somewhere in the middle of a long transcript, and
+  // the message being streamed (which lives in the DOM, not in the session file)
+  // has to stay where it is. If we were following the bottom, come back to it.
+  if (S.live && !S.live.root.isConnected && !S.viewSession && !S.liveDetached) chat.appendChild(S.live.root);
+  if (S.stickToBottom) pinSoon();
 });
 // On a phone the sidebar is a drawer: tapping the conversation closes it.
 chat.addEventListener('click', () => {
@@ -4220,7 +4615,51 @@ async function sendBash(command) {
   }
 }
 
+/* ── the composer's draft ────────────────────────────────────────────────
+ * What you have typed but not sent is worth keeping: the UI reloads itself after
+ * some webview hiccups, and a reload used to take the text and the attachments
+ * with it. Kept per session (and per instance), so switching sessions does not
+ * move a draft from one conversation to another. Switching *instances* still
+ * starts clean - that changes everything else too. */
+function draftKey() {
+  const p = S.viewSession || (S.state && S.state.sessionFile) || 'none';
+  return `piwebui-draft:${instanceKey()}:${String(p).slice(-120)}`;
+}
+
+function saveDraft() {
+  const key = draftKey();
+  const text = (typeof input !== 'undefined' && input.value) ? input.value : '';
+  try {
+    if (!text && !(S.attachments || []).length) { localStorage.removeItem(key); return; }
+    const attachments = (S.attachments || []).map((a) => {
+      // Small images travel inline (a pasted screenshot); anything else is kept by
+      // its path on this machine, which is all the agent needs.
+      const small = a.type === 'image' && typeof a.data === 'string' && a.data.length < 400000;
+      if (small) return { type: a.type, mimeType: a.mimeType, name: a.name, data: a.data };
+      return { type: a.type, kind: a.kind, name: a.name, path: a.path, size: a.size, mimeType: a.mimeType, transcript: a.transcript };
+    });
+    localStorage.setItem(key, JSON.stringify({ text, attachments, at: Date.now() }));
+  } catch { /* quota or private mode: a convenience, not state */ }
+}
+
+function loadDraft() {
+  try {
+    const raw = localStorage.getItem(draftKey());
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    if (!d || (!d.text && !(d.attachments || []).length)) return;
+    if (typeof input !== 'undefined' && d.text) { input.value = d.text; autoSize(); }
+    if ((d.attachments || []).length) { S.attachments = d.attachments; renderAttachments(); }
+    toast('Restored what you had typed');
+  } catch { /* nothing to restore */ }
+}
+
+function clearDraft() {
+  try { localStorage.removeItem(draftKey()); } catch { /* private mode */ }
+}
+
 function resetComposer() {
+  clearDraft();
   input.value = '';
   autoSize();
   clearAttachments();
@@ -4411,24 +4850,13 @@ async function transcribeAudioFile(file) {
 /* A picture or a video is something the user might mean as a background (the
  * wallpaper picker takes both). Used to route a dropped file that is too big for
  * the model to the wallpaper instead of refusing it outright. */
-function looksLikeWallpaper(file) {
-  const t = (file && file.type) || '';
-  const name = (file && file.name) || '';
-  return /^(video|image)\//.test(t) || /\.(mp4|webm|mov|m4v|ogv|mkv|gif|png|jpe?g|webp|avif|bmp|svg)$/i.test(name);
-}
-
 async function addFile(file) {
   if (file.type.startsWith('image/')) { await addImageFile(file); return; }
   if (file.size > 100 * 1024 * 1024) {
-    // The cap is there because an attachment is base64'd into the request. A
-    // background is only ever stored and shown, so a wallpaper video that
-    // happens to be big was refused for no reason - it becomes the background
-    // instead of failing.
-    if (looksLikeWallpaper(file)) {
-      toast(`${file.name} is ${(file.size / 1048576).toFixed(0)} MB — too big for the agent, using it as the background`);
-      await setBackgroundFromFile(file);
-      return;
-    }
+    // The cap is there because an attachment is base64'd into the request. It used
+    // to quietly turn a too-big video into the background - which is not what
+    // anyone dropping a file into the *chat* asked for, so now it just fails.
+    // (The background has its own upload button, and no size limit.)
     toast(`File too large (max 100 MB): ${file.name}`, 'error');
     return;
   }
@@ -4452,6 +4880,7 @@ async function addFile(file) {
 }
 
 function renderAttachments() {
+  saveDraft();
   const wrap = $('attachments');
   wrap.innerHTML = '';
   wrap.classList.toggle('hidden', !S.attachments.length);
@@ -4473,7 +4902,7 @@ function renderAttachments() {
           ? `transcribed: ${a.transcript.slice(0, 80)}${a.transcript.length > 80 ? '…' : ''}`
           : a.transcriptError
             ? `transcript failed (${a.transcriptError})`
-            : `${(a.size / 1024).toFixed(0)} KB`;
+            : fmtSize(a.size);
       meta.appendChild(el('div', 'file-status', status));
       box.append(icon, meta);
     }
@@ -4488,6 +4917,7 @@ function clearAttachments() {
   S.attachments = [];
   renderAttachments();
   syncComposerText();
+  saveDraft();
 }
 
 $('btn-attach').onclick = () => $('file-input').click();
@@ -4510,20 +4940,36 @@ document.addEventListener('paste', (e) => {
 
 // drag & drop images onto the window
 let dragDepth = 0;
+function hideDropOverlay() {
+  dragDepth = 0;
+  const o = $('drop-overlay');
+  if (o) o.classList.add('hidden');
+}
 document.addEventListener('dragenter', (e) => {
-  if ([...(e.dataTransfer?.types || [])].includes('Files')) {
-    dragDepth++;
-    $('drop-overlay').classList.remove('hidden');
-  }
+  if (![...(e.dataTransfer?.types || [])].includes('Files')) return;
+  // In a dialog, and on a row that takes files itself, the "drop files to attach"
+  // overlay is wrong: those spots have their own highlight. Leaving it up (and
+  // having no drop event to take it down, because the row stops propagation) is
+  // what left it hanging over the page.
+  const t = e.target;
+  if (t && t.closest && (t.closest('dialog') || t.closest('.avatar-row') || t.closest('.rate-row'))) return;
+  dragDepth++;
+  $('drop-overlay').classList.remove('hidden');
 });
-document.addEventListener('dragleave', () => {
-  if (--dragDepth <= 0) { dragDepth = 0; $('drop-overlay').classList.add('hidden'); }
+document.addEventListener('dragleave', (e) => {
+  // Leaving the window (no relatedTarget) always clears it: the counter can miss
+  // a leave when the drag ends inside a nested element.
+  if (!e.relatedTarget) { hideDropOverlay(); return; }
+  if (--dragDepth <= 0) hideDropOverlay();
 });
+// the drag ending anywhere - dropped, cancelled, or dropped on a row that stops
+// propagation - must take the overlay down
+document.addEventListener('dragend', () => hideDropOverlay());
+window.addEventListener('blur', () => hideDropOverlay());
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', async (e) => {
   e.preventDefault();
-  dragDepth = 0;
-  $('drop-overlay').classList.add('hidden');
+  hideDropOverlay();
   for (const f of e.dataTransfer?.files || []) await addFile(f);
 });
 
@@ -4913,18 +5359,51 @@ function currentTtsVoice() {
 /* Speak via a local OpenAI-compatible TTS server (/v1/audio/speech):
  * openedai-speech, speaches, alltalk, etc. — small models like Piper with
  * trainable/clonable voices. Returns a promise that resolves when done. */
+/* Speech through the bridge, for a cloud voice: a browser cannot call those
+ * services itself (no CORS, and the API key would sit in the page). The bridge
+ * holds the key and streams the audio back. */
+async function speakCloud(text) {
+  return speakInBatches(text, async (chunk) => {
+    const res = await fetch(api('/api/tts'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: SET.ttsBackend,
+        text: chunk,
+        model: SET.ttsCloudModel || undefined,
+        voice: SET.ttsCloudVoice || undefined,
+        baseUrl: SET.ttsCloudUrl || undefined,
+      }),
+    });
+    if (!res.ok) {
+      let msg = `TTS ${res.status}`;
+      try { const d = await res.json(); if (d && d.error) msg = d.error; } catch { /* not json */ }
+      throw new Error(msg);
+    }
+    return res.blob();
+  });
+}
+
 async function speakEndpoint(text) {
+  return speakInBatches(text, async (chunk) => {
+    const res = await fetch(SET.ttsEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: SET.ttsModel || 'piper', input: chunk, voice: SET.ttsVoiceName || undefined, response_format: 'wav' }),
+    });
+    if (!res.ok) throw new Error(`TTS server ${res.status}`);
+    return res.blob();
+  });
+}
+
+/* Split a reply into pieces a service will accept, hand each one to `getAudio`,
+ * and play what comes back in order. */
+async function speakInBatches(text, getAudio) {
   const chunks = text.match(/[^.!?]+[.!?]*\s*/g) || [text];
   let batch = '', buffers = [];
   const flush = async () => {
     if (!batch.trim()) return;
-    const res = await fetch(SET.ttsEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: SET.ttsModel || 'piper', input: batch.trim(), voice: SET.ttsVoiceName || undefined, response_format: 'wav' }),
-    });
-    if (!res.ok) throw new Error(`TTS server ${res.status}`);
-    buffers.push(await res.blob());
+    buffers.push(await getAudio(batch.trim()));
     batch = '';
   };
   for (const c of chunks) {
@@ -4947,6 +5426,9 @@ async function speakEndpoint(text) {
 }
 
 function speak(text) {
+  if (SET.ttsBackend === 'fish' || SET.ttsBackend === 'openai') {
+    return speakCloud(text).catch((e) => toast(`Speech failed: ${e.message}`, 'error'));
+  }
   if (!('speechSynthesis' in window) && SET.ttsBackend !== 'endpoint') {
     toast('Speech synthesis not supported', 'warning');
     return;
@@ -5175,7 +5657,8 @@ function renderSessions(sessions) {
       const forkKids = sessions.filter((x) => x.parent === s.path);
       if (forkKids.length) {
         const open = !collapsedForks[s.path];
-        const arrow = el('span', 'fork-toggle', open ? '▾' : '▸');
+        // Folded away with a count, so it is obvious there is something behind it.
+        const arrow = el('span', 'fork-toggle', open ? '▾' : `▸ ${forkKids.length}`);
         arrow.title = open
           ? `hide the ${forkKids.length} session${forkKids.length > 1 ? 's' : ''} forked from this one`
           : `show the ${forkKids.length} session${forkKids.length > 1 ? 's' : ''} forked from this one`;
@@ -5184,9 +5667,9 @@ function renderSessions(sessions) {
         arrow.onclick = (e) => { e.stopPropagation(); toggleForkCollapse(s.path); };
         nameRow.appendChild(arrow);
       }
-      nameRow.appendChild(document.createTextNode(s.name));
+      nameRow.appendChild(el('span', 'name-text', s.name));
       item.appendChild(nameRow);
-      item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${(s.size / 1024).toFixed(1)} KB`));
+      item.appendChild(el('div', 's-meta', `${new Date(s.mtime).toLocaleString()} · ${fmtSize(s.size)}`));
       item.onclick = () => switchToSession(s.path);
       item.oncontextmenu = (e) => { e.preventDefault(); openSessionMenu(s, item); };
       // Drag a session onto a folder (or onto another session inside one) to file
@@ -5769,7 +6252,8 @@ function openBellMenu() {
   if (!items.length) items.push({ label: 'nothing yet', hint: 'notifications and errors show up here', keepOpen: true, onPick: () => {} });
   items.push({ sep: true });
   items.push({ label: 'clear', hint: 'empty the list', onPick: () => { S.notices = []; S.noticesUnread = 0; updateBell(); } });
-  const menu = openMenu($('btn-bell'), items, { title: 'notifications', width: 460, force: true, align: 'right' });
+  // No `force`: clicking the bell again closes the list, like every other menu.
+  const menu = openMenu($('btn-bell'), items, { title: 'notifications', width: 460, align: 'right' });
   if (menu) { S.noticesUnread = 0; updateBell(); }
 }
 
@@ -5788,14 +6272,24 @@ window.addEventListener('unhandledrejection', (e) => {
   notice(`Unhandled: ${text}`, 'error', (r && r.stack) || null);
 });
 
+/* Routine bookkeeping: worth showing in the corner, not worth keeping. Switching
+ * session or instance happens constantly while you work, and each one added an
+ * entry to the notification list - so the list became a log of "Session switched"
+ * with the actual errors buried in it. */
+const QUIET_TOASTS = [
+  /^Session switched$/,
+  /^Back to this machine$/,
+  /^Looking at .+ \(through this machine\)$/,
+];
+
 function toast(text, kind = 'info') {
-  notice(text, kind);
+  if (!QUIET_TOASTS.some((r) => r.test(String(text)))) notice(text, kind);
   const t = el('div', `toast ${kind}`, text);
   $('toasts').appendChild(t);
   setTimeout(() => t.remove(), 5000);
 }
 
-function showBanner(kind, text, btnLabel, fn) {
+function showBanner(kind, text, btnLabel, fn, onDismiss) {
   const b = $('banner');
   b.className = `banner ${kind}`;
   b.innerHTML = '';
@@ -5804,6 +6298,14 @@ function showBanner(kind, text, btnLabel, fn) {
     const btn = el('button', 'btn small', btnLabel);
     btn.onclick = () => { hideBanner(); fn(); };
     b.appendChild(btn);
+  }
+  // Anything that comes back on its own has to be dismissible - and the dismissal
+  // has to be remembered, or the same banner returns on the next poll.
+  if (onDismiss) {
+    const x = el('button', 'btn small banner-x', '✕');
+    x.title = 'dismiss (it stays dismissed)';
+    x.onclick = () => { hideBanner(); onDismiss(); };
+    b.appendChild(x);
   }
 }
 
@@ -5878,6 +6380,11 @@ function openSettings() {
   $('set-stt-endpoint').value = SET.sttEndpoint || '';
   syncVoiceSettingsUi();
   $('set-tts-backend').value = SET.ttsBackend || 'browser';
+  if ($('set-tts-apikey')) $('set-tts-apikey').value = SET.ttsApiKey || '';
+  if ($('set-tts-cloud-model')) $('set-tts-cloud-model').value = SET.ttsCloudModel || '';
+  if ($('set-tts-cloud-voice')) $('set-tts-cloud-voice').value = SET.ttsCloudVoice || '';
+  if ($('set-tts-cloud-url')) $('set-tts-cloud-url').value = SET.ttsCloudUrl || '';
+  syncTtsSettingsUi();
   $('set-tts-endpoint').value = SET.ttsEndpoint || '';
   $('set-tts-model').value = SET.ttsModel || '';
   $('set-tts-voice-name').value = SET.ttsVoiceName || '';
@@ -5939,9 +6446,7 @@ $('set-agent-name').addEventListener('change', (e) => {
 });
 
 $('btn-avatar-upload').onclick = () => $('avatar-input').click();
-$('avatar-input').onchange = async (e) => {
-  const f = e.target.files[0];
-  e.target.value = '';
+async function acceptAvatarFile(f) {
   if (!f) return;
   const isVideo = f.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(f.name);
   const isImage = f.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(f.name);
@@ -5968,6 +6473,12 @@ $('avatar-input').onchange = async (e) => {
     }
     toast(`Upload failed: ${err.message}`, 'error');
   }
+}
+
+$('avatar-input').onchange = (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  return acceptAvatarFile(f);
 };
 $('btn-avatar-crop').onclick = () => openCropper('avatar');
 $('btn-avatar-clear').onclick = () => {
@@ -6021,7 +6532,11 @@ $('set-stt-backend').onchange = async (e) => {
     ? 'Voice input: Whisper server' + (SET.sttEndpoint ? ` (${SET.sttEndpoint})` : ' (auto local server)')
     : 'Voice input: browser speech recognition (Chrome/Edge only)');
 };
-$('set-tts-backend').onchange = (e) => { SET.ttsBackend = e.target.value; saveSettings(); };
+$('set-tts-backend').onchange = (e) => { SET.ttsBackend = e.target.value; saveSettings(); syncTtsSettingsUi(); };
+$('set-tts-apikey').onchange = (e) => { SET.ttsApiKey = e.target.value.trim(); saveSettings(); toast('Voice key saved (it lives in the bridge settings)'); };
+$('set-tts-cloud-model').onchange = (e) => { SET.ttsCloudModel = e.target.value.trim(); saveSettings(); };
+$('set-tts-cloud-voice').onchange = (e) => { SET.ttsCloudVoice = e.target.value.trim(); saveSettings(); };
+$('set-tts-cloud-url').onchange = (e) => { SET.ttsCloudUrl = e.target.value.trim(); saveSettings(); };
 $('set-tts-endpoint').addEventListener('change', (e) => { SET.ttsEndpoint = e.target.value.trim(); saveSettings(); });
 $('set-tts-model').addEventListener('change', (e) => { SET.ttsModel = e.target.value.trim(); saveSettings(); });
 $('set-tts-voice-name').addEventListener('change', (e) => { SET.ttsVoiceName = e.target.value.trim(); saveSettings(); });
@@ -6074,6 +6589,23 @@ $('btn-bg-crop').onclick = () => openCropper('bg');
 /* Apply SET.themeBg to the page. Images, GIFs and videos all render as a real
  * element behind the app, so one code path (and one crop) covers all three -
  * a body background-image could not be zoomed or panned by hand. */
+/* The accent, the outline colour and the avatar size: everything that gamer mode
+ * (or a settings change) has to be able to put back on its own. */
+function applyThemeColours() {
+  const rootStyle = document.documentElement.style;
+  // text outline: a 4-way shadow keeps glyphs readable when the panels are
+  // translucent and the background image shows through.
+  document.body.classList.toggle('text-outline', SET.textOutline !== false);
+  rootStyle.setProperty('--outline-color', SET.textOutlineColor || '#000000');
+  if (SET.themeAccent) {
+    rootStyle.setProperty('--accent', SET.themeAccent);
+    rootStyle.setProperty('--accent-dim', `color-mix(in srgb, ${SET.themeAccent} 35%, #171b22)`);
+  } else {
+    rootStyle.removeProperty('--accent');
+    rootStyle.removeProperty('--accent-dim');
+  }
+}
+
 function applyBackgroundMedia() {
   const host = $('bg-media');
   // Another instance brings its own background (its own file, served by its own
@@ -6092,9 +6624,20 @@ function applyBackgroundMedia() {
     applyBgAudio(current);
     return;
   }
+  // If the element does have to be rebuilt, the video must not start over: keep
+  // the playhead, the mute state and whether it was playing (a resize, a settings
+  // save or a theme change used to send it back to the beginning, audio and all).
+  const before = current && current.tagName === 'VIDEO'
+    ? { at: current.currentTime, playing: !current.paused, muted: current.muted }
+    : null;
   host.innerHTML = '';
   if (!src) { host.classList.add('hidden'); return; }
   const node = attachCrop(mediaNode(src, 'bg-node'), look.bgCrop, frame);
+  if (before && node.tagName === 'VIDEO') {
+    try { node.currentTime = before.at; } catch { /* not seekable yet */ }
+    node.muted = before.muted;
+    if (before.playing) node.addEventListener('loadeddata', () => node.play().catch(() => {}), { once: true });
+  }
   node.onerror = () => toast(isVideoSrc(src) ? 'Background video failed to load' : 'Background image failed to load', 'error');
   host.appendChild(node);
   host.classList.remove('hidden');
@@ -6172,6 +6715,11 @@ function startGamerAccent() {
     const hue = gamerPhase * 360;
     root.setProperty('--accent', `oklch(68% 0.17 ${hue.toFixed(1)})`);
     root.setProperty('--accent-dim', `oklch(38% 0.09 ${hue.toFixed(1)})`);
+    // The outline around the chat text follows the hue, but not at accent
+    // brightness: eight 1px shadows around small numbers at 68% lightness smeared
+    // the glyphs (the [573.9K/1.0Mctx] label looked doubled). Mid-lightness keeps
+    // the drift visible and the text readable.
+    if (SET.textOutline !== false) root.setProperty('--outline-color', `oklch(45% 0.14 ${hue.toFixed(1)})`);
   };
   gamerTimer = requestAnimationFrame(tick);
 }
@@ -6182,6 +6730,8 @@ function stopGamerAccent() {
   const root = document.documentElement.style;
   root.removeProperty('--accent');
   root.removeProperty('--accent-dim');
+  // ...and back to the colour from settings when the drift stops.
+  applyThemeColours();
 }
 
 /* ── "the agent has finished" ─────────────────────────────────────────────
@@ -6885,12 +7435,40 @@ async function loadPiProviders() {
   const list = $('pi-providers-list');
   list.innerHTML = '';
   list.appendChild(el('div', 'prov-empty', 'loading…'));
+
+  // The llama.cpp servers found on this machine or the LAN come first: they are the
+  // ones you actually point pi at, and the banner offering to do it can be
+  // dismissed (or missed), so the list is where they live.
+  const llamaSection = document.createDocumentFragment();
+  try {
+    const l = await fetch(api('/api/llama-models')).then((r) => r.json());
+    const servers = (l && l.servers) || [];
+    if (servers.length) {
+      llamaSection.appendChild(el('div', 'prov-group', 'llama.cpp — found automatically'));
+      for (const srv of servers) {
+        const row = el('div', 'prov-row');
+        const info = el('div', 'prov-info');
+        info.appendChild(el('div', 'prov-id', srv.url.replace(/^https?:\/\//, '')));
+        const registered = (S.models || []).some((m) => m.provider === srv.providerId);
+        info.appendChild(el('div', 'prov-meta',
+          `${srv.models.length} model${srv.models.length > 1 ? 's' : ''} · ${registered ? 'registered with pi ✓' : 'not registered with pi yet'}`));
+        const btn = el('button', 'btn small', registered ? 'point pi here again' : 'point pi here & reload');
+        btn.title = `Write ${srv.url} into pi's settings and restart the agent`;
+        btn.onclick = () => fixLlamaConfig(srv.url);
+        row.append(info, btn);
+        llamaSection.appendChild(row);
+      }
+      if (l && l.scanning) llamaSection.appendChild(el('div', 'prov-empty', 'still looking for more on this network…'));
+    }
+  } catch { /* bridge offline: the list below still works */ }
+
   try {
     const d = await fetch(api('/api/pi-providers')).then((r) => r.json());
     list.innerHTML = '';
+    list.appendChild(llamaSection);
     const provs = Object.entries(d.providers || {});
     if (!provs.length) {
-      list.appendChild(el('div', 'prov-empty', 'no custom providers yet'));
+      list.appendChild(el('div', 'prov-empty', llamaSection.childNodes.length ? 'no providers added by hand' : 'no custom providers yet'));
       return;
     }
     for (const [id, p] of provs) {
@@ -6917,6 +7495,7 @@ async function loadPiProviders() {
     }
   } catch {
     list.innerHTML = '';
+    list.appendChild(llamaSection);
     list.appendChild(el('div', 'prov-empty', 'bridge offline'));
   }
 }
@@ -7936,7 +8515,13 @@ function instanceAvatar(inst) {
   if (!inst) return null;
   if (inst.url === location.origin) return SET.avatar || null;
   const card = S.instanceCards[inst.url];
-  return (card && card.avatar) || null;
+  const src = (card && card.avatar) || null;
+  if (!src) return null;
+  // A picture stored on the other machine is a relative "/api/bg-file?name=..."
+  // URL, which this page would ask *this* machine for - that is the broken image
+  // in the instance list. Send it through the proxy instead.
+  if (/^\/api\//.test(src)) return `/proxy/${encodeURIComponent(inst.url)}${src}`;
+  return src;
 }
 
 function updateInstanceBtn() {
@@ -8241,7 +8826,16 @@ try {
     S.remoteName = remembered.name || remembered.url;
   }
 } catch { /* private mode */ }
-loadServerSettings().then(() => maybeShowSetup());
+loadServerSettings().then(() => {
+  // Only offer the first-run dialog when the server's settings really loaded.
+  // Without them SET is this browser's defaults, and the dialog would save those
+  // defaults over a real configuration.
+  if (settingsLoaded) { maybeShowSetup(); return; }
+  // One retry: a busy bridge (a container doing its first `docker exec`, say) can
+  // miss a request, and the dialog is the one thing that must not fire on a
+  // half-loaded page.
+  setTimeout(() => { loadServerSettings().then(() => { if (settingsLoaded) maybeShowSetup(); }); }, 3000);
+});
 connect();
 updateInstanceBtn();
 
@@ -8264,6 +8858,38 @@ if ($('btn-subagents')) {
 }
 if ($('subagent-close')) $('subagent-close').onclick = () => $('subagent-dialog').close();
 if ($('subagent-copy')) $('subagent-copy').onclick = () => copyText($('subagent-body').textContent || '', 'Copied what it wrote');
+/* ── dropping a file on a settings row ───────────────────────────────────
+ * The upload buttons work, but dropping a picture straight onto the row you want
+ * it in is the obvious thing to try - and it did nothing (the page only accepted
+ * drops in the chat). These rows take the same files as their buttons. */
+function wireDropRow(node, onFile, label) {
+  if (!node) return;
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  const clear = () => node.classList.remove('drop-ok');
+  node.addEventListener('dragover', (e) => {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types || !types.includes('Files')) return;   // a session row being dragged, not a file
+    stop(e);
+    e.dataTransfer.dropEffect = 'copy';
+    node.classList.add('drop-ok');
+  });
+  node.addEventListener('dragleave', clear);
+  node.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return undefined;
+    stop(e);
+    clear();
+    hideDropOverlay();          // this row stops propagation, so nothing else can
+    if (label) toast(`${label}: ${f.name}`);
+    return onFile(f);
+  });
+}
+
+wireDropRow($('set-avatar-preview') && $('set-avatar-preview').closest('.avatar-row'), (f) => acceptAvatarFile(f), 'Profile image');
+wireDropRow($('bg-input') && $('bg-input').closest('.rate-row'), (f) => setBackgroundFromFile(f), 'Background');
+wireDropRow($('setup-avatar-preview') && $('setup-avatar-preview').closest('.avatar-row'), (f) => acceptAvatarFile(f), 'Profile image');
+wireDropRow($('setup-bg-upload') && $('setup-bg-upload').closest('.rate-row'), (f) => setBackgroundFromFile(f), 'Background');
+
 /* The empty part of the session list: right-click for a new folder, drop a
  * session there to take it out of its folder. */
 (function wireSessionList() {

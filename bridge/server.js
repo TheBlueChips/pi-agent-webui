@@ -1093,6 +1093,8 @@ function readJsonSafe(file) {
  * pi-llama-cpp extension: project .pi/settings.json → $LLAMA_SERVER_URL →
  * global settings.json → auth.json (built-in provider) → default.
  */
+/* The addresses worth asking right away: what is configured, the loopback, and
+ * this machine's own LAN addresses (a server bound to 0.0.0.0 answers on both). */
 function llamaServerCandidates() {
   const urls = [];
   const project = readJsonSafe(path.join(WORKSPACE_DIR, '.pi', 'settings.json'));
@@ -1105,6 +1107,11 @@ function llamaServerCandidates() {
     urls.push(auth['llama.cpp'].env.LLAMA_BASE_URL);
   }
   urls.push('http://127.0.0.1:8080');
+  urls.push('http://localhost:8080');
+  for (const ip of localIPv4s(false)) {
+    urls.push(`http://${ip}:8080`);
+    urls.push(`http://${ip}:8081`);
+  }
   const out = [];
   for (const raw of urls) {
     for (const u of String(raw).split(';').map((s) => s.trim().replace(/\/+$/, ''))) {
@@ -1118,7 +1125,7 @@ function llamaServerCandidates() {
  * the server is unreachable or has no models endpoint. A network error on the
  * first path means the host is unreachable — don't waste another timeout on
  * the second path. */
-async function fetchLlamaModels(url) {
+async function fetchLlamaModels(url, timeoutMs = 1200) {
   const parse = (d) => {
     const arr = Array.isArray(d) ? d : (Array.isArray(d.data) ? d.data : null);
     if (!arr) return null;
@@ -1127,7 +1134,7 @@ async function fetchLlamaModels(url) {
       .map((m) => ({ id: m.id, name: m.name || m.id }));
   };
   try {
-    const res = await fetch(url + '/v1/models', { signal: AbortSignal.timeout(1200) });
+    const res = await fetch(url + '/v1/models', { signal: AbortSignal.timeout(Math.max(150, Number(timeoutMs) || 1200)) });
     if (res.ok) {
       const models = parse(await res.json());
       if (models) return models;
@@ -1195,6 +1202,79 @@ function maskKey(k) {
 function writeModelsFile(file) {
   fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
   fs.writeFileSync(PI_MODELS_FILE, JSON.stringify(file, null, 2) + '\n');
+}
+
+/* This machine's private IPv4 addresses. A llama-server started with the default
+ * host answers on these too, so they belong in the first, fast round. */
+const VIRTUAL_IFACE = /(wsl|vethernet|virtual|hyper-v|vmware|loopback|docker|veth|br-|tun|tap|utun|npcap)/i;
+
+function localIPv4s(forSweep) {
+  const out = [];
+  try {
+    for (const [name, list] of Object.entries(os.networkInterfaces())) {
+      if (forSweep && VIRTUAL_IFACE.test(name)) continue;   // WSL/Hyper-V/Docker: not the LAN
+      for (const a of list || []) {
+        if (a && a.family === 'IPv4' && !a.internal && /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(a.address)) out.push(a.address);
+      }
+    }
+  } catch { /* no interfaces to read */ }
+  return out;
+}
+
+/* ── looking for llama.cpp on the LAN ────────────────────────────────────
+ * A llama-server on another machine is the whole point of having one (that is
+ * where the GPU is), and only localhost was ever probed - so it was invisible
+ * unless it had been typed into pi's settings by hand. This sweeps the /24 the
+ * machine is on, on the two ports llama-server uses, with a short timeout and a
+ * little concurrency, then remembers the answer for a few minutes. It runs in the
+ * background: the first request answers with the fast candidates only, and the
+ * sweep's findings appear on the next poll (the UI already retries). */
+const LLAMA_LAN_TTL = 5 * 60 * 1000;
+const LLAMA_LAN_PORTS = [8080, 8081];
+let llamaLan = { at: 0, urls: [], scanning: false };
+
+function subnetHosts() {
+  const hosts = [];
+  for (const ip of localIPv4s(true).slice(0, 2)) {
+    const base = ip.split('.').slice(0, 3).join('.');
+    if (hosts.includes(base)) continue;
+    hosts.push(base);
+  }
+  const out = [];
+  for (const base of hosts) for (let i = 1; i <= 254; i++) out.push(`${base}.${i}`);
+  return out;
+}
+
+async function llamaSweepLan() {
+  if (llamaLan.scanning) return;
+  llamaLan.scanning = true;
+  const found = [];
+  const hosts = subnetHosts();
+  const targets = [];
+  for (const h of hosts) for (const port of LLAMA_LAN_PORTS) targets.push(`http://${h}:${port}`);
+  let i = 0;
+  const worker = async () => {
+    while (i < targets.length) {
+      const url = targets[i++];
+      const models = await fetchLlamaModels(url, 350);
+      if (models && models.length) found.push(url);
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: 48 }, worker));
+  } catch { /* whatever we found is still useful */ }
+  llamaLan = { at: Date.now(), urls: found, scanning: false };
+  console.log(`llama.cpp on the LAN: ${found.length ? found.join(', ') : 'nothing found'}`);
+}
+
+function llamaLanUrls() {
+  // PI_LLAMA_SCAN=off turns the sweep off for anyone who does not want the bridge
+  // walking their subnet.
+  if (String(process.env.PI_LLAMA_SCAN || '').toLowerCase() === 'off') return [];
+  if (llamaLan.urls.length && Date.now() - llamaLan.at < LLAMA_LAN_TTL) return llamaLan.urls;
+  if (!llamaLan.scanning) llamaSweepLan().catch(() => {});
+  // While a sweep is running the previous answer (if any) still counts.
+  return llamaLan.urls;
 }
 
 /* Small cache for /api/llama-models (the UI probes it on connect, focus and
@@ -1473,6 +1553,61 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* Speech through a cloud service. The browser cannot call these itself (no
+   * CORS, and the API key would be in the page), so the bridge does it: it reads
+   * the key from its own settings and streams the audio straight back. */
+  if (req.url.startsWith('/api/tts')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 512 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      let inBody = {};
+      try { inBody = JSON.parse(body || '{}'); } catch { /* error below */ }
+      const text = String(inBody.text || '').slice(0, 8000);
+      if (!text.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no text' }));
+        return;
+      }
+      let settings = {};
+      try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
+      const provider = String(inBody.provider || settings.ttsBackend || '').toLowerCase();
+      const key = String(inBody.apiKey || settings.ttsApiKey || '').trim();
+      const model = String(inBody.model || settings.ttsCloudModel || '').trim();
+      const voice = String(inBody.voice || settings.ttsCloudVoice || '').trim();
+      const base = String(inBody.baseUrl || settings.ttsCloudUrl || '').trim().replace(/\/+$/, '');
+      try {
+        if (!key) throw new Error('no API key set for this voice');
+        let url, payload, headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
+        if (provider === 'fish') {
+          // Fish Audio: text + a reference id (a voice you made or picked), or the
+          // model's default voice when none is given.
+          url = `${base || 'https://api.fish.audio'}/v1/tts`;
+          payload = { text, format: 'mp3', model: model || 's1' };
+          if (voice) payload.reference_id = voice;
+        } else {
+          // Anything OpenAI-compatible: /v1/audio/speech with model + voice.
+          url = `${base || 'https://api.openai.com'}/v1/audio/speech`;
+          payload = { model: model || 'tts-1', input: text, voice: voice || 'alloy', response_format: 'mp3' };
+        }
+        const up = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+        if (!up.ok) {
+          const detail = await up.text().catch(() => '');
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `${provider} said ${up.status}${detail ? ': ' + detail.slice(0, 300) : ''}` }));
+          return;
+        }
+        const buf = Buffer.from(await up.arrayBuffer());
+        res.writeHead(200, { 'Content-Type': up.headers.get('content-type') || 'audio/mpeg', 'Content-Length': buf.length });
+        res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (req.url.startsWith('/api/whisper-status')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(whisperStatus()));
@@ -1510,11 +1645,13 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(llamaModelsCache.data));
       return;
     }
-    const results = await Promise.all(llamaServerCandidates().map(async (url) => {
+    const candidates = [...llamaServerCandidates(), ...llamaLanUrls()];
+    const unique = [...new Set(candidates)];
+    const results = await Promise.all(unique.map(async (url) => {
       const models = await fetchLlamaModels(url);
       return models ? { url, providerId: `llama-server=${url}`, models } : null;
     }));
-    const payload = { servers: results.filter(Boolean) };
+    const payload = { servers: results.filter(Boolean), scanning: llamaLan.scanning };
     llamaModelsCache.at = Date.now();
     llamaModelsCache.data = payload;
     res.writeHead(200, { 'Content-Type': 'application/json' });
