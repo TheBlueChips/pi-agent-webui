@@ -1449,7 +1449,7 @@ async function refreshModels() {
  * URL is unreachable), a banner offers to point pi at the live server and
  * restart the agent so the model becomes selectable. */
 let llamaLiveServers = [];
-let llamaConfiguredUrl = null;
+let llamaConfiguredUrls = [];
 let llamaEnvOverride = null;   // LLAMA_SERVER_URL wins over the configured list
 let llamaMismatchBanner = false;
 let llamaFixInFlight = false;
@@ -1463,8 +1463,8 @@ async function refreshLlamaGroup() {
       fetch(api('/api/llama-models')).then((r) => r.json()),
       fetch(api('/api/llama-config')).then((r) => r.json()),
     ]);
-    llamaConfiguredUrl = cfg.url || null;
-  llamaEnvOverride = cfg.envOverride || null;
+    llamaConfiguredUrls = Array.isArray(cfg.urls) ? cfg.urls : (cfg.url ? [cfg.url] : []);
+    llamaEnvOverride = cfg.envOverride || null;
     llamaLiveServers = d.servers || [];
     if (!llamaLiveServers.length) {
       hideLlamaMismatch();
@@ -1520,11 +1520,12 @@ async function refreshLlamaGroup() {
 function showLlamaMismatch(srv) {
   if (SET.llamaDismissed === srv.url) return;      // told once, not again
   const short = srv.url.replace(/^https?:\/\//, '');
-  const configured = (llamaConfiguredUrl && llamaConfiguredUrl !== srv.url)
-    ? `pi is configured for ${llamaConfiguredUrl.replace(/^https?:\/\//, '')} (unreachable)`
+  const isConfigured = llamaConfiguredUrls.some((u) => normLlamaUrl(u) === normLlamaUrl(srv.url));
+  const configured = !isConfigured && llamaConfiguredUrls.length
+    ? `pi is configured for ${llamaConfiguredUrls.map((u) => u.replace(/^https?:\/\//, '')).join(', ')} (the live server is not registered)`
     : 'pi has not registered it yet';
   showBanner('warn',
-    `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it. pi needs the pi-llama-cpp extension to register it (install with: pi install npm:pi-llama-cpp), then point pi at this server and restart.`,
+    `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it. If pi-llama-cpp is not installed, install it with: pi install npm:pi-llama-cpp.`,
     `Point pi at ${llamaLiveServers.length > 1 ? `all ${llamaLiveServers.length} servers` : 'this server'} & reload`,
     () => fixLlamaConfig((llamaLiveServers.length ? llamaLiveServers : [srv]).map((x) => x.url)),
     () => {

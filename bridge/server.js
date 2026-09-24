@@ -1098,10 +1098,10 @@ function readJsonSafe(file) {
 function llamaServerCandidates() {
   const urls = [];
   const project = readJsonSafe(path.join(WORKSPACE_DIR, '.pi', 'settings.json'));
-  if (project && project.llamaServerUrl) urls.push(project.llamaServerUrl);
+  if (project) urls.push(...llamaConfiguredUrls(project));
   if (process.env.LLAMA_SERVER_URL) urls.push(process.env.LLAMA_SERVER_URL);
   const global = readJsonSafe(PI_SETTINGS_FILE);
-  if (global && global.llamaServerUrl) urls.push(global.llamaServerUrl);
+  if (global) urls.push(...llamaConfiguredUrls(global));
   const auth = readJsonSafe(PI_AUTH_FILE);
   if (auth && auth['llama.cpp'] && auth['llama.cpp'].env && auth['llama.cpp'].env.LLAMA_BASE_URL) {
     urls.push(auth['llama.cpp'].env.LLAMA_BASE_URL);
@@ -1180,17 +1180,20 @@ const LOCAL_LLAMA_PORTS = [8080, 8081, 8090, 8000, 1234];   // llama.cpp, plus t
  * what is configured now. */
 function llamaConfiguredUrls(settings) {
   const out = [];
+  const add = (value) => {
+    // pi-llama-cpp's supported multiple-server syntax is one semicolon-separated
+    // value. Accept that syntax in either the legacy key or a list entry so the
+    // bridge can read configurations written by the extension and by the UI.
+    for (const raw of String(value || '').split(';')) {
+      const u = raw.trim().replace(/\/+$/, '');
+      if (u && !out.includes(u)) out.push(u);
+    }
+  };
   const list = settings && settings.llamaSettings && settings.llamaSettings.servers;
   if (Array.isArray(list)) {
-    for (const entry of list) {
-      const u = typeof entry === 'string' ? entry : (entry && entry.url);
-      if (typeof u === 'string' && u.trim()) out.push(u.trim().replace(/\/+$/, ''));
-    }
+    for (const entry of list) add(typeof entry === 'string' ? entry : (entry && entry.url));
   }
-  const legacy = settings && settings.llamaServerUrl;
-  if (typeof legacy === 'string' && legacy.trim() && !out.includes(legacy.trim().replace(/\/+$/, ''))) {
-    out.push(legacy.trim().replace(/\/+$/, ''));
-  }
+  add(settings && settings.llamaServerUrl);
   return out;
 }
 
@@ -1211,10 +1214,11 @@ async function llamaServerIdentity(url) {
  * wins over the loopback/LAN addresses that reach the same server. */
 function readLlamaServerUrl() {
   const project = readJsonSafe(path.join(WORKSPACE_DIR, '.pi', 'settings.json'));
-  if (project && project.llamaServerUrl) return String(project.llamaServerUrl).replace(/\/+$/, '');
+  const projectUrls = llamaConfiguredUrls(project);
+  if (projectUrls.length) return projectUrls[0];
   const global = readJsonSafe(PI_SETTINGS_FILE);
-  if (global && global.llamaServerUrl) return String(global.llamaServerUrl).replace(/\/+$/, '');
-  return null;
+  const globalUrls = llamaConfiguredUrls(global);
+  return globalUrls[0] || null;
 }
 
 const ALLOWED_APIS = new Set([
@@ -1788,14 +1792,20 @@ const server = http.createServer(async (req, res) => {
           let settings = {};
           try { settings = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
           const previous = llamaConfiguredUrls(settings);
-          const hadLegacy = typeof settings.llamaServerUrl === 'string';
-          settings.llamaSettings = Object.assign({}, settings.llamaSettings, { servers: clean.map((url) => ({ url })) });
-          // The legacy key means "one server" and would shadow the list.
-          if (hadLegacy) delete settings.llamaServerUrl;
+          // pi-llama-cpp currently resolves llamaServerUrl at startup, and its
+          // documented multi-server format is semicolon-separated URLs. The
+          // llamaSettings.servers list is kept for newer versions of the
+          // extension, but on its own it is ignored by the installed version —
+          // which made the UI say it had pointed pi at the LAN server while pi
+          // continued registering only 127.0.0.1.
+          settings.llamaServerUrl = clean.join(';');
+          settings.llamaSettings = Object.assign({}, settings.llamaSettings, {
+            servers: clean.map((url) => ({ url })),
+          });
           fs.mkdirSync(path.dirname(PI_SETTINGS_FILE), { recursive: true });
           fs.writeFileSync(PI_SETTINGS_FILE, JSON.stringify(settings, null, 2));
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, previous, urls: clean, removedLegacyKey: hadLegacy }));
+          res.end(JSON.stringify({ ok: true, previous, urls: clean, format: 'semicolon-separated llamaServerUrl' }));
         } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message }));
