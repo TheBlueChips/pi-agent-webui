@@ -426,11 +426,24 @@ body.hide-thinking details.thinking { display: none; }
   max-width: 860px; margin: 6px auto 0;
   display: flex; align-items: center; justify-content: flex-start;
   gap: 12px; font-size: 12px; color: var(--text-dim);
-  /* Fold instead of squeezing: items that cannot shrink used to spill their text
-     over the neighbour (the ctx label ran into the token counter), and empty
-     fields reserved their full width, which pushed the total far away. */
-  flex-wrap: wrap; row-gap: 6px;
+  /* One line, always. This row used to wrap when it ran out of room, and since the
+     numbers grow while the agent works, the row folded and unfolded with them - the
+     whole dock (composer included) moved up and down by 26px. The width at which
+     things get tight is a property of the window, so the squeeze has to be taken
+     by the elastic parts (the model and thinking pills, which truncate) and never
+     by the layout. */
+  flex-wrap: nowrap;
+  min-height: 44px;
 }
+/* The ring, the ctx label and the total never shrink and never paint outside
+   their box (that is what ran the ctx label into the token counter). */
+#stats-bar .ctx-ring, #ctx-label, #stat-turn { flex: 0 0 auto; }
+/* The token counter is the long one and the least important, so it truncates -
+   the ring and the label next to it carry the same information. The controls keep
+   a readable width; squeezing them to 50px was worse than clipping a number. */
+#stat-tokens, #stat-cost { flex: 0 1 auto; min-width: 44px; overflow: hidden; text-overflow: ellipsis; }
+#stats-bar select, #stats-bar .btn.pill { flex: 0 0 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#model-btn { max-width: 200px; }
 #stats-bar .stats-spacer { flex: 1; }
 /* Numbers that grow while the agent runs: fixed-width digits, and enough room
    reserved for the longest form so the row never rewraps as the seconds tick.
