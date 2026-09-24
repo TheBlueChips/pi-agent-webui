@@ -2235,15 +2235,12 @@ function tickNeeded() {
   if (S.runStartTs) return true;
   if ($('setup-dialog') && $('setup-dialog').open) return true;   // the avatar preview fills in
   if (S.subagentMenuOpen || S.viewSubagent) return true;
-  // a newly rendered message still has to take over the animated avatar
-  if (lastMsgHead() !== liveAvatarSlot) return true;
+  // a fresh render leaves the avatars in the wrong state until the ticker fixes it
+  if (avatarAnimNeeded()) return true;
+  // and while a group of avatars animates, the ticker is what keeps them on the
+  // same frame - a second of drift is visible when they are side by side
+  if (document.querySelectorAll('video.avatar').length > 1) return true;
   return subagentList().some(isLiveRun);
-}
-
-/* The header of the newest assistant message (the one that gets the animation). */
-function lastMsgHead() {
-  const heads = document.querySelectorAll('.msg.assistant .who');
-  return heads.length ? heads[heads.length - 1] : null;
 }
 function ensureTick() {
   if (tickNeeded() && !uiTick) uiTick = setInterval(onUiTick, 1000);
@@ -2251,7 +2248,8 @@ function ensureTick() {
 }
 function onUiTick() {
   paintRunStat();
-  animateLastMsgAvatar();          // the newest message owns the animated avatar
+  animateAvatarGroup();            // the newest messages keep the animated avatar
+  syncAvatarVideos();              // and stay on the same frame
   if ($('setup-dialog') && $('setup-dialog').open) refreshSetupPreview();
   if (S.subagentMenuOpen || S.viewSubagent || subagentList().some(isLiveRun)) refreshSubagents().catch(() => {});
   if (S.subagentMenuOpen) refreshSubagentMenu();
@@ -2566,6 +2564,18 @@ function avatarNodeFrom(want, sizeClass) {
   const node = attachCrop(mediaNode(want.src, 'avatar'), want.crop, 1);
   // remember which crop this node was built with, so a crop change can rebuild it
   if (node) node.dataset.crop = JSON.stringify(want.crop || null);
+  if (node && node.tagName === 'VIDEO') {
+    // Join the animated group's frame instead of restarting from 0. A cached file
+    // can be ready before those listeners attach, and a seek issued too early is
+    // dropped, so every animated avatar also checks itself while it plays - the
+    // group converges within a quarter of a second whatever the timing was.
+    const join = () => alignAvatarVideo(node);
+    node.addEventListener('loadedmetadata', join);
+    node.addEventListener('canplay', join);
+    node.addEventListener('playing', join);
+    node.addEventListener('timeupdate', join);
+    if (node.readyState >= 1) join();
+  }
   wrap.appendChild(node);
   return wrap;
 }
@@ -2583,24 +2593,74 @@ function putAvatarIn(slot, want) {
   return true;
 }
 
-/* The newest message keeps the animated avatar and every older one shows the
- * still, so a transcript of any length runs two decoders at most (this one and
- * the sidebar) no matter how many messages are on screen. Called after renders
- * and from the ticker, and it does nothing when the same slot is already live. */
-let liveAvatarSlot = null;
-function animateLastMsgAvatar() {
-  const heads = document.querySelectorAll('.msg.assistant .who');
-  const last = heads.length ? heads[heads.length - 1] : null;
-  if (liveAvatarSlot && liveAvatarSlot !== last) {
-    const still = avatarWant(false, true);
-    if (still && still.ready) putAvatarIn(liveAvatarSlot, still);   // hand the animation over
-    liveAvatarSlot = null;
+/* How many messages animate: the newest few plus the sidebar. Every one of them
+ * is the same video, so they are kept on the same frame - a group of avatars each
+ * playing its own copy from wherever it happened to start looks broken. Ten is
+ * well inside what a GPU decodes in hardware, so this stays cheap; everything
+ * older is a still frame. */
+const AVATAR_ANIMATE_MSGS = 8;
+
+/* The frame every animated avatar should be showing: one wall-clock position,
+ * taken from page load, wrapped by the clip's duration. All of them play the same
+ * file, so aligning each to this clock is enough to keep the group together - and
+ * unlike "follow the first video that is playing" it cannot be dragged off by a
+ * freshly built one (a transcript rebuild creates videos at 0, and following one
+ * of those pulled the whole group back to the start). */
+const avatarClockAt = performance.now();
+function avatarClockNow() {
+  return (performance.now() - avatarClockAt) / 1000;
+}
+function alignAvatarVideo(v) {
+  if (!v || v.readyState < 1) return;
+  // A video that is still loading can report a bogus (tiny) duration, and
+  // `t %= tiny` is ~0 - which pinned the whole group on the first frame. Only
+  // wrap for a believable duration, and only seek inside what is really seekable.
+  const d = v.duration;
+  if (!isFinite(d) || d < 2) return;
+  const t = Math.max(0, avatarClockNow()) % d;   // the group loops, so the position wraps
+  if (Math.abs(v.currentTime - t) < 0.12) return;
+  try { v.currentTime = t; } catch (e) { /* not seekable yet */ }
+}
+
+/* Keep every animated avatar on that clock. A seek only happens when one has
+ * drifted, so a settled group costs nothing. */
+function syncAvatarVideos() {
+  const vids = [...document.querySelectorAll('video.avatar')];
+  for (const v of vids) {
+    if (v.paused) v.play().catch(() => {});
+    if (v.readyState < 2) { v.addEventListener('canplay', () => alignAvatarVideo(v), { once: true }); continue; }
+    alignAvatarVideo(v);
   }
-  if (!last) return;
+}
+
+/* The newest AVATAR_ANIMATE_MSGS messages animate; every older one shows the
+ * still. Called after renders and from the ticker, and it only touches a slot
+ * whose picture actually changed - rebuilding an avatar restarts its video. */
+function animateAvatarGroup() {
+  const heads = [...document.querySelectorAll('.msg.assistant .who')];
+  const want = Math.min(AVATAR_ANIMATE_MSGS, heads.length);
+  const firstLive = heads.length - want;      // heads before this index are stills
   const live = avatarWant(false, false);
-  if (!live || !live.ready) return;
-  putAvatarIn(last, live);
-  liveAvatarSlot = last;
+  const still = avatarWant(false, true);
+  heads.forEach((who, i) => {
+    const target = i >= firstLive ? live : still;
+    if (target && target.ready) putAvatarIn(who, target);
+  });
+  syncAvatarVideos();
+  // the sync above needs a ticker to keep running; ensureTick decides
+  ensureTick();
+}
+
+/* Does the transcript still match that? Used by the ticker to start itself when
+ * a render has left the avatars in the wrong state (a new message arrives with a
+ * still, and the oldest animated message has to give its video back). */
+function avatarAnimNeeded() {
+  const heads = [...document.querySelectorAll('.msg.assistant .who')];
+  if (!heads.length) return false;
+  const want = Math.min(AVATAR_ANIMATE_MSGS, heads.length);
+  const tail = heads.slice(-want);
+  if (!tail.every((h) => h.querySelector('video.avatar'))) return true;
+  return heads.slice(0, heads.length - want).some((h) => h.querySelector('video.avatar'));
 }
 
 /* Is the slot already showing exactly this picture with exactly this crop?
@@ -2645,7 +2705,10 @@ function refreshAvatars() {
     who.insertBefore(node, who.firstChild);
     if (old) { releaseVideosIn(old); old.remove(); }
   });
-  animateLastMsgAvatar();
+  animateAvatarGroup();
+  // an instance-list row may be waiting for exactly the still captured above
+  const instMenu = [...document.querySelectorAll('.menu')].find((m) => m._instances && m.isConnected);
+  if (instMenu) refreshInstanceMenuInPlace(instMenu);
   const side = $('sidebar-avatar');
   if (side) {
     // The sidebar is the one place that keeps an animated avatar.
@@ -2826,7 +2889,7 @@ function renderAssistantMessage(msg, timing) {
   timing = timingFor(msg, timing);
   const { root, tools, bubble } = makeMsgShell('assistant', timeStr(msg.timestamp));
   root._msg = msg;
-  ensureTick();     // the newest message takes the animated avatar over from the old one
+  ensureTick();     // the newest messages take the animated avatars over from the old ones
   const textBlocks = [];
   let stats = usageStats(msg.usage, timing && timing.elapsedSec, timing && timing.prefillSec);
   if (!stats && timing && timing.est) stats = estStatsText(timing.est, timing.elapsedSec);
@@ -4988,11 +5051,11 @@ const LOCAL_COMMANDS = [
  * thinking) to their RPC equivalents itself, and the rest belong to a button
  * somewhere - so the menu only offers what actually runs. Typing a hidden one
  * still works when the UI implements it. */
-const HIDDEN_BUILTINS = new Set([
-  'settings', 'model', 'scoped-models', 'export', 'import', 'share', 'changelog',
-  'hotkeys', 'fork', 'tree', 'trust', 'login', 'logout', 'new', 'resume',
-  'reload', 'quit',
-]);
+/* The only built-in pi command worth a row in the menu is /compact: everything
+ * else pi's TUI implements (name, clone, copy, session, model, thinking, new,
+ * fork, export, ...) is a button or a right-click in this UI, and the rest do
+ * nothing here. Typing one still works when the UI implements it. */
+const MENU_BUILTINS = new Set(['compact']);
 
 /* pi registers skills as `skill:<name>`. That prefix is an implementation
  * detail: the menu shows the name you type, tab-completion inserts it, and it is
@@ -5041,7 +5104,7 @@ function updateSlashMenu() {
   if (!m || !caretInFirstWord || !allCommands().length) { closeSlashMenu(); return; }
   const q = m[1].toLowerCase();
   const items = allCommands()
-    .filter((c) => !(c.source === 'builtin' && HIDDEN_BUILTINS.has(c.name.toLowerCase())))
+    .filter((c) => c.source !== 'builtin' || MENU_BUILTINS.has(String(c.name || '').toLowerCase().replace(/^\//, '')))
     .filter((c) => String(c.name || '').toLowerCase().includes(q)
       || commandLabel(c).toLowerCase().includes(q)
       || (c.description || '').toLowerCase().includes(q))
@@ -8501,7 +8564,13 @@ async function loadInstanceCards() {
     try {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 4000);
-      const d = await fetch(`${inst.url}/api/instance-card`, { signal: ctl.signal, cache: 'no-store' }).then((r) => r.json());
+      // Through *this* bridge's proxy, not straight at the other machine: a direct
+      // cross-origin fetch needs that bridge to send the right header, and an older
+      // one (or a machine behind anything) simply never answers - which is why the
+      // other instance's picture was missing from the switcher while switching to
+      // it showed the picture fine (that path already went through the proxy).
+      const via = api(`/proxy/${encodeURIComponent(inst.url)}/api/instance-card`);
+      const d = await fetch(via, { signal: ctl.signal, cache: 'no-store' }).then((r) => r.json());
       clearTimeout(t);
       if (d && d.ok) S.instanceCards[inst.url] = d;
       // The card may carry no picture at all (nothing set there, or an older
@@ -8513,15 +8582,29 @@ async function loadInstanceCards() {
 
 function instanceAvatar(inst) {
   if (!inst) return null;
-  if (inst.url === location.origin) return SET.avatar || null;
+  if (inst.url === location.origin) {
+    const own = SET.avatar || null;
+    // the same rule as below: these rows are <img>s
+    return own && isVideoSrc(own) ? avatarStillSrc(own) : own;
+  }
   const card = S.instanceCards[inst.url];
-  const src = (card && card.avatar) || null;
+  const src = (card && card.avatar) || inst.avatar || null;
   if (!src) return null;
   // A picture stored on the other machine is a relative "/api/bg-file?name=..."
   // URL, which this page would ask *this* machine for - that is the broken image
-  // in the instance list. Send it through the proxy instead.
-  if (/^\/api\//.test(src)) return `/proxy/${encodeURIComponent(inst.url)}${src}`;
-  return src;
+  // in the instance list. Anything not already inline goes through the proxy, so
+  // the local bridge fetches it (and an old remote, or one whose media route
+  // needs a header, still shows up).
+  let url = null;
+  if (/^(data:|blob:)/i.test(src)) url = src;
+  else if (/^https?:/i.test(src)) {
+    try { const u = new URL(src); url = `/proxy/${encodeURIComponent(inst.url)}${u.pathname}${u.search}`; } catch (e) { /* odd url */ }
+  }
+  if (!url) url = `/proxy/${encodeURIComponent(inst.url)}${src.startsWith('/') ? src : `/${src}`}`;
+  // These rows draw an <img>, and an <img> cannot show a video: a video pfp is
+  // what produced the broken image in the instance list. Use the still frame the
+  // avatar code captures (and re-draws once it exists).
+  return isVideoSrc(url) ? avatarStillSrc(url) : url;
 }
 
 function updateInstanceBtn() {
@@ -8708,8 +8791,15 @@ function setRowAvatar(row, src) {
     return;
   }
   const img = el('img', 'menu-avatar');
-  img.src = src;
   img.alt = '';
+  // A picture that cannot be fetched must not leave the "broken image" glyph in
+  // the list: fall back to the same empty slot as "no picture".
+  img.onerror = () => {
+    const span = el('span', 'menu-avatar empty', '');
+    span.title = 'picture could not be loaded';
+    img.replaceWith(span);
+  };
+  img.src = src;
   if (current) current.replaceWith(img);
   else row.insertBefore(img, row.firstChild);
 }

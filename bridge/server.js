@@ -1148,6 +1148,35 @@ async function fetchLlamaModels(url, timeoutMs = 1200) {
   }
 }
 
+/* One llama.cpp host is usually reachable at several of its own addresses at
+ * once (loopback, its LAN IP, a configured name, a virtual adapter). Each one
+ * answered /v1/models, so the UI listed the same server - and its models - once
+ * per address. Ask the server who it is: llama.cpp reports the model file it
+ * loaded, which is the same answer from every address. Servers that do not
+ * report it fall back to their model list. */
+async function llamaServerIdentity(url) {
+  try {
+    const res = await fetch(url + '/props', { signal: AbortSignal.timeout(900) });
+    if (!res.ok) return null;
+    const d = await res.json();
+    const gen = (d && d.default_generation_settings) || {};
+    const path = d && (d.model_path || gen.model);
+    if (path) return `model:${path}|ctx:${gen.n_ctx || ''}`;
+  } catch { /* not llama.cpp, /props disabled, or unreachable */ }
+  return null;
+}
+
+/* The URL pi itself is configured with: its providerId
+ * ("llama-server=<url>") has to stay exactly this one or set_model fails, so it
+ * wins over the loopback/LAN addresses that reach the same server. */
+function readLlamaServerUrl() {
+  const project = readJsonSafe(path.join(WORKSPACE_DIR, '.pi', 'settings.json'));
+  if (project && project.llamaServerUrl) return String(project.llamaServerUrl).replace(/\/+$/, '');
+  const global = readJsonSafe(PI_SETTINGS_FILE);
+  if (global && global.llamaServerUrl) return String(global.llamaServerUrl).replace(/\/+$/, '');
+  return null;
+}
+
 const ALLOWED_APIS = new Set([
   'openai-completions', 'openai-responses', 'anthropic-messages',
   'google-generative-ai', 'mistral-conversations', 'bedrock-converse-stream',
@@ -1647,11 +1676,27 @@ const server = http.createServer(async (req, res) => {
     }
     const candidates = [...llamaServerCandidates(), ...llamaLanUrls()];
     const unique = [...new Set(candidates)];
-    const results = await Promise.all(unique.map(async (url) => {
+    const configured = readLlamaServerUrl();
+    const rank = (u) => (configured && u === configured ? 0
+      : /\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(u) ? 1 : 2);
+    const answered = (await Promise.all(unique.map(async (url, i) => {
       const models = await fetchLlamaModels(url);
-      return models ? { url, providerId: `llama-server=${url}`, models } : null;
-    }));
-    const payload = { servers: results.filter(Boolean), scanning: llamaLan.scanning };
+      if (!models || !models.length) return null;
+      return { url, i, models, key: await llamaServerIdentity(url) };
+    }))).filter(Boolean);
+    // best address first, so the entry that survives dedupe is the one worth using
+    answered.sort((a, b) => rank(a.url) - rank(b.url) || a.i - b.i);
+    const byKey = new Map();
+    const servers = [];
+    for (const s of answered) {
+      const key = s.key || 'models:' + s.models.map((m) => m.id).sort().join(',');
+      const seen = byKey.get(key);
+      if (seen) { seen.alsoAt.push(s.url); continue; }
+      const entry = { url: s.url, providerId: `llama-server=${s.url}`, models: s.models, alsoAt: [] };
+      byKey.set(key, entry);
+      servers.push(entry);
+    }
+    const payload = { servers, scanning: llamaLan.scanning };
     llamaModelsCache.at = Date.now();
     llamaModelsCache.data = payload;
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1849,11 +1894,35 @@ const server = http.createServer(async (req, res) => {
         '.ogv': 'video/ogg', '.mkv': 'video/x-matroska',
       };
       const st = fs.statSync(file);
-      res.writeHead(200, {
-        'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream',
-        'Content-Length': st.size,
+      const type = types[path.extname(file).toLowerCase()] || 'application/octet-stream';
+      const headers = {
+        'Content-Type': type,
+        // Videos have to be advertised as seekable: a player cannot position
+        // itself in a file the server will only send from the start, and the
+        // animated avatars are kept on a shared frame by seeking them.
+        'Accept-Ranges': 'bytes',
         'Cache-Control': 'public, max-age=86400',
-      });
+      };
+      // Range requests, so one download can feed several elements (ten animated
+      // avatars of the same clip used to open ten full downloads, and the ones
+      // that did not fit the connection limit stalled).
+      const range = req.headers.range;
+      if (range) {
+        const m = /bytes=(\d*)-(\d*)/.exec(String(range));
+        let start = m && m[1] ? Number(m[1]) : 0;
+        let end = m && m[2] ? Number(m[2]) : st.size - 1;
+        if (!Number.isFinite(start) || start < 0) start = 0;
+        if (!Number.isFinite(end) || end >= st.size) end = st.size - 1;
+        if (start > end || start >= st.size) {
+          res.writeHead(416, { ...headers, 'Content-Range': `bytes */${st.size}` });
+          res.end();
+          return;
+        }
+        res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${st.size}`, 'Content-Length': end - start + 1 });
+        fs.createReadStream(file, { start, end }).pipe(res);
+        return;
+      }
+      res.writeHead(200, { ...headers, 'Content-Length': st.size });
       fs.createReadStream(file).pipe(res);
     } catch {
       res.writeHead(400, { 'Content-Type': 'application/json' });

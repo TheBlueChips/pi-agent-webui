@@ -426,13 +426,20 @@ body.hide-thinking details.thinking { display: none; }
   max-width: 860px; margin: 6px auto 0;
   display: flex; align-items: center; justify-content: flex-start;
   gap: 12px; font-size: 12px; color: var(--text-dim);
+  /* Fold instead of squeezing: items that cannot shrink used to spill their text
+     over the neighbour (the ctx label ran into the token counter), and empty
+     fields reserved their full width, which pushed the total far away. */
+  flex-wrap: wrap; row-gap: 6px;
 }
 #stats-bar .stats-spacer { flex: 1; }
 /* Numbers that grow while the agent runs: fixed-width digits, and enough room
-   reserved for the longest form so the row never rewraps as the seconds tick. */
-#stats-bar > span { font-variant-numeric: tabular-nums; white-space: nowrap; }
+   reserved for the longest form so the row never rewraps as the seconds tick.
+   An empty counter reserves nothing at all. */
+#stats-bar > span { font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 0; }
 #stat-turn { min-width: 12ch; }
-#stat-tokens, #stat-cost { min-width: 14ch; }
+#stat-turn:empty, #stat-cost:empty { min-width: 0; }
+#stat-tokens, #stat-cost { min-width: 12ch; }
+#stat-tokens:empty, #stat-cost:empty { min-width: 0; }
 #stats-bar select { max-width: 150px; font-size: 11.5px; padding: 3px 6px; }
 .ctx-ring { display: inline-flex; align-items: center; }
 .ctx-ring .ring-bg { stroke: var(--bg-hover); }
@@ -444,6 +451,9 @@ body.hide-thinking details.thinking { display: none; }
 .ctx-label {
   font-family: var(--mono); font-size: 11px; color: var(--text-dim);
   white-space: nowrap; min-width: 1px;
+  /* never shrink below the text and never paint outside the box - it used to do
+     both, over the token counter */
+  flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis;
 }
 #stat-tokens { font-family: var(--mono); font-size: 11.5px; }
 
