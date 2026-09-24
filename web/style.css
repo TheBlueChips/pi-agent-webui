@@ -584,7 +584,12 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
   flex: 1; min-height: 0; display: flex; flex-direction: column;
   overflow-y: auto; overflow-x: hidden; overflow-anchor: none;
   scrollbar-gutter: stable;
+  /* Over-scrolling (a trackpad flick past the end) rubber-banded the whole
+     transcript - and the sticky composer with it - upwards and then back, which
+     during a run looked exactly like the UI jumping. */
+  overscroll-behavior: contain;
 }
+html, body { overscroll-behavior: none; }
 #chat {
   /* Grows to fill the column when the conversation is short (so the composer
    * stays at the bottom) but is never squeezed: taller than the window and the
@@ -1136,10 +1141,15 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
   border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.55);
   padding: 8px; display: flex; flex-direction: column; gap: 6px;
 }
+.model-search-row { display: flex; gap: 6px; align-items: stretch; }
 .model-menu input[type="search"] {
   background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px;
   color: var(--text); padding: 6px 8px; font-size: 12.5px;
+  flex: 1; min-width: 0;
 }
+#model-refresh { flex: 0 0 auto; padding: 4px 9px; font-size: 13px; line-height: 1.1; }
+#model-refresh.spinning { animation: model-refresh-spin .7s linear infinite; color: var(--accent); }
+@keyframes model-refresh-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .model-list { max-height: 46vh; overflow-y: auto; display: flex; flex-direction: column; }
 .model-group {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;

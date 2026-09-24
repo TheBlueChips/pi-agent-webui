@@ -1312,6 +1312,20 @@ function toggleModelMenu(open) {
   // has to be reflected on the button.
   $('model-select').addEventListener('change', () => updateModelBtn());
   $('model-search').oninput = (e) => renderModelMenu(e.target.value);
+  // Reload the list from the agent *and* re-scan the llama.cpp servers (a model
+  // loaded or a server started after the page loaded shows up without a reload).
+  const refreshBtn = $('model-refresh');
+  if (refreshBtn) refreshBtn.onclick = async (e) => {
+    e.stopPropagation();
+    refreshBtn.classList.add('spinning');
+    try {
+      await refreshModels();
+      await refreshLlamaGroup();
+      renderModelMenu($('model-search') ? $('model-search').value : '');
+    } finally {
+      setTimeout(() => refreshBtn.classList.remove('spinning'), 400);
+    }
+  };
   $('model-search').onkeydown = (e) => {
     if (e.key === 'Escape') { e.preventDefault(); toggleModelMenu(false); input.focus(); }
     if (e.key === 'Enter') {
@@ -1322,6 +1336,48 @@ function toggleModelMenu(open) {
   menu.addEventListener('click', (e) => e.stopPropagation());
   document.addEventListener('click', () => toggleModelMenu(false));
 })();
+
+/* pi-llama-cpp derives the provider id from the URL the user configured, so the
+ * id for a server we discovered can differ by a trailing slash, the case of the
+ * host, or localhost vs 127.0.0.1. Comparing the raw string made the UI think a
+ * server was not registered: it listed a second copy of every model and selecting
+ * one asked to "point pi here" and then failed with provider-not-found. Compare
+ * normalised URLs instead, and use the id pi itself reported. */
+function normLlamaUrl(u) {
+  try {
+    const x = new URL(String(u || '').trim());
+    let host = x.hostname.toLowerCase();
+    if (host === 'localhost') host = '127.0.0.1';
+    const port = x.port || (x.protocol === 'https:' ? '443' : '80');
+    return `${host}:${port}${x.pathname.replace(/\/+$/, '')}`;
+  } catch (e) {
+    return String(u || '').trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+/* The id pi registered for this server, or its URLs-shaped id when there is none. */
+function llamaProviderFor(srv) {
+  if (!srv) return null;
+  const want = normLlamaUrl(srv.url);
+  const hit = (S.models || []).find((m) => String(m.provider || '').startsWith('llama-server=')
+    && normLlamaUrl(String(m.provider).slice('llama-server='.length)) === want);
+  return hit ? hit.provider : (srv.providerId || `llama-server=${srv.url}`);
+}
+
+function llamaRegistered(srv) {
+  if (!srv) return false;
+  const want = normLlamaUrl(srv.url);
+  return (S.models || []).some((m) => String(m.provider || '').startsWith('llama-server=')
+    && normLlamaUrl(String(m.provider).slice('llama-server='.length)) === want);
+}
+
+/* A live server that pi knows this provider id for (by URL, not by spelling). */
+function llamaServerForProvider(provider) {
+  const id = String(provider || '');
+  if (!id.startsWith('llama-server=')) return null;
+  const want = normLlamaUrl(id.slice('llama-server='.length));
+  return (llamaLiveServers || []).find((x) => normLlamaUrl(x.url) === want) || null;
+}
 
 async function refreshModels() {
   try {
@@ -1383,17 +1439,28 @@ async function refreshLlamaGroup() {
     let unregistered = null;
     for (const srv of llamaLiveServers) {
       const short = srv.url.replace(/^https?:\/\//, '');
-      const registered = S.models.some((m) => m.provider === srv.providerId);
+      const registered = llamaRegistered(srv);
       if (!registered && !unregistered) unregistered = srv;
+      // the id pi registered this server under, so set_model works and the group
+      // never duplicates what pi already listed
+      const pid = llamaProviderFor(srv);
       for (const m of srv.models) {
-        const key = `${srv.providerId}||${m.id}`;
+        const key = `${pid}||${m.id}`;
         if (known.has(key) || knownIds.has(m.id)) continue; // already listed by the agent itself
         const o = el('option', null, llamaLiveServers.length > 1 ? `${m.name || m.id} · ${short}` : (m.name || m.id));
         o.value = key;
         group.appendChild(o);
       }
     }
-    if (group.children.length) sel.appendChild(group);
+    // A concurrent refresh (the retry loop below) can append a second group before
+    // the first is removed, which showed every model twice. Keep one, and drop
+    // options that repeat a value.
+    const seenVals = new Set();
+    group.querySelectorAll('option').forEach((o) => { if (seenVals.has(o.value)) o.remove(); else seenVals.add(o.value); });
+    if (group.children.length) {
+      sel.querySelectorAll('optgroup[data-llama]').forEach((g) => g.remove());
+      sel.appendChild(group);
+    }
     if (unregistered) showLlamaMismatch(unregistered);
     else hideLlamaMismatch();
     const after = ($('model-select').querySelector('optgroup[data-llama]') || {}).innerHTML || '';
@@ -1483,7 +1550,7 @@ async function ensureLlamaGroup(attempt = 0) {
   // Stop retrying once every live server is registered with pi (its models
   // then appear in the main list, so the optgroup is intentionally empty).
   const allRegistered = llamaLiveServers.length > 0 &&
-    llamaLiveServers.every((s) => S.models.some((m) => m.provider === s.providerId));
+    llamaLiveServers.every((s) => llamaRegistered(s));
   if ((g && g.children.length) || allRegistered || attempt >= LLAMA_RETRY_DELAYS.length) return;
   setTimeout(() => { ensureLlamaGroup(attempt + 1); }, LLAMA_RETRY_DELAYS[attempt]);
 }
@@ -6155,7 +6222,7 @@ $('model-select').onchange = async (e) => {
   // If pi has not registered this llama provider yet (its configured URL is
   // dead), point pi at the live server, restart the agent, then retry.
   if (isLlama && !S.models.some((m) => m.provider === provider)) {
-    const live = llamaLiveServers.find((s) => s.providerId === provider);
+    const live = llamaServerForProvider(provider);
     const all = (llamaLiveServers.length ? llamaLiveServers : [live]);
     if (live && confirm(`pi has not registered the llama.cpp server at ${live.url} yet.\n\nPoint pi at ${all.length > 1 ? `all ${all.length} live servers` : 'it'} and restart the agent? (writes llamaSettings.servers in your pi config)`)) {
       S.pendingModel = { provider, modelId };
@@ -7552,7 +7619,7 @@ async function loadPiProviders() {
         const row = el('div', 'prov-row');
         const info = el('div', 'prov-info');
         info.appendChild(el('div', 'prov-id', srv.url.replace(/^https?:\/\//, '')));
-        const registered = (S.models || []).some((m) => m.provider === srv.providerId);
+        const registered = llamaRegistered(srv);
         info.appendChild(el('div', 'prov-meta',
           `${srv.models.length} model${srv.models.length > 1 ? 's' : ''} · ${registered ? 'registered with pi ✓' : 'not registered with pi yet'}`));
         const btn = el('button', 'btn small', registered ? 'use only this one' : 'use only this one & reload');
@@ -7571,7 +7638,7 @@ async function loadPiProviders() {
         const all = el('div', 'prov-row');
         const info = el('div', 'prov-info');
         info.appendChild(el('div', 'prov-id', `all ${servers.length} servers at once`));
-        const registered = servers.every((srv) => (S.models || []).some((m) => m.provider === srv.providerId));
+        const registered = servers.every((srv) => llamaRegistered(srv));
         info.appendChild(el('div', 'prov-meta', registered
           ? 'every one of them is registered with pi ✓'
           : 'pi keeps them all as separate providers, so no switching back and forth'));
