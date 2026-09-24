@@ -4255,6 +4255,12 @@ function updateStreamUi() {
   // The Stop button appears next to the (always visible) Send button while the
   // agent is generating, so you can stop generation or steer/queue a message.
   $('btn-stop').classList.toggle('hidden', !S.isStreaming);
+  // While a run is going, the widget and status lines above the composer keep
+  // their space even when an extension clears them for a moment. Setting and
+  // clearing a status (an MCP server connecting, the sub-agent widget updating)
+  // resized the dock, which moved the composer and the stats row with it - the
+  // stack is anchored now, and the space is given back when the run ends.
+  document.body.classList.toggle('run-active', !!S.isStreaming);
   setConn(S.isStreaming ? 'busy' : 'on');
   // Reset the ring's high-water mark on every streaming transition so the
   // final authoritative total can settle (even if the estimate overshot), and

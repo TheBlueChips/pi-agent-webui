@@ -740,7 +740,19 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 }
 .status-bar {
   padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap;
-  min-height: 1.6em; max-height: 3.2em; overflow-y: auto;
+  /* one line, always: it used to grow to two when a second status appeared, which
+     moved everything below it */
+  height: 1.6em; max-height: 1.6em; overflow-y: auto;
+}
+/* While the agent is running, a bar that has been cleared for a moment keeps its
+   box. Extensions set and clear their status/widget constantly during a run (an
+   MCP server connecting, the sub-agent widget), and every appear/disappear
+   resized the dock - the composer and stats row went with it. Released on run end,
+   so nothing is wasted while idle. */
+body.run-active .widget-bar.hidden,
+body.run-active .status-bar.hidden {
+  /* .hidden is display:none !important, so this has to out-specify it */
+  display: block !important; visibility: hidden;
 }
 
 /* No slab behind the whole composer strip: only the actual controls carry a
