@@ -722,7 +722,14 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   max-width: 860px; width: calc(100% - 24px); margin: 0 auto;
   font-size: calc(12px * var(--chat-scale)); color: var(--text-dim);
 }
-.queue-bar { padding: 2px 0; }
+.queue-bar {
+  padding: 2px 0;
+  /* one line, always: the chips used to wrap onto a second line as more messages
+     were queued, which resized the dock and moved the composer and stats with it */
+  height: calc(1.9em + 4px); overflow-x: auto; overflow-y: hidden;
+  white-space: nowrap; scrollbar-width: none;
+}
+.queue-bar::-webkit-scrollbar { display: none; }
 .queue-chip {
   display: inline-block;
   background: color-mix(in srgb, var(--bg-elev) calc(var(--ui-alpha) * 100%), transparent);
@@ -749,6 +756,7 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
    MCP server connecting, the sub-agent widget), and every appear/disappear
    resized the dock - the composer and stats row went with it. Released on run end,
    so nothing is wasted while idle. */
+body.run-active .queue-bar.hidden,
 body.run-active .widget-bar.hidden,
 body.run-active .status-bar.hidden {
   /* .hidden is display:none !important, so this has to out-specify it */

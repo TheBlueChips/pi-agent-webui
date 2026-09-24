@@ -1175,6 +1175,25 @@ function isLocalLlamaAddress(url) {
 
 const LOCAL_LLAMA_PORTS = [8080, 8081, 8090, 8000, 1234];   // llama.cpp, plus the usual app defaults
 
+/* The URLs pi will actually talk to: the extension's own `llamaSettings.servers`
+ * list, or the older single `llamaServerUrl`. Reading both is what lets the UI say
+ * what is configured now. */
+function llamaConfiguredUrls(settings) {
+  const out = [];
+  const list = settings && settings.llamaSettings && settings.llamaSettings.servers;
+  if (Array.isArray(list)) {
+    for (const entry of list) {
+      const u = typeof entry === 'string' ? entry : (entry && entry.url);
+      if (typeof u === 'string' && u.trim()) out.push(u.trim().replace(/\/+$/, ''));
+    }
+  }
+  const legacy = settings && settings.llamaServerUrl;
+  if (typeof legacy === 'string' && legacy.trim() && !out.includes(legacy.trim().replace(/\/+$/, ''))) {
+    out.push(legacy.trim().replace(/\/+$/, ''));
+  }
+  return out;
+}
+
 async function llamaServerIdentity(url) {
   try {
     const res = await fetch(url + '/props', { signal: AbortSignal.timeout(900) });
@@ -1735,29 +1754,48 @@ const server = http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/llama-config')) {
     if (req.method === 'GET') {
       let url = null;
-      try { url = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')).llamaServerUrl || null; } catch { /* no file */ }
+      let urls = [];
+      try {
+        const st = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8'));
+        urls = llamaConfiguredUrls(st);
+        url = urls[0] || null;
+      } catch { /* no file */ }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ url }));
+      // LLAMA_SERVER_URL overrides the configured list in the extension, so the UI
+      // has to say so - otherwise "point pi at both" looks like it did nothing.
+      res.end(JSON.stringify({ url, urls, envOverride: String(process.env.LLAMA_SERVER_URL || '').trim() || null }));
       return;
     }
     if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+      let body0 = '';
+      req.on('data', (c) => { body0 += c; if (body0.length > 64 * 1024) req.destroy(); });
       req.on('end', () => {
         try {
-          const { url } = JSON.parse(body || '{}');
-          if (typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
-            throw new Error('url must be an http(s) base URL');
+          const body = JSON.parse(body0 || '{}');
+          // `urls` (a list) is the extension's recommended form and registers every
+          // server at once; `url` is the older single-value spelling.
+          const wanted = Array.isArray(body.urls) ? body.urls : (body.url != null ? [body.url] : []);
+          if (!wanted.length) throw new Error('send url or urls');
+          const clean = [];
+          for (const raw of wanted) {
+            if (typeof raw !== 'string' || !/^https?:\/\//i.test(raw.trim())) {
+              throw new Error(`"${String(raw).slice(0, 60)}" is not an http(s) base URL`);
+            }
+            const u = raw.trim().replace(/\/+$/, '');
+            if (!clean.includes(u)) clean.push(u);
           }
-          const clean = url.trim().replace(/\/+$/, '');
+          if (clean.length > 16) throw new Error('at most 16 servers');
           let settings = {};
           try { settings = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
-          const previous = settings.llamaServerUrl || null;
-          settings.llamaServerUrl = clean;
+          const previous = llamaConfiguredUrls(settings);
+          const hadLegacy = typeof settings.llamaServerUrl === 'string';
+          settings.llamaSettings = Object.assign({}, settings.llamaSettings, { servers: clean.map((url) => ({ url })) });
+          // The legacy key means "one server" and would shadow the list.
+          if (hadLegacy) delete settings.llamaServerUrl;
           fs.mkdirSync(path.dirname(PI_SETTINGS_FILE), { recursive: true });
           fs.writeFileSync(PI_SETTINGS_FILE, JSON.stringify(settings, null, 2));
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, previous, current: clean }));
+          res.end(JSON.stringify({ ok: true, previous, urls: clean, removedLegacyKey: hadLegacy }));
         } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message }));

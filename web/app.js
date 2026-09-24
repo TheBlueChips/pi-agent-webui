@@ -1349,6 +1349,7 @@ async function refreshModels() {
  * restart the agent so the model becomes selectable. */
 let llamaLiveServers = [];
 let llamaConfiguredUrl = null;
+let llamaEnvOverride = null;   // LLAMA_SERVER_URL wins over the configured list
 let llamaMismatchBanner = false;
 let llamaFixInFlight = false;
 
@@ -1362,6 +1363,7 @@ async function refreshLlamaGroup() {
       fetch(api('/api/llama-config')).then((r) => r.json()),
     ]);
     llamaConfiguredUrl = cfg.url || null;
+  llamaEnvOverride = cfg.envOverride || null;
     llamaLiveServers = d.servers || [];
     if (!llamaLiveServers.length) {
       hideLlamaMismatch();
@@ -1411,8 +1413,8 @@ function showLlamaMismatch(srv) {
     : 'pi has not registered it yet';
   showBanner('warn',
     `llama.cpp server found at ${short} with ${srv.models.length} models, but ${configured} — selecting its models will fail until pi is pointed at it. pi needs the pi-llama-cpp extension to register it (install with: pi install npm:pi-llama-cpp), then point pi at this server and restart.`,
-    'Point pi here & reload',
-    () => fixLlamaConfig(srv.url),
+    `Point pi at ${llamaLiveServers.length > 1 ? `all ${llamaLiveServers.length} servers` : 'this server'} & reload`,
+    () => fixLlamaConfig((llamaLiveServers.length ? llamaLiveServers : [srv]).map((x) => x.url)),
     () => {
       // Kept in the settings, so it does not come back for this server on the
       // next poll, reload or browser. A *different* server still gets a mention.
@@ -1432,15 +1434,19 @@ function hideLlamaMismatch() {
 /* One-click fix: write the live URL into pi's global settings, restart the
  * agent (pi-llama-cpp resolves the URL at startup), then retry the model
  * the user was trying to select. */
-async function fixLlamaConfig(url) {
+/* Point pi at one server, or at all of them at once: the extension registers one
+ * provider per entry of llamaSettings.servers, so a list gives every instance's
+ * models in the picker without switching back and forth. */
+async function fixLlamaConfig(urls) {
   if (llamaFixInFlight) return;
+  const list = Array.isArray(urls) ? urls : [urls];
   llamaFixInFlight = true;
-  toast('Updating pi config and restarting the agent…');
+  toast(list.length > 1 ? `Pointing pi at ${list.length} servers and restarting the agent…` : 'Updating pi config and restarting the agent…');
   try {
     const r = await fetch(api('/api/llama-config'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ urls: list }),
     });
     const out = await r.json();
     if (!r.ok) throw new Error(out.error || `failed (${r.status})`);
@@ -6150,9 +6156,10 @@ $('model-select').onchange = async (e) => {
   // dead), point pi at the live server, restart the agent, then retry.
   if (isLlama && !S.models.some((m) => m.provider === provider)) {
     const live = llamaLiveServers.find((s) => s.providerId === provider);
-    if (live && confirm(`pi has not registered the llama.cpp server at ${live.url} yet.\n\nPoint pi at it and restart the agent? (updates llamaServerUrl in your pi config)`)) {
+    const all = (llamaLiveServers.length ? llamaLiveServers : [live]);
+    if (live && confirm(`pi has not registered the llama.cpp server at ${live.url} yet.\n\nPoint pi at ${all.length > 1 ? `all ${all.length} live servers` : 'it'} and restart the agent? (writes llamaSettings.servers in your pi config)`)) {
       S.pendingModel = { provider, modelId };
-      fixLlamaConfig(live.url);
+      fixLlamaConfig(all.map((x) => x.url));
     }
     return;
   }
@@ -7548,11 +7555,31 @@ async function loadPiProviders() {
         const registered = (S.models || []).some((m) => m.provider === srv.providerId);
         info.appendChild(el('div', 'prov-meta',
           `${srv.models.length} model${srv.models.length > 1 ? 's' : ''} · ${registered ? 'registered with pi ✓' : 'not registered with pi yet'}`));
-        const btn = el('button', 'btn small', registered ? 'point pi here again' : 'point pi here & reload');
-        btn.title = `Write ${srv.url} into pi's settings and restart the agent`;
-        btn.onclick = () => fixLlamaConfig(srv.url);
+        const btn = el('button', 'btn small', registered ? 'use only this one' : 'use only this one & reload');
+        btn.title = `Write ${srv.url} into pi's settings (replacing any other llama server) and restart the agent`;
+        btn.onclick = () => fixLlamaConfig([srv.url]);
         row.append(info, btn);
         llamaSection.appendChild(row);
+      }
+      if (llamaEnvOverride) {
+        llamaSection.appendChild(el('div', 'prov-empty',
+          `note: LLAMA_SERVER_URL is set to ${llamaEnvOverride} in the bridge's environment, and the pi-llama-cpp extension lets that override this list`));
+      }
+      if (servers.length > 1) {
+        // One provider per configured server: pointing pi at the list means every
+        // instance's models are selectable at the same time.
+        const all = el('div', 'prov-row');
+        const info = el('div', 'prov-info');
+        info.appendChild(el('div', 'prov-id', `all ${servers.length} servers at once`));
+        const registered = servers.every((srv) => (S.models || []).some((m) => m.provider === srv.providerId));
+        info.appendChild(el('div', 'prov-meta', registered
+          ? 'every one of them is registered with pi ✓'
+          : 'pi keeps them all as separate providers, so no switching back and forth'));
+        const btn = el('button', 'btn small', registered ? 'point pi at all of them again' : `point pi at all ${servers.length} & reload`);
+        btn.title = `Write all ${servers.length} URLs into llamaSettings.servers and restart the agent`;
+        btn.onclick = () => fixLlamaConfig(servers.map((s) => s.url));
+        all.append(info, btn);
+        llamaSection.appendChild(all);
       }
       if (l && l.scanning) llamaSection.appendChild(el('div', 'prov-empty', 'still looking for more on this network…'));
     }
