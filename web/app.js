@@ -5697,6 +5697,24 @@ function renderSessions(sessions) {
   const inFolder = new Set(shown.filter((x) => folderOf.has(x.path)).map((x) => x.path));
   const collapsedFolders = S.collapsedFolders || {};
 
+  // The session the agent is actually working in (may be a fork of what is on
+  // screen; when the UI shows another session, S.isStreaming still describes it).
+  const runningPath = (cur) => (cur && cur.path) || (S.state && S.state.sessionFile) || null;
+  const sessionHasRunningDescendant = (parentPath, all, target) => {
+    if (!target) return false;
+    const seen = new Set();
+    const walk = (p) => {
+      for (const x of all) {
+        if (x.parent !== p || seen.has(x.path)) continue;
+        seen.add(x.path);
+        if (sameSessionPath(x.path, target, all)) return true;
+        if (walk(x.path)) return true;
+      }
+      return false;
+    };
+    return walk(parentPath);
+  };
+
   const addRow = (s) => {
       const item = el('div', 'session-item');
       // A session that was forked off another one: thinner row, smaller grey text
@@ -5713,9 +5731,18 @@ function renderSessions(sessions) {
       // marks the session still running in the background. Highlighting both made
       // it look like two sessions were selected at once.
       if (S.viewSession ? isViewed : isCurrent) item.classList.add('active');
-      if (isCurrent && S.isStreaming) item.classList.add('live');
+      // Which session the agent is running in. A fork whose parent row is folded
+      // away is not in the list at all, so an ancestor carries the dot instead -
+      // otherwise a running branch was invisible until you opened the forks.
+      const selfLive = isCurrent && S.isStreaming;
+      const branchLive = !selfLive && S.isStreaming && sessionHasRunningDescendant(s.path, sessions, runningPath(current));
+      if (selfLive || branchLive) item.classList.add('live');
       const nameRow = el('div', 's-name');
-      if (isCurrent && S.isStreaming) nameRow.appendChild(el('span', 'live-dot', ''));
+      if (selfLive || branchLive) {
+        const dot = el('span', 'live-dot', '');
+        if (branchLive) dot.title = 'a branch forked from this session is running';
+        nameRow.appendChild(dot);
+      }
       // The arrow that folds this session's forks away (only where there are any).
       const forkKids = sessions.filter((x) => x.parent === s.path);
       if (forkKids.length) {
@@ -8690,6 +8717,22 @@ async function reloadForInstance() {
   S.queue = { steering: [], followUp: [] };
   S.isStreaming = false;
   document.body.classList.remove('compacting');
+  // The streaming message - and the parked DOM of the instance we are leaving -
+  // must go with it. Keeping S.live meant the *old* agent's half-written answer
+  // was re-attached to the new instance's chat (refreshMessages restores the
+  // parked fragment) and kept being updated, so it looked like the other machine's
+  // agent was typing into this conversation.
+  try { if (S.live && S.live.root) releaseVideosIn(S.live.root); } catch { /* not rendered yet */ }
+  try {
+    if (S.liveDetached && S.liveDetached.frag) {
+      S.liveDetached.frag.childNodes.forEach((n) => releaseVideosIn(n));
+      S.liveDetached.frag.replaceChildren();
+    }
+  } catch { /* nothing parked */ }
+  S.live = null;
+  S.liveDetached = null;
+  S.toolCards = new Map();
+  S.thinkingEl = null;
   try { $('chat').replaceChildren(); } catch { /* nothing rendered yet */ }
   try { renderQueue(); updateStreamUi(); updateViewBanner(); } catch { /* not wired yet */ }
   updateSubagentsBtn();
