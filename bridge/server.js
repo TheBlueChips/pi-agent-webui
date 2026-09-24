@@ -1106,11 +1106,16 @@ function llamaServerCandidates() {
   if (auth && auth['llama.cpp'] && auth['llama.cpp'].env && auth['llama.cpp'].env.LLAMA_BASE_URL) {
     urls.push(auth['llama.cpp'].env.LLAMA_BASE_URL);
   }
-  urls.push('http://127.0.0.1:8080');
-  urls.push('http://localhost:8080');
+  // This machine's own instances: a handful of common llama.cpp ports is cheap to
+  // probe (a few addresses) and finds a second instance running locally beside the
+  // one pi is already pointed at, even on a non-default port. The LAN sweep stays
+  // on 8080/8081 - scanning a /24 on five ports would take minutes.
+  for (const port of LOCAL_LLAMA_PORTS) {
+    urls.push(`http://127.0.0.1:${port}`);
+    urls.push(`http://localhost:${port}`);
+  }
   for (const ip of localIPv4s(false)) {
-    urls.push(`http://${ip}:8080`);
-    urls.push(`http://${ip}:8081`);
+    for (const port of LOCAL_LLAMA_PORTS) urls.push(`http://${ip}:${port}`);
   }
   const out = [];
   for (const raw of urls) {
@@ -1153,7 +1158,23 @@ async function fetchLlamaModels(url, timeoutMs = 1200) {
  * answered /v1/models, so the UI listed the same server - and its models - once
  * per address. Ask the server who it is: llama.cpp reports the model file it
  * loaded, which is the same answer from every address. Servers that do not
- * report it fall back to their model list. */
+ * report it fall back to their model list.
+ *
+ * Only addresses on *this* machine are merged, though. Two instances on different
+ * machines very often load the same file (the same download path, the same name),
+ * and merging those hid one of them completely - the local one disappeared when a
+ * LAN one was already configured. A remote address therefore always keeps its own
+ * entry. */
+function isLocalLlamaAddress(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+    if (/^(localhost|127\.0\.0\.1|::1)$/i.test(host)) return true;
+    return localIPv4s(false).includes(host);
+  } catch { return false; }
+}
+
+const LOCAL_LLAMA_PORTS = [8080, 8081, 8090, 8000, 1234];   // llama.cpp, plus the usual app defaults
+
 async function llamaServerIdentity(url) {
   try {
     const res = await fetch(url + '/props', { signal: AbortSignal.timeout(900) });
@@ -1689,7 +1710,11 @@ const server = http.createServer(async (req, res) => {
     const byKey = new Map();
     const servers = [];
     for (const s of answered) {
-      const key = s.key || 'models:' + s.models.map((m) => m.id).sort().join(',');
+      let key = s.key || 'models:' + s.models.map((m) => m.id).sort().join(',');
+      // a second machine stays its own entry even when it serves the same file
+      if (!isLocalLlamaAddress(s.url)) {
+        try { key += '|host:' + new URL(s.url).host.toLowerCase(); } catch (e) { key += '|host:' + s.url; }
+      }
       const seen = byKey.get(key);
       if (seen) { seen.alsoAt.push(s.url); continue; }
       const entry = { url: s.url, providerId: `llama-server=${s.url}`, models: s.models, alsoAt: [] };
