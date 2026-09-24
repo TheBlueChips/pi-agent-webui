@@ -1355,20 +1355,47 @@ function normLlamaUrl(u) {
   }
 }
 
-/* The id pi registered for this server, or its URLs-shaped id when there is none. */
-function llamaProviderFor(srv) {
+/* Every provider pi has for this server. Usually one (its base URL), but some
+ * setups register one per model ("<base>/<model>") - a multi-model server, or a
+ * newer pi-llama-cpp - and then a "set_model" with the bare server id is a model
+ * that does not exist. */
+function llamaRegisteredProviders(srv) {
+  if (!srv) return [];
+  const base = normLlamaUrl(srv.url);
+  const out = [];
+  for (const m of (S.models || [])) {
+    const p = String(m.provider || '');
+    if (!p.startsWith('llama-server=')) continue;
+    const u = normLlamaUrl(p.slice('llama-server='.length));
+    if ((u === base || u.startsWith(base + '/')) && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+/* The id to use for this server and (when given) this model: the per-model id if
+ * pi has one, else the plain server id. Null when pi has nothing for the server. */
+function llamaProviderFor(srv, modelId) {
   if (!srv) return null;
-  const want = normLlamaUrl(srv.url);
-  const hit = (S.models || []).find((m) => String(m.provider || '').startsWith('llama-server=')
-    && normLlamaUrl(String(m.provider).slice('llama-server='.length)) === want);
-  return hit ? hit.provider : (srv.providerId || `llama-server=${srv.url}`);
+  const list = llamaRegisteredProviders(srv);
+  // nothing registered: the id the extension *would* derive, so callers always have
+  // a usable value (llamaRegistered() is what says whether pi knows the server)
+  if (!list.length) return llamaSyntheticProvider(srv);
+  if (modelId) {
+    const want = '/' + String(modelId).toLowerCase();
+    const byModel = list.find((p) => normLlamaUrl(p.slice('llama-server='.length)).toLowerCase().endsWith(want));
+    if (byModel) return byModel;
+  }
+  return list.slice().sort((a, b) => a.length - b.length)[0];   // the plain server id
+}
+
+/* The id this server gets when pi has not registered it (what the extension
+ * would derive), so the banner can still offer to point pi at it. */
+function llamaSyntheticProvider(srv) {
+  return srv ? (srv.providerId || `llama-server=${srv.url}`) : null;
 }
 
 function llamaRegistered(srv) {
-  if (!srv) return false;
-  const want = normLlamaUrl(srv.url);
-  return (S.models || []).some((m) => String(m.provider || '').startsWith('llama-server=')
-    && normLlamaUrl(String(m.provider).slice('llama-server='.length)) === want);
+  return llamaRegisteredProviders(srv).length > 0;
 }
 
 /* A live server that pi knows this provider id for (by URL, not by spelling). */
@@ -1376,7 +1403,25 @@ function llamaServerForProvider(provider) {
   const id = String(provider || '');
   if (!id.startsWith('llama-server=')) return null;
   const want = normLlamaUrl(id.slice('llama-server='.length));
-  return (llamaLiveServers || []).find((x) => normLlamaUrl(x.url) === want) || null;
+  return (llamaLiveServers || []).find((x) => {
+    const base = normLlamaUrl(x.url);
+    return want === base || want.startsWith(base + '/');
+  }) || null;
+}
+
+/* Repair a value that carries the model inside the URL - "<base>/<model>", which
+ * is how a per-model provider id looks when the "||" separator was lost. Returns
+ * {provider, modelId} or null when it cannot be told apart. */
+function splitGluedModel(provider, modelId) {
+  const glued = /:\/\//.test(String(modelId || '')) ? modelId : (/:\/\//.test(String(provider || '')) && !modelId ? provider : null);
+  if (!glued) return null;
+  const cut = String(glued).lastIndexOf('/');
+  if (cut <= 'https://'.length) return null;
+  const base = String(glued).slice(0, cut);
+  const model = String(glued).slice(cut + 1);
+  if (!model) return null;
+  const srv = (llamaLiveServers || []).find((x) => normLlamaUrl(x.url) === normLlamaUrl(base));
+  return { provider: srv ? (llamaProviderFor(srv, model) || `llama-server=${base}`) : `llama-server=${base}`, modelId: model, srv };
 }
 
 async function refreshModels() {
@@ -1438,13 +1483,14 @@ async function refreshLlamaGroup() {
       if (!registered && !unregistered) unregistered = srv;
       // the id pi registered this server under, so set_model works and the group
       // never duplicates what pi already listed
-      const pid = llamaProviderFor(srv);
+      const pid = llamaProviderFor(srv) || llamaSyntheticProvider(srv);
       for (const m of srv.models) {
         // Skip only when pi lists this model *for this server*. Matching the model
         // id alone hid the second instance's copy: two servers very often serve the
         // same file (the same model id), and the LAN one then vanished from the list
         // while its local twin was registered.
-        const key = `${pid}||${m.id}`;
+        const perModel = llamaProviderFor(srv, m.id);
+        const key = `${perModel || pid}||${m.id}`;
         if (known.has(key)) continue;
         const o = el('option', null, llamaLiveServers.length > 1 ? `${m.name || m.id} · ${short}` : (m.name || m.id));
         o.value = key;
@@ -6217,7 +6263,21 @@ $('model-select').onchange = async (e) => {
     [provider, ...rest] = e.target.value.split(':');
     modelId = rest.join(':');
   }
-  const isLlama = provider.startsWith('llama-server=');
+  let isLlama = provider.startsWith('llama-server=') || /:\/\//.test(String(modelId || ''));
+  // A value can lose its "||" (an older page, a value from storage): then the model
+  // id carries the server URL ("llama-server=http://host:8080/Model" arrived as the
+  // model), and set_model answers "Model not found: llama-server=http://host:8080/Model".
+  if (isLlama) {
+    const repaired = splitGluedModel(provider, modelId);
+    if (repaired) { provider = repaired.provider; modelId = repaired.modelId; }
+    // and use the id pi actually has for this server/model (per-model ids included)
+    const srv = llamaServerForProvider(provider);
+    if (srv) {
+      const better = llamaProviderFor(srv, modelId);
+      if (better) provider = better;
+    }
+    isLlama = provider.startsWith('llama-server=');
+  }
   // If pi has not registered this llama provider yet (its configured URL is
   // dead), point pi at the live server, restart the agent, then retry.
   if (isLlama && !S.models.some((m) => m.provider === provider)) {
@@ -6227,6 +6287,10 @@ $('model-select').onchange = async (e) => {
       S.pendingModel = { provider, modelId };
       fixLlamaConfig(all.map((x) => x.url));
     }
+    return;
+  }
+  if (/:\/\//.test(String(modelId || ''))) {
+    toast(`That model entry is malformed (${String(modelId).slice(0, 60)}…) — the list is stale, hit ⟳ in the model menu`, 'error');
     return;
   }
   try {
