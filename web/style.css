@@ -1148,7 +1148,10 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
   flex: 1; min-width: 0;
 }
 #model-refresh { flex: 0 0 auto; padding: 4px 9px; font-size: 13px; line-height: 1.1; }
-#model-refresh.spinning { animation: model-refresh-spin .7s linear infinite; color: var(--accent); }
+#model-refresh .ico { display: inline-block; }
+/* spin the glyph, not the button box */
+#model-refresh.spinning .ico { animation: model-refresh-spin .7s linear infinite; }
+#model-refresh.spinning { color: var(--accent); }
 @keyframes model-refresh-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .model-list { max-height: 46vh; overflow-y: auto; display: flex; flex-direction: column; }
 .model-group {

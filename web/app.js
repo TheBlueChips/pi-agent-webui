@@ -1426,11 +1426,6 @@ async function refreshLlamaGroup() {
       return;
     }
     const known = new Set(S.models.map((m) => `${m.provider}||${m.id}`));
-    // The same model can be registered by pi under its own provider id and
-    // appear again here under "llama-server=<url>", which showed every local
-    // model twice. Match on the model id as well - these ids are unique per
-    // file on the server.
-    const knownIds = new Set(S.models.map((m) => m.id));
     const group = el('optgroup', null, 'llama.cpp (found on this machine or the LAN)');
     // A sweep that finishes after the menu was built left it stale - which is why
     // the models from the LAN only showed up on the second open.
@@ -1445,8 +1440,12 @@ async function refreshLlamaGroup() {
       // never duplicates what pi already listed
       const pid = llamaProviderFor(srv);
       for (const m of srv.models) {
+        // Skip only when pi lists this model *for this server*. Matching the model
+        // id alone hid the second instance's copy: two servers very often serve the
+        // same file (the same model id), and the LAN one then vanished from the list
+        // while its local twin was registered.
         const key = `${pid}||${m.id}`;
-        if (known.has(key) || knownIds.has(m.id)) continue; // already listed by the agent itself
+        if (known.has(key)) continue;
         const o = el('option', null, llamaLiveServers.length > 1 ? `${m.name || m.id} · ${short}` : (m.name || m.id));
         o.value = key;
         group.appendChild(o);
