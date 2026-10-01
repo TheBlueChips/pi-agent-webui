@@ -166,7 +166,7 @@ const getJson = (p) => new Promise((res, rej) => {
   const pre = JSON.parse(await evalJs(`JSON.stringify({
     streaming: !!S.isStreaming,
     viewSession: S.viewSession,
-    switchRunning: switchRunning,
+    switchSend: !!switchSend,
   })`));
   console.error('       state before the clicks: ' + JSON.stringify(pre));
   // four clicks as fast as the UI can deliver them, in the same tick
@@ -203,6 +203,33 @@ const getJson = (p) => new Promise((res, rej) => {
   }
 
   if (problems.length) fail(problems.slice(0, 3).join(' | '));
+
+  /* ── 3. a second click must take over, not queue behind the first ────────
+   *
+   * Reported as "switching sessions while one is loading won't stop the first one
+   * so you have to wait for the first one to finish" (issue #39).
+   *
+   * The generation counter is what decides who owns the view, and every click has
+   * to claim it. The guard that coalesced the agent-side switch used to return
+   * before this point, so a second click left the generation untouched: the first
+   * switch kept drawing and the second was only started once everything the first
+   * one did had finished. Counting the bumps measures exactly that difference -
+   * it cannot be satisfied by parking the click. */
+  await evalJs('window.__frames.length = 0;');
+  const gens = JSON.parse(await evalJs(`(() => {
+    const before = switchGen;
+    switchToSession('/tmp/supersede-1.jsonl').catch(() => {});
+    switchToSession('/tmp/supersede-2.jsonl').catch(() => {});
+    return JSON.stringify({ before, after: switchGen });
+  })()`));
+  await sleep(5000);
+  const sent = JSON.parse(await evalJs(`JSON.stringify(window.__frames.filter((m) => m.type === 'switch_session').map((m) => m.sessionPath))`));
+  console.log('  two clicks: generation ' + gens.before + ' -> ' + gens.after + ', frames ' + JSON.stringify(sent));
+  if (gens.after - gens.before !== 2) {
+    fail(`two clicks moved the generation ${gens.after - gens.before} time(s) - the second click was parked instead of taking over the view (issue #39)`);
+  }
+  if (sent.length > 2) fail(`${sent.length} switches sent for two clicks - the agent-side switch is no longer coalesced`);
+  console.log('  PASS a second click takes over immediately, and the agent still gets at most one switch per click');
   ws.close(); cleanup();
   process.exit(0);
 })().catch((e) => { cleanup(); fail(e && e.stack ? e.stack : String(e)); });

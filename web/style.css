@@ -484,6 +484,15 @@ body.hide-thinking details.thinking { display: none; }
    reserved for the longest form so the row never rewraps as the seconds tick.
    An empty counter reserves nothing at all. */
 #stats-bar > span { font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 0; }
+/* Every counter in this row has its line box pinned, for the same reason
+ * #ctx-label does (issue #2): the value is rewritten from a timer, and a replaced
+ * text node is re-shaped from scratch, which can land the ink a pixel or two
+ * higher or lower even when the text is identical. #ctx-label and the ring were
+ * fixed that time and the rest of the row was not, which is issue #42 - "every
+ * text in the composer bar is jumping up and down (except the ring)". The
+ * writers go through setText() now as well; this is the belt to that pair of
+ * braces, and it holds if a value legitimately changes. */
+#stat-turn, #stat-tokens, #stat-cost { line-height: 16px; height: 16px; display: inline-block; }
 #stat-turn { min-width: 12ch; }
 #stat-turn:empty, #stat-cost:empty { min-width: 0; }
 #stat-tokens, #stat-cost { min-width: 12ch; }
@@ -1340,12 +1349,52 @@ body { display: flex; }
  * browser draws and which turn a 12px track into something that reads as a
  * control rather than a scrollbar. */
 ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
-/* standards version (Firefox, Chrome 121+)
-/* `thin` is the 11px variant on purpose avoided above: Firefox would keep
- * rendering the narrow bar whatever the webkit rules say. `auto` is the thick
- * one, which is the closest Firefox has to the 15px track used here. */
+
+/* ── Firefox's scrollbar ─────────────────────────────────────────────────
+ * The webkit rules above do nothing in Firefox. All it honours is
+ * scrollbar-color and scrollbar-width, and with the default width it draws the
+ * classic control: a wide track with a square thumb and an arrow button at each
+ * end. That is the bar in the screenshot - and `thin` is what takes the buttons
+ * away and narrows it, which is why `thin` is here after all. The comment that
+ * used to sit here said `thin` was "on purpose avoided"; that was a judgement
+ * about the 11px track, and it was the wrong trade, because the alternative
+ * Firefox look has arrow buttons.
+ *
+ * Measured in Chromium on this machine, with a custom ::-webkit-scrollbar asking
+ * for 30px, and what it actually reserved:
+ *
+ *     the webkit rule alone                   -> 30 px
+ *     + scrollbar-width: auto                 -> 30 px
+ *     + scrollbar-color: <blue> <faint blue>  -> 15 px
+ *     + scrollbar-width: thin                 -> 10 px
+ *
+ * Two things follow, and the second one corrected an earlier claim here.
+ *
+ *  1. Setting `scrollbar-color` takes Chromium off the ::-webkit-scrollbar path
+ *     entirely - the third line is the native bar, coloured. That rule is set on
+ *     `*` further down, so IN CURRENT CHROMIUM everything above this comment is
+ *     inert: the rounded accent-coloured pill it draws comes from scrollbar-color,
+ *     not from these webkit rules. They are kept because they are still the only
+ *     thing Safari and pre-121 Chromium understand, but they are no longer what
+ *     makes the bar look right here.
+ *  2. So `thin` would not break Chromium's bar; it would narrow it from 15px to
+ *     10px. Scoping it to Firefox is therefore about leaving alone the bar that is
+ *     already right, not about rescuing it - the 15px one is closer to the 12px
+ *     this stylesheet intends, and it is the width in the screenshot worth keeping.
+ *
+ * Hence: `auto` globally, and `thin` only where ::-webkit-scrollbar does not
+ * exist. Firefox loses its arrow buttons; Chromium changes not at all. */
+
 ::selection { background: color-mix(in srgb, var(--accent) 42%, transparent); color: var(--text); }
-* { scrollbar-color: color-mix(in srgb, var(--accent) 68%, transparent) color-mix(in srgb, var(--accent) 10%, transparent); scrollbar-width: thin; }
+* { scrollbar-color: color-mix(in srgb, var(--accent) 68%, transparent) color-mix(in srgb, var(--accent) 10%, transparent); scrollbar-width: auto; }
+
+/* Applied AFTER the rule above on purpose: both are `*`, so whichever comes last
+ * wins where nothing more specific says otherwise. The two `scrollbar-width: none`
+ * declarations in this file (.queue-bar, #stats-bar) are more specific and are
+ * unaffected, which is what they want - those are deliberately hidden bars. */
+@supports not selector(::-webkit-scrollbar) {
+  * { scrollbar-width: thin; }
+}
 
 /* ── frosted panels ───────────────────────────────────────────────────────
  * The blur used to be on every bubble, tool card, panel and button strip, sized
@@ -1743,3 +1792,21 @@ body.hide-tools .msg.tool { display: none; }
   color: var(--text-dim);
 }
 .banner-x { margin-left: 8px; padding: 2px 8px; line-height: 1.2; }
+
+/* ── the Extensions tab (issue #46) ──────────────────────────────────────
+ * The rows reuse .prov-row / .prov-info / .prov-id / .prov-meta, which the
+ * Pi providers tab already uses, so a disabled resource only needs to look off
+ * and the section headings only need to exist. */
+#tab-extensions .ext-head {
+  margin: 2px 0 6px; font-size: 12.5px; font-weight: 600; letter-spacing: .02em;
+  display: flex; align-items: center; gap: 6px;
+}
+#tab-extensions .ext-count {
+  font-size: 11px; font-weight: 500; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; line-height: 15px;
+}
+#tab-extensions .prov-id.ext-off { color: var(--text-dim); text-decoration: line-through; text-decoration-thickness: 1px; }
+#tab-extensions .prov-row { align-items: center; }
+#tab-extensions .prov-row .btn { flex: 0 0 auto; }
+#tab-extensions textarea { width: 100%; font-family: var(--mono); font-size: 12px; margin-top: 6px; }
+#tab-extensions .prov-section:first-of-type { margin-top: 4px; }

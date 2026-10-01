@@ -67,9 +67,8 @@ packages.lock.json
 *.nuget.g.props
 *.nuget.g.targets
 
-# Metro scratch the RN build leaves behind next to the project
-pi-desktop/.bundle/
+# scratch files from a probe run - never part of the suite
+verify/.tmp-*.js
 
-# MSBuild binary logs from local builds
-pi-desktop/windows/*.binlog
-pi-desktop/windows/**/*.binlog
+# Metro scratch next to the desktop project (a local build leaves it behind)
+pi-desktop/.bundle/

@@ -22,7 +22,7 @@
 set -uo pipefail
 
 # ── a note on the environment ────────────────────────────────────────────
-# The suite invokes `node` with POSIX-style paths (/d/webui/verify/...), which
+# The suite invokes `node` with POSIX-style paths (<project>/verify/...), which
 # Git Bash translates for native programs. MSYS_NO_PATHCONV=1 in the caller's
 # environment disables that translation, and then every test script path fails
 # to resolve:
@@ -167,13 +167,49 @@ fi
 # ───────────────────── 3. integration (live bridge) ─────────────────────
 head_ "3. integration — live bridge on :$PORT"
 
+# This suite owns two ports, and a bridge from an interrupted run keeps them: it
+# answers /api/health exactly like the one about to start, so without clearing it
+# the suite silently tests the PREVIOUS run's bridge, with that run's environment,
+# and every failure looks like a bug in the code. Found the hard way - a stale
+# bridge on the second port meant the extensions checks ran against the real
+# ~/.pi/agent instead of the scratch one.
+#
+# Killed by PORT, never by a pattern over process command lines. The ports here are
+# this suite's own; nothing else uses them. (A pattern is how I once killed the
+# running bridge on :3080 - its command line is just `node bridge/server.js`, so
+# "every node running server.js" includes the one the user is actually using.)
+port_pid() {
+  netstat -ano 2>/dev/null | grep LISTENING | grep ":$1 " | awk '{print $5}' | head -1
+}
+kill_port() {
+  local pid
+  pid=$(port_pid "$1")
+  [ -n "$pid" ] || return 0
+  if command -v taskkill >/dev/null 2>&1; then taskkill //F //PID "$pid" >/dev/null 2>&1 || true
+  else kill "$pid" 2>/dev/null || true; fi
+  sleep 0.5
+}
+clear_leftover() {
+  local pid
+  pid=$(port_pid "$1")
+  [ -n "$pid" ] || return 0
+  printf '%s\n' "  ${YEL}note${RST} clearing a leftover listener on :$1 (pid $pid) from an earlier run"
+  kill_port "$1"
+}
+
+# Before anything starts, not after: this has to run BEFORE the bridge below, and
+# it did once sit in the next section instead - where it killed the bridge that had
+# just started, and the failure looked like a session-list bug.
+clear_leftover "$PORT"
+clear_leftover "$((PORT + 1))"
+
 PI_SESSION_DIR="$SESSION_DIR" \
 PI_WEBUI_SETTINGS="$TMP/settings.json" \
 PI_WEBUI_LAST_SESSION="$TMP/last.json" \
 PORT=$PORT \
   node bridge/server.js >"$TMP/bridge.log" 2>&1 &
 BRIDGE_PID=$!
-trap 'kill $BRIDGE_PID 2>/dev/null' EXIT
+trap 'kill_port "$PORT"; kill_port "$((PORT + 1))"' EXIT
 
 up=0
 for _ in $(seq 1 60); do
@@ -185,6 +221,54 @@ if [ "$up" = 1 ]; then
 else
   bad "bridge is up"; head -20 "$TMP/bridge.log" | sed 's/^/       /'
   printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"; exit 1
+fi
+
+# ─────────────── a second bridge for the extensions tab (#46) ───────────────
+# Those endpoints WRITE settings.json and DELETE files, so this bridge is pointed
+# at a scratch agent dir and never at the real ~/.pi/agent. The fixture is
+# synthesised rather than copied, so it behaves the same on CI.
+
+EXT_DIR="$TMP/agent"
+mkdir -p "$EXT_DIR/extensions" "$EXT_DIR/skills/fixture-skill/reference" "$TMP/workspace"
+printf 'export default () => {};\n' > "$EXT_DIR/extensions/fixture-ext.ts"
+printf '# Fixture skill\n' > "$EXT_DIR/skills/fixture-skill/SKILL.md"
+printf 'nested\n' > "$EXT_DIR/skills/fixture-skill/reference/notes.md"
+printf '# project context\n' > "$TMP/workspace/AGENTS.md"
+cat > "$EXT_DIR/settings.json" <<'JSON'
+{
+  "defaultModel": "fixture-model",
+  "packages": ["npm:pi-subagents", { "source": "npm:pi-web-access", "extensions": ["-index.ts"] }]
+}
+JSON
+# PI_COMMAND matters more here than anywhere else: without it the bridge spawns the
+# real pi, and a real pi pointed at a scratch agent dir whose settings.json lists
+# packages INSTALLS them - it created npm/, pi-subagents/, auth.json and
+# models-store.json in the fixture and removed the files this check needs. No agent
+# is involved in any of these checks, so it gets the mock.
+#
+# NOTE for anyone editing this: no comment may go inside the line-continued
+# assignment list below. A line that is entirely a comment ENDS the command, so the
+# rest of the list runs as a separate command - which is exactly how this ran
+# against the real ~/.pi/agent once, with PI_AGENT_DIR silently dropped.
+PI_AGENT_DIR="$EXT_DIR" \
+WORKSPACE_DIR="$TMP/workspace" \
+PI_SESSION_DIR="$SESSION_DIR" \
+PI_WEBUI_SETTINGS="$TMP/settings-ext.json" \
+PI_WEBUI_LAST_SESSION="$TMP/last-ext.json" \
+PI_COMMAND="node $ROOT/bridge/mock_agent.js" \
+PORT=$((PORT + 1)) \
+  node bridge/server.js >"$TMP/bridge-ext.log" 2>&1 &
+EXT_BRIDGE_PID=$!
+trap 'kill_port "$PORT"; kill_port "$((PORT + 1))"' EXIT
+ext_up=0
+for _ in $(seq 1 60); do
+  curl -fsS "http://127.0.0.1:$((PORT + 1))/api/health" >/dev/null 2>&1 && { ext_up=1; break; }
+  sleep 0.2
+done
+if [ "$ext_up" = 1 ]; then
+  ok "second bridge for the extensions tab is up (agent dir: $EXT_DIR)"
+else
+  bad "second bridge for the extensions tab is up"; head -20 "$TMP/bridge-ext.log" | sed 's/^/       /'
 fi
 
 # The path comes from the bridge's own answer, not from a guess about where it
@@ -248,6 +332,13 @@ if [ -n "$SPATH" ]; then
     # inserted, removed or reordered above it.
     run "sidebar: stays anchored on its row across a rebuild" \
         node "$V/test-sidebar-anchor.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #38: a picture on a session line larger than 8 MB. The phone pictures
+    # came back as "image no longer in this session" because readLineAt() stopped
+    # growing its read at 8 MB, truncated the line, and the parse failure was
+    # reported as a missing image. Writes one file into the session dir and removes
+    # only that file.
+    run "images: a picture on a line over 8 MB is served whole" \
+        env PI_BIGIMG_DIR="$SESSION_DIR" node "$V/test-big-image.js" "http://127.0.0.1:$PORT"
     # Reported as "switching fast and the server kind of dies": the heartbeat
     # asked the agent (and closed the socket when a busy agent was slow) and
     # every click queued its own switch. It reports 77 - a SKIP - when the shared
@@ -255,6 +346,28 @@ if [ -n "$SPATH" ]; then
     # count.
     skip_ok "rapid switching: heartbeat asks the bridge, clicks coalesce" \
         node "$V/test-rapid-switch.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issues #40, #47, #48, #42, #41 and #38's loop. All of them are decided in the
+    # page, so no agent turn is needed. PI_TEST_KEEP_GOING=1 there reports every
+    # failed check at once, which is how each one was shown to fail on the old code.
+    # The scrollbar: Firefox needs `thin` (it is what removes the arrow buttons) and
+    # Chromium must stay on `auto` (its bar is already right, and thin narrows it
+    # 15px -> 10px). The two cannot share one value, so the CSS scopes it with
+    # @supports. Chromium can only check that it is NOT caught by that guard; the
+    # Firefox half is one reload away for a person to see.
+    run "scrollbar: Firefox gets `thin`, this browser is not caught by the guard" \
+        node "$V/test-scrollbar.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #45: the settings dialog must not build the 295-option system font list
+    # while it is opening. It reports 77 (a SKIP) against a bridge that knows few
+    # fonts, since then there is no list to keep out.
+    skip_ok "settings: opening the dialog builds no font list, the font box still works" \
+        node "$V/test-settings-open.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #46: the extensions tab, against the scratch agent dir - the endpoints
+    # write settings.json and delete files.
+    run "extensions: list, enable/disable writes pi's own format, paths stay inside" \
+        env PI_TEST_AGENT_DIR="$EXT_DIR" \
+        node "$V/test-extensions.js" "http://127.0.0.1:$((PORT + 1))" "$BROWSER"
+    run "compaction: marks are per-session, facts survive a reload, ring shows the estimate" \
+        node "$V/test-compaction.js" "http://127.0.0.1:$PORT" "$BROWSER"
   else
     skip "no Chrome/Edge found for the browser check"
   fi
@@ -262,7 +375,14 @@ else
   bad "session list returns a usable path"
 fi
 
-kill $BRIDGE_PID 2>/dev/null; wait $BRIDGE_PID 2>/dev/null; trap - EXIT
+# Both bridges, and the trap is cleared only after both are gone. This used to kill
+# $BRIDGE_PID alone and then `trap - EXIT`, which is how the extensions bridge from
+# every run stayed up on its port and the next run quietly tested the old one.
+kill_port "$PORT"
+kill_port "$((PORT + 1))"
+wait $BRIDGE_PID 2>/dev/null
+wait $EXT_BRIDGE_PID 2>/dev/null
+trap - EXIT
 
 # ───────────────────────────── 4. docker ─────────────────────────────
 if [ "${1:-}" = "--docker" ]; then

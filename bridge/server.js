@@ -515,11 +515,30 @@ async function sessionStamp(ref) {
 
 /* One line, read from a known byte offset, without reading what came before it.
  *
- * Local reads take a bounded window from the offset and cut at the first newline.
- * A line can be long - a message carrying a screenshot is a few hundred KB - so
- * the window grows in steps rather than being fixed, and a line longer than the
- * cap is reported as not found, which falls back to the forward scan. */
-async function readLineAt(ref, offset, maxBytes = 8 * 1024 * 1024) {
+ * This carried a note claiming that "a line longer than the cap is reported as
+ * not found, which falls back to the forward scan". That was not what the code
+ * did - it returned the truncated bytes as if they were the whole line - and the
+ * note has gone with the bug, because believing it is what made the failure look
+ * like a missing image. */
+/* One line, read from a known byte offset, for the picture endpoint.
+ *
+ * A session line has no size worth guessing at: a message carries its pictures
+ * inline, and one off a phone camera is several megabytes of base64 on a single
+ * line. This used to grow its read but stop at 8 MB - smaller than that - so the
+ * line came back truncated, JSON.parse threw on it, and the caller reported the
+ * image as "no longer at that line" while it sat there in the file. Which is
+ * issue #38 exactly: the pictures that failed to load were the phone ones, every
+ * other picture worked, and the file was fine all along.
+ *
+ * So the read grows until it finds the newline or reaches the end of the file.
+ * maxBytes is still there for a caller that wants a ceiling; the default is the
+ * file. Measured on the session from that issue: line 85 is 10,450,484 chars of
+ * base64 and now serves as a 7,837,863-byte PNG.
+ *
+ * The chunks are joined and decoded ONCE at the end rather than per read: a
+ * multi-byte character can straddle two reads, and decoding each chunk on its own
+ * would corrupt it - the same reason sessionLines below decodes the way it does. */
+async function readLineAt(ref, offset, maxBytes = Number.MAX_SAFE_INTEGER) {
   if (offset < 0) return null;
   if (ref.kind === 'docker') {
     // `tail -c +N` is 1-based, and the path is argv as everywhere else
@@ -533,33 +552,46 @@ async function readLineAt(ref, offset, maxBytes = 8 * 1024 * 1024) {
   try {
     const st = await fh.stat();
     if (offset >= st.size) return null;
-    let len = Math.min(65536, st.size - offset);
+    const hardEnd = Math.min(offset + maxBytes, st.size);
+    const chunks = [];
+    let got = 0;
+    let len = Math.min(65536, hardEnd - offset);
     for (;;) {
+      if (len <= 0) break;
       const buf = Buffer.alloc(len);
-      const { bytesRead } = await fh.read(buf, 0, len, offset);
-      if (!bytesRead) return null;
+      const { bytesRead } = await fh.read(buf, 0, len, offset + got);
+      if (!bytesRead) break;
       const slice = buf.subarray(0, bytesRead);
       const nl = slice.indexOf(0x0a);
       if (nl >= 0) {
-        // cut at a newline, so the bytes before it are whole characters
-        return slice.subarray(0, nl).toString('utf8');
+        // cut at the newline, so what is decoded holds only whole characters
+        chunks.push(slice.subarray(0, nl));
+        break;
       }
-      if (bytesRead < len) return slice.toString('utf8');   // last line, no newline
-      if (len >= Math.min(maxBytes, st.size - offset)) return slice.toString('utf8');
-      len = Math.min(len * 4, maxBytes, st.size - offset);
+      chunks.push(slice);
+      got += bytesRead;
+      if (bytesRead < len) break;                 // the line runs to the end of the file
+      if (offset + got >= hardEnd) break;         // a ceiling was asked for
+      len = Math.min(len * 4, 64 * 1024 * 1024, hardEnd - offset - got);
     }
+    if (!chunks.length) return null;
+    return Buffer.concat(chunks).toString('utf8');
   } catch { return null; } finally {
     try { await fh.close(); } catch { /* already closed */ }
   }
 }
 
-/* One line, read from a known byte offset, for the picture endpoint. */
+/* Every line of a session, one at a time, with the byte offset of each.
+ *
+ * Streaming rather than reading the file whole, because a session can be tens of
+ * megabytes; `onLine` is handed the offset before each line so a caller can build
+ * the line index that readLineAt above seeks with. */
 async function* sessionLines(ref, onLine) {
   if (ref.kind === 'docker') {
     // `docker exec` hands us a live stdout, so the file can be read as it
     // arrives instead of after the whole of it has crossed into this process.
     // The first version used dockerCapture, which collects the entire file into
-    // one string before returning - so on the setup this machine actually uses
+    // one string before returning - so on the setup the bridge actually runs on
     // (a native bridge driving an agent inside a container) nothing could be
     // sent until the last byte had come back: measured 1513 ms before the first
     // byte on a 70 MB session, 3.3 s to finish.
@@ -2263,33 +2295,49 @@ const server = http.createServer(async (req, res) => {
        * with the index it is one short read whatever the line. The index is built
        * by /api/session-messages, which is what drew the transcript the picture is
        * being requested for, so in the normal case it is already there. */
-      let entry = null, found = false;
+      /* Read the line, and say what actually went wrong when it cannot be used.
+       *
+       * `found` used to mean "a line was read" while a parse failure was swallowed
+       * into entry = null, so every such failure came out as the same message -
+       * "that image is no longer at that line" - which is a claim about the SESSION
+       * being wrong rather than about the reader being wrong. That is what made
+       * issue #38 read as a missing image: the line was there, the read of it was
+       * broken, and the error blamed the file. */
+      let entry = null;
+      let read = false;               // a line was located and read
+      let badJson = false;            // ... but it did not parse as one entry
       const stampNow = await sessionStamp(ref);
       const offsets = stampNow ? indexGet(indexKey(ref, stampNow)) : null;
       const at = offsets && offsets.length >= wantLine ? offsets[wantLine - 1] : null;
       if (at != null) {
         const raw = await readLineAt(ref, at);
         if (raw != null) {
-          try { entry = JSON.parse(raw); } catch { entry = null; }
-          found = true;
+          read = true;
+          try { entry = JSON.parse(raw); } catch { entry = null; badJson = true; }
         }
       }
-      if (!found) {
+      if (!read) {
         // no index (or the file moved under it): read forward, as before
         let line = 0;
         for await (const raw of sessionLines(ref)) {
           if (++line !== wantLine) continue;
-          try { entry = JSON.parse(raw); } catch { entry = null; }
-          found = true;
+          read = true;
+          try { entry = JSON.parse(raw); } catch { entry = null; badJson = true; }
           break;
         }
       }
+      if (badJson) {
+        // Neither the session's fault nor the picture's. Say which, so the next
+        // person looks at the reader instead of hunting for a lost image.
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ error: `line ${wantLine} could not be read as one session entry` }));
+        return;
+      }
       const content = entry && entry.message && entry.message.content;
       const block = Array.isArray(content) ? content[wantPart] : null;
-      if (!found || !block || block.type !== 'image' || typeof block.data !== 'string') {
-        // the file moved under us (a compaction rewrites it, a new turn shifts a
-        // line). Say so plainly; the page shows a placeholder rather than a
-        // broken image.
+      if (!read || !block || block.type !== 'image' || typeof block.data !== 'string') {
+        // Genuinely nothing to serve: a wrong line or part, or a session rewritten
+        // under a URL that named a position in the old one.
         res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ error: 'that image is no longer at that line' }));
         return;
@@ -3401,6 +3449,327 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405).end();
     return;
   }
+
+/* ── pi's extensions, skills, packages and AGENTS.md ──────────────────────
+ *
+ * The management tab (issue #46). Everything here is read or written under
+ * PI_AGENT_DIR and nowhere else, and nothing runs a shell: a name off the wire is
+ * data, it is reduced to a basename, and the path it produces has to be a direct
+ * child of the directory it belongs to.
+ *
+ * Enable/disable does NOT have its own mechanism. pi stores it as +path / -path /
+ * !pattern entries inside the `extensions`, `skills`, `prompts` and `themes`
+ * arrays of settings.json, and resolves them in isEnabledByOverrides()
+ * (core/package-manager.js): anything not matched is enabled, `-rel` and `!rel`
+ * disable, `+rel` re-enables. A pattern is the path relative to the agent dir, so
+ * disabling the gitea skill writes "skills": ["-skills/gitea"]. This writes the
+ * same format rather than inventing a second one - pi has to agree, or the switch
+ * would look on and do nothing.
+ *
+ * There is deliberately no install here. Adding an extension means the agent will
+ * load and run it, and this bridge has no authentication - only the Host/Origin
+ * gate that stops a page on another origin driving it (issue #23). "Install" over
+ * an unauthenticated port is "run my code on that machine", so it is left out
+ * rather than shipped behind a confirmation nobody reads. The tab says so. */
+const PI_EXT_DIR = path.join(PI_AGENT_DIR, 'extensions');
+const PI_SKILLS_DIR = path.join(PI_AGENT_DIR, 'skills');
+const PI_AGENTS_FILE = path.join(PI_AGENT_DIR, 'AGENTS.md');
+const RESOURCE_ARRAYS = { extensions: 'extensions', skills: 'skills' };
+
+/* A name that is exactly one path segment. Rejects "", ".", "..", anything with a
+ * separator or a control character, and anything unreasonably long. */
+function safeResourceName(name) {
+  const n = String(name == null ? '' : name).trim();
+  if (!n || n === '.' || n === '..') return null;
+  if (n.length > 200) return null;
+  if (/[\\/\u0000-\u001f]/.test(n)) return null;
+  if (n.includes('..')) return null;
+  return n;
+}
+
+/* The one path a resource of this kind is allowed to be. basename() cannot escape
+ * on its own, but the check is kept anyway: this is the value that decides what a
+ * delete removes, and the guard has to be visible next to the rm - which is the
+ * lesson from the two injection bugs this file has already had. */
+function resourcePath(kind, name) {
+  const safe = safeResourceName(name);
+  if (!safe) return null;
+  const root = kind === 'skills' ? PI_SKILLS_DIR : PI_EXT_DIR;
+  if (path.basename(safe) !== safe) return null;
+  const full = path.join(root, safe);
+  if (!full.startsWith(root + path.sep)) return null;
+  return full;
+}
+
+function readPiSettings() {
+  try {
+    const j = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8'));
+    return j && typeof j === 'object' ? j : {};
+  } catch { return {}; }
+}
+
+function writePiSettings(settings) {
+  // The same shape pi's own SettingsManager writes (JSON.stringify(x, null, 2)),
+  // so its loader and this writer cannot disagree about the file.
+  writeJsonAtomic(PI_SETTINGS_FILE, settings);
+}
+
+/* pi's override resolution, reduced to what a single row needs: is this resource
+ * enabled? `rel` is the path relative to the agent dir, posix-separated. */
+function resourceEnabled(patterns, rel, name) {
+  const list = Array.isArray(patterns) ? patterns.filter((p) => typeof p === 'string') : [];
+  const overrides = list.filter((p) => p.startsWith('!') || p.startsWith('+') || p.startsWith('-'));
+  const accepts = (p) => p === rel || p === name;
+  const excludes = overrides.filter((p) => p.startsWith('!')).map((p) => p.slice(1));
+  const includes = overrides.filter((p) => p.startsWith('+')).map((p) => p.slice(1));
+  const forceOut = overrides.filter((p) => p.startsWith('-')).map((p) => p.slice(1));
+  let enabled = true;
+  if (excludes.some(accepts)) enabled = false;
+  if (includes.some(accepts)) enabled = true;
+  if (forceOut.some(accepts)) enabled = false;
+  return enabled;
+}
+
+/* Set one resource's override, replacing any earlier entry for it - what pi's
+ * config selector does, and what stops the array growing a line per click.
+ * enabled === null removes the override entirely. */
+function setResourceOverride(list, rel, enabled) {
+  const keep = (Array.isArray(list) ? list : []).filter((p) => {
+    if (typeof p !== 'string') return true;
+    const body = (p.startsWith('!') || p.startsWith('+') || p.startsWith('-')) ? p.slice(1) : p;
+    return body !== rel;
+  });
+  if (enabled === null) return keep;
+  keep.push(`${enabled ? '+' : '-'}${rel}`);
+  return keep;
+}
+
+/* Loose resources: a .ts/.js file (or a directory holding one) under extensions/,
+ * a directory holding SKILL.md under skills/. Anything else is ignored rather than
+ * listed as something this tab cannot act on. Packages are entries in
+ * settings.json, not files here, so they are listed separately. */
+function listLooseResources(kind) {
+  const root = kind === 'skills' ? PI_SKILLS_DIR : PI_EXT_DIR;
+  const out = [];
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(root, e.name);
+    if (e.isDirectory()) {
+      const entry = kind === 'skills'
+        ? fs.existsSync(path.join(full, 'SKILL.md'))
+        : (fs.existsSync(path.join(full, 'index.ts')) || fs.existsSync(path.join(full, 'index.js')));
+      if (!entry) continue;
+      let modified = 0;
+      try { modified = fs.statSync(full).mtimeMs; } catch { /* gone */ }
+      out.push({ name: e.name, kind: 'dir', rel: kind + '/' + e.name, modified });
+    } else if (e.isFile()) {
+      if (kind === 'skills') continue;                     // a skill is a directory holding SKILL.md
+      if (!/\.(ts|js|mjs|cjs)$/i.test(e.name)) continue;
+      let size = 0, modified = 0;
+      try { const st = fs.statSync(full); size = st.size; modified = st.mtimeMs; } catch { /* gone */ }
+      out.push({ name: e.name, kind: 'file', rel: kind + '/' + e.name, size, modified });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/* The global AGENTS.md, plus the per-project ones pi would pick up walking up from
+ * the agent's working directory. The project files are read-only here: they sit at
+ * arbitrary ancestor paths, and writing one would be a write anywhere on disk. */
+function agentContextFiles() {
+  const out = [];
+  out.push({
+    path: PI_AGENTS_FILE, scope: 'global', exists: fs.existsSync(PI_AGENTS_FILE),
+    writable: true, name: path.basename(PI_AGENTS_FILE),
+  });
+  const names = ['AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD'];
+  let dir = path.resolve(WORKSPACE_DIR);
+  /* Deduped case-insensitively: AGENTS.md and AGENTS.MD are one file on Windows and
+   * macOS, and listing the same file twice under two of its own spellings is the
+   * kind of thing that makes a list look broken. */
+  const seen = new Set();
+  const key = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  for (let hops = 0; hops < 24; hops++) {
+    for (const n of names) {
+      const p = path.join(dir, n);
+      if (key(p) === key(PI_AGENTS_FILE) || seen.has(key(p))) continue;
+      seen.add(key(p));
+      if (!fs.existsSync(p)) continue;
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch { /* gone */ }
+      out.push({
+        path: p, scope: dir === path.resolve(WORKSPACE_DIR) ? 'project' : 'parent',
+        exists: true, writable: false, name: n, size,
+      });
+    }
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return out;
+}
+
+function jsonOut(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+
+if (req.url.startsWith('/api/pi-extensions')) {
+  const only = req.url.split('?')[0];
+  if (req.method === 'GET' && only === '/api/pi-extensions') {
+    const settings = readPiSettings();
+    const extPatterns = settings[RESOURCE_ARRAYS.extensions] || [];
+    const skillPatterns = settings[RESOURCE_ARRAYS.skills] || [];
+    const extensions = listLooseResources('extensions')
+      .map((r) => Object.assign({}, r, { enabled: resourceEnabled(extPatterns, r.rel, r.name), source: 'local' }));
+    const skills = listLooseResources('skills')
+      .map((r) => Object.assign({}, r, { enabled: resourceEnabled(skillPatterns, r.rel, r.name), source: 'local' }));
+    const packages = (Array.isArray(settings.packages) ? settings.packages : []).map((p, i) => ({
+      index: i,
+      source: typeof p === 'string' ? p : ((p && p.source) || ''),
+      form: typeof p === 'string' ? 'string' : 'object',
+      filters: (p && typeof p === 'object')
+        ? Object.fromEntries(Object.entries(p).filter(([k]) => k !== 'source'))
+        : null,
+    }));
+    jsonOut(res, 200, {
+      agentDir: PI_AGENT_DIR,
+      settingsFile: PI_SETTINGS_FILE,
+      extensions: extensions, skills: skills, packages: packages,
+      counts: { extensions: extensions.length, skills: skills.length, packages: packages.length },
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && only === '/api/pi-extensions/toggle') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const kind = j && String(j.type || '');
+      if (!j || !RESOURCE_ARRAYS[kind] || typeof j.enabled !== 'boolean') {
+        return jsonOut(res, 400, { error: 'need {type: "extensions"|"skills", name, enabled}' });
+      }
+      const name = safeResourceName(j.name);
+      const full = name ? resourcePath(kind, name) : null;
+      if (!full || !fs.existsSync(full)) return jsonOut(res, 400, { error: 'no such resource' });
+      const rel = kind + '/' + name;
+      const settings = readPiSettings();
+      settings[RESOURCE_ARRAYS[kind]] = setResourceOverride(settings[RESOURCE_ARRAYS[kind]], rel, j.enabled);
+      // A list that is back to nothing has no reason to stay in the file.
+      if (Array.isArray(settings[RESOURCE_ARRAYS[kind]]) && settings[RESOURCE_ARRAYS[kind]].length === 0) {
+        delete settings[RESOURCE_ARRAYS[kind]];
+      }
+      try { writePiSettings(settings); }
+      catch (e) { return jsonOut(res, 500, { error: 'could not write settings.json: ' + e.message }); }
+      jsonOut(res, 200, { ok: true, name: name, rel: rel, enabled: j.enabled, settingsFile: PI_SETTINGS_FILE });
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && only === '/api/pi-extensions/delete') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const kind = j && String(j.type || '');
+      if (!j || !RESOURCE_ARRAYS[kind]) return jsonOut(res, 400, { error: 'need {type: "extensions"|"skills", name}' });
+      const name = safeResourceName(j.name);
+      const full = name ? resourcePath(kind, name) : null;
+      if (!full || !fs.existsSync(full)) return jsonOut(res, 400, { error: 'no such resource' });
+      try { fs.rmSync(full, { recursive: true, force: true }); }
+      catch (e) { return jsonOut(res, 500, { error: 'could not remove it: ' + e.message }); }
+      const settings = readPiSettings();
+      settings[RESOURCE_ARRAYS[kind]] = setResourceOverride(settings[RESOURCE_ARRAYS[kind]], kind + '/' + name, null);
+      if (Array.isArray(settings[RESOURCE_ARRAYS[kind]]) && settings[RESOURCE_ARRAYS[kind]].length === 0) {
+        delete settings[RESOURCE_ARRAYS[kind]];
+      }
+      try { writePiSettings(settings); } catch { /* it is gone either way */ }
+      jsonOut(res, 200, { ok: true, removed: full });
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && only === '/api/pi-extensions/package') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const action = j && String(j.action || '');
+      const source = j && typeof j.source === 'string' ? j.source.trim() : '';
+      if (!j || (action !== 'add' && action !== 'remove')) {
+        return jsonOut(res, 400, { error: 'need {action: "add"|"remove", source}' });
+      }
+      if (!source || source.length > 300) return jsonOut(res, 400, { error: 'need a source' });
+      /* A source beginning with "-" is read by npm as a flag rather than a package
+       * once pi installs it, so it is refused here rather than stored and refused
+       * later by something that does not know what it is looking at. */
+      if (source.startsWith('-')) return jsonOut(res, 400, { error: 'a package source cannot start with "-"' });
+      if (/[\u0000-\u001f]/.test(source)) return jsonOut(res, 400, { error: 'a package source cannot contain control characters' });
+      const settings = readPiSettings();
+      const list = Array.isArray(settings.packages) ? settings.packages.slice() : [];
+      const sourceOf = (p) => (typeof p === 'string' ? p : ((p && p.source) || ''));
+      if (action === 'remove') {
+        const next = list.filter((p) => sourceOf(p) !== source);
+        if (next.length === list.length) return jsonOut(res, 404, { error: 'that package is not in the list' });
+        settings.packages = next;
+      } else {
+        if (list.some((p) => sourceOf(p) === source)) return jsonOut(res, 409, { error: 'that package is already listed' });
+        list.push(source);
+        settings.packages = list;
+      }
+      if (Array.isArray(settings.packages) && settings.packages.length === 0) delete settings.packages;
+      try { writePiSettings(settings); }
+      catch (e) { return jsonOut(res, 500, { error: 'could not write settings.json: ' + e.message }); }
+      jsonOut(res, 200, {
+        ok: true, packages: settings.packages || [],
+        note: action === 'add' ? 'listed in settings.json - pi fetches it the next time it starts, not from here' : undefined,
+      });
+    });
+    return;
+  }
+
+  res.writeHead(405).end();
+  return;
+}
+
+if (req.url.startsWith('/api/pi-agents')) {
+  const only = req.url.split('?')[0];
+  if (req.method === 'GET' && only === '/api/pi-agents') {
+    const files = agentContextFiles().map((f) => {
+      let content = '';
+      try { content = fs.readFileSync(f.path, 'utf8'); } catch { /* unreadable */ }
+      return Object.assign({}, f, {
+        content: f.writable ? content : content.slice(0, 20000),
+        truncated: !f.writable && content.length > 20000,
+        bytes: content.length,
+      });
+    });
+    jsonOut(res, 200, { global: files[0], files: files, workspace: WORKSPACE_DIR });
+    return;
+  }
+  if (req.method === 'POST' && only === '/api/pi-agents') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 4 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      if (!j || typeof j.content !== 'string') return jsonOut(res, 400, { error: 'need {content}' });
+      if (j.content.length > 4 * 1024 * 1024) return jsonOut(res, 413, { error: 'too large' });
+      try {
+        if (j.content.trim() === '') { try { fs.rmSync(PI_AGENTS_FILE, { force: true }); } catch { /* gone */ } }
+        else fs.writeFileSync(PI_AGENTS_FILE, j.content, 'utf8');
+      } catch (e) { return jsonOut(res, 500, { error: 'could not write it: ' + e.message }); }
+      jsonOut(res, 200, { ok: true, path: PI_AGENTS_FILE, bytes: j.content.length });
+    });
+    return;
+  }
+  res.writeHead(405).end();
+  return;
+}
+
 
   if (req.url.startsWith('/api/pi-providers')) {
     if (req.method === 'GET') {

@@ -465,7 +465,7 @@ const DEFAULT_SETTINGS = {
   // 1-8 = a cap. Each animated message is a live video decoder, which is why the
   // cap exists and why the whole group pauses while the tab is in the
   // background.
-  avatarAnimate: -2,
+  avatarAnimate: 8,       // the slider's top; -2 ("all") is one decoder per message
   sessionFolders: [],     // the first instance's set; kept as the source for the one-time migration
   sessionFoldersByInstance: null,  // { instanceOrigin: [{ id, name, paths }] } — folders are per instance
   bgOpacity: 100,         // 0-100 — background image / video transparency
@@ -665,8 +665,10 @@ const S = {
   // Compactions we watched happen in this page session. Each is anchored to the
   // message index it sat at, so it stays put instead of being re-appended to the
   // bottom of the transcript on every turn.
-  compactionMarks: [],     // [{ summary, tokensBefore, estimatedTokensAfter, at }]  (at = ms)
+  compactionMarks: [],     // [{ ...compactionResult, at, session }]  (at = ms, session = the session it happened in)
   ctxStats: null,          // last authoritative contextUsage from get_session_stats
+  autoContinueStreak: 0,   // compactions in a row that dragged the task on by themselves
+  ctxWindow: null,         // the model's context window, remembered across the null a compaction sets
   ctxDisplayTokens: null,  // high-water mark: the largest token count the ring has shown
   stateModelKey: '',        // provider||id of the model the thinking levels were read for
   ctxBaseTokens: null,     // authoritative count when the current turn started
@@ -1874,9 +1876,9 @@ async function refreshStats() {
   try {
     const d = await rpc({ type: 'get_session_stats' });
     const cost = d && d.cost && d.cost.total != null ? Number(d.cost.total) : null;
-    $('stat-cost').textContent = cost != null
+    setText($('stat-cost'), cost != null
       ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`
-      : '';
+      : '');
     let cu = d && d.contextUsage;
     const rawTokens = cu && cu.tokens != null ? cu.tokens : null;
     // While a turn is in flight the live number is anchored to the last real
@@ -1923,7 +1925,33 @@ function setAttr(el, name, value) {
   if (el && el.getAttribute(name) !== value) el.setAttribute(name, value);
 }
 
+/* The ring's high-water marks, dropped whenever the context is replaced.
+ *
+ * All three exist to stop the ring walking backwards DURING a turn - the agent's
+ * own count comes back a little differently each time it is asked, so polling it
+ * mid-turn used to make the ring tick down and climb again. Each of them is a
+ * statement about the context as it is right now, and a compaction replaces that
+ * context wholesale, so after one they are all describing something that no
+ * longer exists.
+ *
+ * Left in place they do worse than nothing: ctxTurnPeak is only cleared on
+ * agent_start, so a compaction that happens mid-turn leaves the pre-compaction
+ * peak behind, and the clamp in setCtxRing reads it as a floor and pushes the
+ * post-compaction estimate straight back up to it. Which is issue #48 exactly as
+ * reported - "right after compaction the counter stays the same" - and it is why
+ * that check first failed with 26.7K where the compaction had said 25.6K. */
+function resetCtxHighWater() {
+  S.ctxTurnPeak = 0;
+  S.ctxDisplayTokens = null;
+  S.ctxBaseTokens = null;
+}
+
 function setCtxRing(cu, store = true) {
+  // The window is remembered apart from the stats object it arrives in.
+  // compaction_start nulls S.ctxStats on purpose - the count is about to be
+  // meaningless - but the window has not changed, and showCompactionEstimate()
+  // needs it a moment later to display the post-compaction size.
+  if (cu && cu.contextWindow) S.ctxWindow = cu.contextWindow;
   if (store) S.ctxStats = cu && cu.tokens != null && cu.contextWindow ? { ...cu } : null;
   // The agent's own count comes back a little differently each time it is asked
   // (it recounts the conversation as tool results land), so polling it during a
@@ -2047,7 +2075,7 @@ function noteTokenRatio(usage, chars) {
 function updateTotals(extraUsage) {
   const read = S.totals.read + ((u) => u ? (u.input || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) : 0)(extraUsage);
   const write = S.totals.write + (extraUsage ? (extraUsage.output || 0) : 0);
-  $('stat-tokens').textContent = `↑ ${formatTok(read) ?? 0} · ↓ ${formatTok(write) ?? 0}`;
+  setText($('stat-tokens'), `↑ ${formatTok(read) ?? 0} · ↓ ${formatTok(write) ?? 0}`);
 }
 
 /* ───────────────────────── chat rendering ───────────────────────── */
@@ -3384,6 +3412,9 @@ function renderUserMessage(msg) {
   }
   transcriptHost().appendChild(root);
   scrollBottom();
+  // Returned so a caller that drew this row optimistically can take it back if
+  // the message turns out not to have been delivered (see sendPrompt).
+  return root;
 }
 
 /* Estimated written tokens for a live message, used while streaming and as a
@@ -3829,7 +3860,11 @@ function buildCompactionSummary(msg, extra) {
   const before = msg.tokensBefore != null ? `${formatTok(msg.tokensBefore)} tok` : 'context';
   const after = extra && extra.estimatedTokensAfter != null
     ? ` → ${formatTok(extra.estimatedTokensAfter)} tok` : '';
-  who.textContent = `conversation compacted · ${before}${after}`;
+  /* The reason was drawn only by renderCompactionBlock(), the live marker, so
+   * even a rebuild in the same page session dropped "· manual" - not just a
+   * reload. That is half of issue #47. */
+  const reason = extra && extra.reason ? ` · ${extra.reason}` : '';
+  who.textContent = `conversation compacted · ${before}${after}${reason}`;
   if (extra && extra.count > 1) {
     const badge = el('span', 'compaction-count', `${extra.count}✕`);
     badge.title = `${extra.count} compactions in this session`;
@@ -3933,6 +3968,79 @@ function renderCompactionBlock(result, reason) {
 
 // Read a session transcript from the bridge (messages + the compaction
 // entries, which are not messages and so are absent from get_messages).
+/* ── the compaction facts pi does not persist ─────────────────────────
+ *
+ * The session file's `compaction` entry, and the compactionSummary message pi
+ * builds from it, carry the summary, an id, a timestamp and tokensBefore. The
+ * post-compaction size and the reason are computed by pi at the moment it
+ * compacts, emitted on the compaction_end event, and never written down - so a
+ * marker read back from the file could only ever say "conversation compacted ·
+ * 833.3K tok", while the same marker when it happened said "... · 833.3K tok →
+ * 24.4K tok · manual". That is issue #47, and it is why the type appears to be
+ * "lost" on reload rather than mis-set.
+ *
+ * Both facts are a number and a short word, so they are kept here. The key is a
+ * hash of the summary: it is the one field that survives into the file and is
+ * unique per compaction. The summary text itself is NOT stored - it is already
+ * on disk, it runs to tens of kilobytes, and localStorage is small and shared
+ * with the drafts. */
+const COMPACT_FACT_MAX = 60;
+
+function summaryHash(s) {
+  const str = String(s || '');
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return `${h.toString(36)}.${str.length.toString(36)}`;
+}
+
+function compactionFactKey(sessionPath) {
+  return `piwebui-compact:${instanceKey()}:${String(sessionPath || 'none').slice(-120)}`;
+}
+
+/* Newest first wins, so an old record for the same summary cannot overwrite a
+ * newer one. */
+function loadCompactionFacts(sessionPath) {
+  const out = new Map();
+  let rows;
+  try { rows = JSON.parse(localStorage.getItem(compactionFactKey(sessionPath)) || '[]'); }
+  catch { return out; }
+  if (!Array.isArray(rows)) return out;
+  for (const r of rows) {
+    if (!r || typeof r.h !== 'string') continue;
+    if (!out.has(r.h)) out.set(r.h, r);
+  }
+  return out;
+}
+
+function saveCompactionFact(sessionPath, mark) {
+  if (!mark || !mark.summary) return;
+  const key = compactionFactKey(sessionPath);
+  let rows;
+  try { rows = JSON.parse(localStorage.getItem(key) || '[]'); } catch { rows = []; }
+  if (!Array.isArray(rows)) rows = [];
+  const h = summaryHash(mark.summary);
+  rows = rows.filter((r) => r && r.h !== h);
+  rows.unshift({
+    h,
+    a: mark.estimatedTokensAfter != null ? mark.estimatedTokensAfter : null,
+    r: mark.reason || null,
+    t: mark.at || Date.now(),
+  });
+  try { localStorage.setItem(key, JSON.stringify(rows.slice(0, COMPACT_FACT_MAX))); }
+  catch { /* quota or private mode: a nicety, not state */ }
+}
+
+/* A compaction mark belongs to one session. */
+function markSessionPath() { return (S.state && S.state.sessionFile) || ''; }
+function markBelongsTo(k, sessionPath) {
+  const a = (k && k.session) || '';
+  const b = sessionPath || '';
+  // An unsaved new session has no path on either side; keep them together
+  // rather than losing the marker, and let the summary dedupe handle the rest.
+  if (!a || !b) return !a && !b;
+  return sameSessionPath(a, b, S.sessionsList || []);
+}
+
 /* pi writes timestamps as ISO strings; every comparison below is numeric, and
  * Number("2026-09-20T...") is NaN - which is why every compaction marker landed
  * at the top of the transcript instead of where it happened. */
@@ -4163,9 +4271,25 @@ async function refreshMessages(prefetched) {
   }
   // Markers we watched happen in this page session, plus the ones already in
   // the file. Deduped by summary text so a watched compaction is not doubled.
-  const marks = [...S.compactionMarks];
+  //
+  // Only the marks belonging to THIS session, though. The list is the page's
+  // memory of compactions it saw, and it was replayed into every session opened
+  // afterwards - so session A's "conversation compacted" markers showed up in
+  // session B until a reload. That is issue #40, and the reload fixing it is the
+  // tell: a fresh page starts the list empty.
+  const renderSession = S.viewSession || (S.state && S.state.sessionFile) || '';
+  const facts = loadCompactionFacts(renderSession);
+  const marks = S.compactionMarks.filter((k) => markBelongsTo(k, renderSession)).map((k) => ({ ...k }));
   const markSeen = new Set(marks.map((k) => k.summary));
   for (const k of fileMarks) if (k.summary && !markSeen.has(k.summary)) marks.push(k);
+  // Put back the two facts pi never writes to the file (issue #47).
+  for (const k of marks) {
+    if (k.estimatedTokensAfter != null && k.reason) continue;
+    const f = k.summary ? facts.get(summaryHash(k.summary)) : null;
+    if (!f) continue;
+    if (k.estimatedTokensAfter == null && f.a != null) k.estimatedTokensAfter = f.a;
+    if (!k.reason && f.r) k.reason = f.r;
+  }
   for (const m of msgs) {
     if (m && m.timestamp != null && typeof m.timestamp !== 'number') {
       const n = Date.parse(m.timestamp);
@@ -4250,7 +4374,10 @@ async function refreshMessages(prefetched) {
       // In place, in order - a compaction marker belongs at the point in the
       // conversation where it happened, and it scrolls away with it. Pinning the
       // newest one to the bottom left a marker permanently on screen.
-      renderCompactionSummary(m);
+      // pi's version of this message carries the summary and tokensBefore and
+      // nothing else, so the rest is looked up from what we kept (issue #47).
+      const f = m.summary ? facts.get(summaryHash(m.summary)) : null;
+      renderCompactionSummary(m, f ? { estimatedTokensAfter: f.a, reason: f.r } : undefined);
     }
     // Stamp whatever node(s) this message produced, so a compaction marker can
     // be anchored to a point in time instead of a shifting position.
@@ -4391,7 +4518,7 @@ async function refreshMessages(prefetched) {
         if (!firstTs && ts) firstTs = ts;
         if (ts && at && ts <= at) target = n;
       }
-      const node = buildCompactionSummary(k, { count: marks.length });
+      const node = buildCompactionSummary(k, { count: marks.length, reason: k.reason });
       // Before the first rendered message only if it really is older than it;
       // otherwise it belongs after the newest content, not at the top.
       if (target) target.after(node);
@@ -4750,6 +4877,10 @@ function handleEvent(msg) {
       // The pre-compaction token count is now stale; show a dash until the
       // next LLM response reports a real post-compaction context size.
       setCtxRing(null);
+      // ...and drop the high-water marks with it, or the peak from before the
+      // compaction outlives the context it measured and clamps the next number
+      // back up to itself (issue #48).
+      resetCtxHighWater();
       if ($('ctx-label')) $('ctx-label').textContent = ctxLabel('compacting…', '–');
       // Live "compacting…" block with an elapsed timer, removed on compaction_end.
       if (!S.compactionLive) S.compactionLive = renderCompactionLive();
@@ -4778,14 +4909,27 @@ function handleEvent(msg) {
         // Remember it so refreshMessages() can put the marker back where it
         // happened instead of re-appending it to the bottom every turn.
         if (!S.compactionMarks.some((k) => k.summary === msg.result.summary)) {
-          S.compactionMarks.push({ ...msg.result, at: Date.now() });
+          const mark = { ...msg.result, reason: msg.reason || null, at: Date.now(), session: markSessionPath() };
+          S.compactionMarks.push(mark);
+          // estimatedTokensAfter and reason exist only on this event. pi computes
+          // them at the moment it compacts and writes neither to the session file,
+          // so they are kept aside for the reload (issue #47).
+          saveCompactionFact(mark.session, mark);
         }
         renderCompactionBlock(msg.result, msg.reason);
         S.compactionHappened = true;
         // willRetry=true (overflow) → pi retries the prompt itself. A manual
         // /compact never auto-continues (the user asked for it, task was done).
         // Only auto-compactions (threshold/overflow without retry) need a nudge.
-        if (!msg.willRetry && msg.reason !== 'manual') S.compactionNeedsContinue = true;
+        /* Only worth continuing if the compaction actually made room.
+         *
+         * A compaction that barely shrank the context overflows again on the very
+         * next request, so continuing straight into it is how the loop feeds
+         * itself - and pi's own guard against that (one compact-and-retry per
+         * turn) is reset by every new user message, which is exactly what the
+         * continue below sends. */
+        const useful = before == null || after == null || after < before * 0.9;
+        if (!msg.willRetry && msg.reason !== 'manual') S.compactionNeedsContinue = useful;
       } else {
         removeCompactionLive();
       }
@@ -4919,8 +5063,8 @@ function paintRunStat() {
   const live = !!S.runStartTs;
   const ms = live ? Date.now() - S.runStartTs : (S.runMs || 0);
   stat.classList.toggle('live', live);
-  if (!ms && !live) { stat.textContent = ''; stat.title = 'how long the task took'; return; }
-  stat.textContent = `total ${fmtElapsed(ms)}`;
+  if (!ms && !live) { setText(stat, ''); stat.title = 'how long the task took'; return; }
+  setText(stat, `total ${fmtElapsed(ms)}`);
   stat.title = live
     ? 'time since you sent your message — every turn, tool call and compaction counts'
     : 'how long the last task took, from your message to the agent’s last word';
@@ -5333,8 +5477,25 @@ function startToolCard(msg) {
 /* The ring right after a compaction: pi has no number yet, so show the estimate
  * the compaction reported instead of a dash. */
 function showCompactionEstimate(tokens) {
-  const win = (S.ctxStats && S.ctxStats.contextWindow) || (S.state && S.state.contextWindow) || null;
+  /* The window has to come from S.ctxWindow, and that is half of this fix.
+   *
+   * Every way into a compaction calls setCtxRing(null) first - compaction_start,
+   * and the /compact command handler - which nulls S.ctxStats. So the old lookup
+   * (S.ctxStats.contextWindow) was always null by the time this ran, the function
+   * returned without drawing anything, and the size the compaction itself
+   * reported was never shown. What stayed on screen was the ring's empty "–" or
+   * the number from before the compaction, which is issue #48: "right after
+   * compaction the counter stays the same".
+   *
+   * The other half is the high-water marks, which have to go with the context they
+   * describe (see resetCtxHighWater). Without that, the peak from before the
+   * compaction is read as a floor and this estimate is pushed back up to it.
+   *
+   * The previous second fallback, S.state.contextWindow, is not set anywhere in
+   * this file and never was, so it is gone rather than left looking like a net. */
+  const win = (S.ctxStats && S.ctxStats.contextWindow) || S.ctxWindow || null;
   if (!win) return;
+  resetCtxHighWater();
   setCtxRing({ tokens, contextWindow: win, percent: Math.max(0, Math.min(100, (tokens / win) * 100)) });
 }
 
@@ -5424,13 +5585,28 @@ function updateViewBanner() {
 function updateLiveDot() {
   const list = $('session-list');
   if (!list) return;
-  for (const item of list.querySelectorAll('.session-item.active')) {
-    item.classList.toggle('live', S.isStreaming);
+  /* The green dot marks the session the AGENT is running in, which is not always
+   * the row that is highlighted: switching away during a turn highlights the row
+   * you are reading and leaves the agent in its own session.
+   *
+   * This used to walk only the `.active` rows, toggle the dot on those, and never
+   * take it off a row that was no longer active. So each switch during a run left
+   * another green dot behind, and the session actually doing the work lost its
+   * own - issue #41, "both sessions indicate that it is active, stacks with each
+   * session change if the agent makes a new turn". Walking every row and deciding
+   * from S.state.sessionFile fixes both halves, and matches what a full
+   * renderSessions() rebuild already computes (`selfLive = isCurrent &&
+   * S.isStreaming`) - which is why refreshing used to clear them. */
+  const runsIn = (S.state && S.state.sessionFile) || '';
+  const sessions = S.sessionsList || [];
+  for (const item of list.querySelectorAll('.session-item')) {
+    const live = !!S.isStreaming && !!runsIn && sameSessionPath(item.dataset.path || '', runsIn, sessions);
+    item.classList.toggle('live', live);
     const nameRow = item.querySelector('.s-name');
     if (!nameRow) continue;
     const dot = nameRow.querySelector('.live-dot');
-    if (S.isStreaming && !dot) nameRow.prepend(el('span', 'live-dot', ''));
-    else if (!S.isStreaming && dot) dot.remove();
+    if (live && !dot) nameRow.prepend(el('span', 'live-dot', ''));
+    else if (!live && dot) dot.remove();
   }
 }
 
@@ -5457,7 +5633,7 @@ function flushCompactionQueue() {
   if (S.isStreaming || S.compacting) return; // wait until the agent is idle
   const next = S.compactionQueue.shift();
   startRunClock();   // a queued message from the user is a new task
-  sendPrompt(next.text, next.images);
+  sendPrompt(next.text, next.images, undefined, true);
   // The next agent_end/agent_settled will flush the rest of the queue.
 }
 
@@ -5465,12 +5641,31 @@ function flushCompactionQueue() {
  * (or manual) compaction it stops and waits for the next user message — even
  * when the task is clearly not done. Nudge it along automatically (once per
  * cooldown) so long tasks keep going. */
+/* How many compactions in a row may pull the task along by themselves before this
+ * gives up and says so. Reset by the next message the user sends. */
+const AUTO_CONTINUE_MAX = 3;
+
 function maybeAutoContinue() {
   if (SET.autoContinueAfterCompaction === false) return;
   if (S.isStreaming || S.compacting) return;
   const now = Date.now();
   if (now - S.lastAutoContinueAt < 120000) return; // don't chain-continue forever
+  /* "Don't chain-continue forever" is what the line above says, and it is not
+   * what it does: the cooldown bounds how OFTEN the loop turns, not whether it
+   * ends. If the context is still over the window after a compaction, the next
+   * request overflows, pi compacts again, this continues again - every two
+   * minutes, indefinitely. That is issue #38's "infinite cycle of context
+   * overflow ... it compacts every time even after compaction". pi caps its own
+   * recovery (one compact-and-retry per turn, _overflowRecoveryAttempted) and
+   * re-arms it on every new user message; a machine that keeps sending user
+   * messages keeps re-arming it. So the count is capped here as well, where the
+   * messages actually come from. */
+  if (S.autoContinueStreak >= AUTO_CONTINUE_MAX) {
+    toast(`Compaction has been needed ${S.autoContinueStreak} times in a row — stopping the automatic continuation. Send a message to carry on.`, 'warning');
+    return;
+  }
   S.lastAutoContinueAt = now;
+  S.autoContinueStreak++;
   toast('Compaction done — continuing the task…', 'info');
   // Deliberately not startRunClock(): this continues the task the user already
   // started, so its clock keeps running (compaction time included).
@@ -5620,10 +5815,13 @@ async function sendCurrent() {
     sendText = skillAwareCommand(text);
     if (sendText !== text) name = sendText.slice(1, sendText.indexOf(' ') > 0 ? sendText.indexOf(' ') : undefined).toLowerCase();
 
-    /* Anything this command reports opens the notifications panel (issue #5).
-     * The flag is cleared again in the finally, so a later background notice
-     * cannot open it by accident. */
-    S.noticesFromCommand = true;
+    /* Anything this command reports opens the notifications panel (issue #5),
+     * with one exception: /compact. Its outcome is already drawn inline as the
+     * "conversation compacted" marker and toasted, so throwing the panel open on
+     * top of that is noise rather than a service - issue #44. The flag is cleared
+     * again in the finally, so a later background notice cannot open it by
+     * accident. */
+    S.noticesFromCommand = name !== 'compact';
     try {
 
     // Client-local slash commands: executed by the UI, never sent to the agent.
@@ -5670,7 +5868,9 @@ async function sendCurrent() {
   }
 
   startRunClock();
-  sendPrompt(sendText, S.attachments.slice());
+  // A real message from the user restarts the budget of automatic continuations.
+  S.autoContinueStreak = 0;
+  sendPrompt(sendText, S.attachments.slice(), undefined, true);
   resetComposer();
 }
 
@@ -5690,6 +5890,7 @@ async function handleBuiltinCommand(name, arg) {
       S.compacting = true;
       toast('Compacting session…');
       setCtxRing(null);
+      resetCtxHighWater();
       if ($('ctx-label')) $('ctx-label').textContent = ctxLabel('compacting…', '–');
       // Compaction makes an LLM call and can take minutes — the old 120s RPC
       // timeout fired first and reported a false failure while the agent kept
@@ -5769,7 +5970,7 @@ async function handleBuiltinCommand(name, arg) {
   }
 }
 
-function sendPrompt(text, images, behavior) {
+function sendPrompt(text, images, behavior, fromComposer) {
   const all = images || [];
   const imgs = all.filter((a) => a.type === 'image');
   const files = all.filter((a) => a.type === 'file');
@@ -5791,16 +5992,32 @@ function sendPrompt(text, images, behavior) {
     cmd.images = imgs.map((a) => ({ type: 'image', data: a.data, mimeType: a.mimeType }));
   }
   if (S.isStreaming) cmd.streamingBehavior = behavior || 'steer';
-  rpc(cmd).catch((e) => toast(e.message, 'error'));
-  // Optimistic bubble; replaced by the authoritative history on the next agent_end.
+  /* The bubble is drawn at once, and kept only if the agent actually took the
+   * message.
+   *
+   * It used to be drawn unconditionally and left in the DOM whatever happened.
+   * Sending while the agent is busy with a compaction is the case that bites: pi
+   * rejects the prompt, a toast says so, and the row stays on screen looking
+   * delivered - until the next rebuild drops it, because it is not in the session
+   * file. That is issue #49, "after a manual compaction my message disappeared ...
+   * and after a reload I can see that it never even happened".
+   *
+   * Now the row is removed and the text goes back into the composer, so a message
+   * that was not sent is visibly not sent and cannot be lost. */
+  let row = null;
   if (text || all.length) {
     const content = [];
     for (const a of imgs) content.push({ type: 'image', data: a.data, mimeType: a.mimeType });
     if (msg) content.push({ type: 'text', text: msg });
-    renderUserMessage({ role: 'user', content: content.length ? content : msg, timestamp: Date.now(), __live: true });
+    row = renderUserMessage({ role: 'user', content: content.length ? content : msg, timestamp: Date.now(), __live: true });
     S.stickToBottom = true;
     scrollBottom(true);
   }
+  rpc(cmd).catch((e) => {
+    if (row && row.isConnected) row.remove();
+    if (fromComposer) restoreComposer(text, all);
+    toast(fromComposer ? `${e.message} — your message is back in the box` : e.message, 'error');
+  });
 }
 
 /* Send a bash command and stream its output into the card it belongs to.
@@ -5856,12 +6073,19 @@ function saveDraft() {
   try {
     if (!text && !(S.attachments || []).length) { localStorage.removeItem(key); return; }
     const attachments = (S.attachments || []).map((a) => {
-      // Small images travel inline (a pasted screenshot); anything else is kept by
-      // its path on this machine, which is all the agent needs.
-      const small = a.type === 'image' && typeof a.data === 'string' && a.data.length < 400000;
-      if (small) return { type: a.type, mimeType: a.mimeType, name: a.name, data: a.data };
+      /* An image has no path on disk - it IS its bytes - so the old fallthrough
+       * here stored `path: a.path` for anything too big to keep, which for an
+       * image is undefined. A reload then restored an attachment with no data,
+       * which drew nothing and, if it was sent, carried `data: undefined` to the
+       * agent. Only what can actually be restored is kept now. */
+      if (a.type === 'image') {
+        const keep = typeof a.data === 'string' && a.data.length < 400000;
+        return keep ? { type: 'image', mimeType: a.mimeType, name: a.name, data: a.data } : null;
+      }
+      // Non-images are kept by their path on this machine, which is all the agent
+      // needs to open them again.
       return { type: a.type, kind: a.kind, name: a.name, path: a.path, size: a.size, mimeType: a.mimeType, transcript: a.transcript };
-    });
+    }).filter(Boolean);
     localStorage.setItem(key, JSON.stringify({ text, attachments, at: Date.now() }));
   } catch { /* quota or private mode: a convenience, not state */ }
 }
@@ -5891,6 +6115,17 @@ function resetComposer() {
   updateEditBanner();
   syncComposerText();
   input.focus();
+}
+
+/* Put a message that failed to send back where it came from. The attachments
+ * are handed back as they were, so an uploaded picture does not have to be
+ * picked again, and the draft is saved so a reload does not lose it either. */
+function restoreComposer(text, attachments) {
+  if (text) input.value = text;
+  if (attachments && attachments.length) { S.attachments = attachments.slice(); renderAttachments(); }
+  autoSize();
+  syncComposerText();
+  saveDraft();
 }
 
 /* The ring around the typed text stays visible whenever the composer has
@@ -5967,7 +6202,7 @@ async function finishEdit(newText) {
     await refreshMessages();
     await ensureForkable();
     startRunClock();
-    sendPrompt(newText, S.attachments.slice());
+    sendPrompt(newText, S.attachments.slice(), undefined, true);
     resetComposer();
   } catch (e) {
     toast(`Fork failed: ${e.message}`, 'error');
@@ -5987,7 +6222,7 @@ function readAsDataUrl(file) {
 
 async function addImageFile(file) {
   if (!file.type.startsWith('image/')) { toast(`Not an image: ${file.name}`, 'warning'); return; }
-  const dataUrl = await readAsDataUrl(file);
+  const dataUrl = await shrinkImage(await readAsDataUrl(file), file.type);
   S.attachments.push({
     type: 'image',
     data: dataUrl.split(',')[1],
@@ -5995,6 +6230,56 @@ async function addImageFile(file) {
     name: file.name || 'pasted-image',
   });
   renderAttachments();
+}
+
+/* A picture straight off a phone camera is 3-12 MB, and everything downstream
+ * pays for it: the bytes cross this WebSocket as base64 (a third larger again),
+ * they are written into the session file, and the provider is asked to look at
+ * the whole thing on every turn it stays in the context.
+ *
+ * It is also the reason a photograph could not be kept in the composer draft -
+ * localStorage holds a few megabytes for everything the page keeps, and a phone
+ * picture on its own can exceed that. And when a provider rejects a request because
+ * of its byte size, its error reads like a context overflow, so a picture that is
+ * too big can start a compaction the picture itself can never be summarised out of:
+ * pi prices an image at a flat ~1200 tokens no matter how large it is, so the
+ * estimate looks small and the image stays in the kept window while each retry
+ * carries the same megabytes (issue #38).
+ *
+ * So anything larger than a sensible viewing size is re-encoded once, on attach.
+ * 2048px on the long edge loses nothing anyone can see here, and the base64 that
+ * has to travel, be stored and be read is a fraction of what it was. GIFs are left
+ * alone so they keep animating, and every failure path returns the original: this
+ * is an optimisation and must never be the reason a picture does not arrive. */
+const IMAGE_MAX_EDGE = 2048;
+const IMAGE_REENCODE_OVER = 300000;   // base64 characters, roughly 225 KB
+
+async function shrinkImage(dataUrl, mimeType) {
+  if (typeof dataUrl !== 'string' || dataUrl.length < IMAGE_REENCODE_OVER) return dataUrl;
+  if (/gif/i.test(mimeType || '')) return dataUrl;
+  try {
+    const bmp = await createImageBitmap(await (await fetch(dataUrl)).blob());
+    const longEdge = Math.max(bmp.width || 0, bmp.height || 0);
+    const scale = longEdge > 0 ? Math.min(1, IMAGE_MAX_EDGE / longEdge) : 1;
+    if (scale >= 1 && dataUrl.length < IMAGE_REENCODE_OVER * 3) { bmp.close(); return dataUrl; }
+    const w = Math.max(1, Math.round(bmp.width * scale));
+    const h = Math.max(1, Math.round(bmp.height * scale));
+    const cv = document.createElement('canvas');
+    cv.width = w;
+    cv.height = h;
+    cv.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    bmp.close();
+    // PNG for a screenshot (crisp text and flat colour), JPEG for a photograph.
+    const type = /png|webp/i.test(mimeType || '') ? 'image/png' : 'image/jpeg';
+    const blob = await new Promise((res) => cv.toBlob(res, type, 0.88));
+    if (!blob) return dataUrl;
+    const shrunk = await readAsDataUrl(blob);
+    // Keep it only if it is genuinely smaller - a photo stored as PNG can come
+    // back larger from the re-encode, and then the original is the better file.
+    return shrunk.length < dataUrl.length ? shrunk : dataUrl;
+  } catch {
+    return dataUrl;
+  }
 }
 
 /* File kind for non-image attachments. */
@@ -7298,9 +7583,46 @@ $('btn-new-folder').onclick = () => addFolderDialog();
  *     switch finished. Reported as "visually selects a different session".
  *     Every switch carries a generation now and a stale one applies nothing.
  */
-let switchGen = 0;
-let switchRunning = null;    // the generation currently being applied, or null
-let switchWanted = null;     // the newest target asked for while one was running
+let switchGen = 0;            // who owns the view; the newest click
+let switchSend = null;        // the in-flight agent-side switch loop, or null
+let switchWanted = null;      // the newest target asked for while a switch was in flight
+
+/* Move the agent into a session, one switch at a time, newest target wins.
+ *
+ * pi answers one request at a time, so several switches sent at once are several
+ * switches it works through in order - that is what made the bridge look dead in
+ * issue #34, and it is why only the newest target is sent: while one is in
+ * flight the target is replaced rather than queued.
+ *
+ * The waiting is deliberately confined to this one call. Every earlier version
+ * of the guard around it (switchRunning / switchWanted) parked the whole switch,
+ * so a second click did not even move the highlight or start reading its file
+ * until the first switch had finished everything - "switching sessions while one
+ * is loading won't stop the first one so you have to wait for the first one to
+ * finish", issue #39. Bumping the generation is what stops the first one; this
+ * function only serialises the part that has to be serialised. */
+function requestAgentSwitch(target) {
+  switchWanted = target;
+  if (!switchSend) {
+    switchSend = (async () => {
+      try {
+        while (switchWanted) {
+          const next = switchWanted;
+          switchWanted = null;
+          try {
+            await rpc({ type: 'switch_session', sessionPath: next });
+          } catch (err) {
+            // A newer click has replaced this target, so this refusal is about a
+            // session nobody is waiting for any more - carry on to the newest.
+            if (switchWanted && switchWanted !== next) continue;
+            throw err;
+          }
+        }
+      } finally { switchSend = null; }
+    })();
+  }
+  return switchSend;
+}
 
 async function switchToSession(sessionPath) {
   const agentSession = S.state.sessionFile;
@@ -7328,7 +7650,14 @@ async function switchToSession(sessionPath) {
     }
     S.viewSubagent = null;
     S.viewSession = sessionPath;
-    await renderSessionFromDisk(sessionPath);
+    /* The same supersede rule as the idle path below: this click owns the view,
+     * and the read it is about to start must bail out if another click takes
+     * over. Without it two quick switches each fetched, each cleared the chat and
+     * each painted, so the earlier one could finish last and win - and there was
+     * no guard at all on this branch (issue #39). */
+    const gen = ++switchGen;
+    await renderSessionFromDisk(sessionPath, gen);
+    if (switchGen !== gen) return;
     updateSubagentsBtn();
     updateViewBanner();
     syncSessionHighlight();
@@ -7336,17 +7665,14 @@ async function switchToSession(sessionPath) {
   }
   // Agent is idle: move it to the selected session so input works there.
 
-  /* A switch is already running, so this click is one of several.
+  /* Take the view for this click.
    *
-   * It is remembered rather than performed: the view and the agent would both be
-   * moved to a session the next click is about to leave. Only the last target is
-   * run, when the one in flight finishes. */
-  if (switchRunning !== null) {
-    switchWanted = sessionPath;
-    return;
-  }
+   * Whatever was switching before is superseded from here on: its `superseded()`
+   * checks stop it drawing anything more, its transcript read is aborted by the
+   * refreshMessages() below (that one already aborted the previous read), and the
+   * generation it passes to initSession makes it skip applyState. The click is
+   * answered now rather than after the previous switch finished - issue #39. */
   const gen = ++switchGen;
-  switchRunning = gen;
   const superseded = () => switchGen !== gen;
   try {
     /* Start reading the target file *now*, alongside the switch.
@@ -7410,7 +7736,7 @@ async function switchToSession(sessionPath) {
      * it refuses, the error is reported and the view is put back. */
     toast(`Switching to “${String(sessionPath).split(/[\\/]/).pop().replace(/\.jsonl$/, '').slice(0, 48)}”`);
     try {
-      await rpc({ type: 'switch_session', sessionPath });
+      await requestAgentSwitch(sessionPath);
     } catch (err) {
       // A newer switch has taken over: this failure is about a session the user
       // has already left, and undoing the guess would undo theirs.
@@ -7420,7 +7746,7 @@ async function switchToSession(sessionPath) {
       throw err;
     }
     // Do not apply state from a switch that has been overtaken - that is the
-    // wrong-row highlight (see the note above switchRunning).
+    // wrong-row highlight (see the note above requestAgentSwitch).
     if (superseded()) return;
     await initSession(false, prefetch, drawn, gen);
   } catch (e) {
@@ -7460,25 +7786,18 @@ async function switchToSession(sessionPath) {
       return;
     }
     toast(`Switch failed: ${e.message}`, 'error');
-  } finally {
-    if (switchRunning === gen) switchRunning = null;
-    /* Run whatever was asked for while this was running.
-     *
-     * The clicks between were dropped on purpose, so the only target left to
-     * honour is the newest one - and only if it is somewhere else, since a
-     * double-click on the same row should not switch twice. */
-    const next = switchWanted;
-    switchWanted = null;
-    if (next && next !== sessionPath) {
-      switchToSession(next).catch(() => { /* reported by that call */ });
-    }
   }
 }
 
 // Read-only render of another session's transcript straight from its file.
-async function renderSessionFromDisk(sessionPath) {
+async function renderSessionFromDisk(sessionPath, gen) {
+  // Nothing here touches the DOM until the file has arrived, and by then the
+  // click that asked for it may have been replaced - in which case this read is
+  // stale and must not clear the chat the new one is drawing into.
+  const superseded = () => gen !== undefined && switchGen !== gen;
   try {
     const d = await fetchSession(sessionPath);
+    if (superseded()) return;
     const msgs = d.messages;
     const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
     chat.innerHTML = '';
@@ -7979,8 +8298,9 @@ function openSettings() {
   $('set-bg-url').value = SET.themeBg && !SET.themeBg.startsWith('data:') && !SET.themeBg.startsWith('/api/bg-file') ? SET.themeBg : '';
   $('set-tts-rate').value = SET.ttsRate;
   $('set-tts-rate-val').textContent = Number(SET.ttsRate).toFixed(2);
-  // System font list for the searchable font picker (loaded async).
-  loadSystemFonts();
+  // The system font list is NOT loaded here. It is 295 options in a hidden
+  // panel, it has no reason to be in the dialog layout, and it belongs to the
+  // font box - loadSystemFonts() is wired to that box instead.
   $('set-font-size').value = Number(SET.chatFontSize) || 14;
   $('set-font-size-val').textContent = `${Number(SET.chatFontSize) || 14}px`;
   $('set-chat-opacity').value = SET.chatOpacity == null ? 100 : Number(SET.chatOpacity);
@@ -8036,6 +8356,7 @@ function openSettings() {
   populateTtsVoiceSelect();
   loadPiProviders();
   loadAuthProviders();
+  loadExtensionsTab();
   prettifySettingsSelects();
   $('settings-dialog').showModal();
 }
@@ -8924,17 +9245,43 @@ function saveCrop() {
  * (Windows font registry) and offer them in a datalist under the font input.
  * Preset names (System/Monospace/Serif/Rounded) stay available too. */
 let systemFontsLoaded = false;
-async function loadSystemFonts() {
+let systemFontsLoading = null;
+
+/* The system font list is built when the font box is actually used, not when the
+ * settings dialog opens.
+ *
+ * It is 295 options on this machine, they live in a hidden panel, and nothing can
+ * see them until the font picker drops down - but they were built on the first
+ * settings open, into a dialog that was being laid out at that moment. The fetch
+ * behind it answers in 130 ms warm and 347 ms cold here, and every one of those
+ * options then takes part in the dialog layout.
+ *
+ * This is not claimed to be the whole of issue #45 - the profile attached to that
+ * issue shows openSettings() itself at 285 ms, which I could not reproduce with a
+ * fresh browser profile. It is the one measurable piece of work in the open path
+ * with no reason to be there. See verify/probe-settings-open.js. */
+function loadSystemFonts() {
   const list = $('font-list');
-  if (!list) return;
-  if (systemFontsLoaded) return;
-  try {
-    const d = await (await fetch(api('/api/system-fonts'))).json();
-    const fonts = d.fonts || [];
-    list.innerHTML = '';
-    for (const f of fonts) list.appendChild(el('option', null, f));
-    systemFontsLoaded = true;
-  } catch { /* bridge may be old — picker still works with presets */ }
+  if (!list) return Promise.resolve();
+  if (systemFontsLoaded) return Promise.resolve();
+  if (systemFontsLoading) return systemFontsLoading;
+  systemFontsLoading = (async () => {
+    try {
+      const d = await (await fetch(api('/api/system-fonts'))).json();
+      const fonts = d.fonts || [];
+      list.innerHTML = '';
+      for (const f of fonts) list.appendChild(el('option', null, f));
+      systemFontsLoaded = true;
+    } catch { /* bridge may be old - picker still works with presets */ }
+    finally { systemFontsLoading = null; }
+  })();
+  return systemFontsLoading;
+}
+
+/* Build it the moment the font box is focused or typed in, so it is there by the
+ * time the picker drops down - and never before then. */
+for (const ev of ['focus', 'input', 'pointerdown']) {
+  $('set-font').addEventListener(ev, () => { loadSystemFonts(); }, { passive: true });
 }
 
 function applyFontChoice(value) {
@@ -9463,6 +9810,195 @@ $('setup-done').onclick = async () => {
 };
 
 /* ───────────────────────── pi providers (models.json) ───────────────────────── */
+
+
+/* ── the Extensions tab (issue #46) ──────────────────────────────────────
+ *
+ * Lists what pi will actually load - loose extensions, skills, the packages in
+ * settings.json, and AGENTS.md - and switches or removes them through the bridge,
+ * which writes pi's own +path/-path entries under ~/.pi/agent.
+ *
+ * Every action goes through postExt() and every one is followed by a reload of the
+ * list, so what is on screen is what the file says rather than what was asked for.
+ * A change only takes effect in the running agent after a reload, and the panel
+ * says so rather than pretending it is live. */
+async function postExt(path, payload) {
+  const r = await fetch(api(path), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  let d = {};
+  try { d = await r.json(); } catch { /* no body */ }
+  if (!r.ok) throw new Error(d.error || `request failed (${r.status})`);
+  return d;
+}
+
+function extRow(kind, r, reload) {
+  const row = el('div', 'prov-row');
+  const info = el('div', 'prov-info');
+  const name = el('div', 'prov-id', r.name);
+  if (!r.enabled) name.classList.add('ext-off');
+  info.appendChild(name);
+  const bits = [r.kind === 'dir' ? 'directory' : 'file', r.source];
+  if (r.size != null) bits.push(`${Math.max(1, Math.round(r.size / 1024))} KB`);
+  bits.push(r.enabled ? 'enabled' : 'disabled');
+  info.appendChild(el('div', 'prov-meta', bits.join(' · ')));
+  row.appendChild(info);
+
+  const toggle = el('button', 'btn small' + (r.enabled ? '' : ' primary'), r.enabled ? 'disable' : 'enable');
+  toggle.title = r.enabled
+    ? `Write "-${r.rel}" into settings.json so pi stops loading it`
+    : `Write "+${r.rel}" into settings.json so pi loads it again`;
+  toggle.onclick = async () => {
+    toggle.disabled = true;
+    try {
+      await postExt('/api/pi-extensions/toggle', { type: kind, name: r.name, enabled: !r.enabled });
+      toast(`${r.name} ${r.enabled ? 'disabled' : 'enabled'} — reload the agent to apply it`);
+      await reload();
+    } catch (e) { toast(e.message, 'error'); } finally { toggle.disabled = false; }
+  };
+
+  if (r.source === 'local') {
+    const del = el('button', 'btn small', 'uninstall');
+    del.title = `Delete ${r.name} from disk. Only loose files under the agent dir can be removed here.`;
+    del.onclick = async () => {
+      if (!confirm(`Delete ${r.name} from disk?\n\nThis removes the file itself, not just the setting. It cannot be undone from here.`)) return;
+      del.disabled = true;
+      try {
+        const d = await postExt('/api/pi-extensions/delete', { type: kind, name: r.name });
+        toast(`Removed ${d.removed}`);
+        await reload();
+      } catch (e) { toast(e.message, 'error'); } finally { del.disabled = false; }
+    };
+    row.appendChild(toggle);
+    row.appendChild(del);
+  } else {
+    row.appendChild(toggle);
+  }
+  return row;
+}
+
+async function loadExtensionsTab() {
+  const extBox = $('ext-extensions');
+  const skillBox = $('ext-skills');
+  const pkgBox = $('ext-packages');
+  if (!extBox || !skillBox) return;
+  const reload = () => loadExtensionsTab();
+  for (const box of [extBox, skillBox, pkgBox]) {
+    box.innerHTML = '';
+    box.appendChild(el('div', 'prov-empty', 'loading…'));
+  }
+  let d;
+  try {
+    d = await fetch(api('/api/pi-extensions')).then((r) => r.json());
+  } catch (e) {
+    for (const box of [extBox, skillBox, pkgBox]) { box.innerHTML = ''; box.appendChild(el('div', 'prov-empty', e.message)); }
+    return;
+  }
+  if (d.error) {
+    for (const box of [extBox, skillBox, pkgBox]) { box.innerHTML = ''; box.appendChild(el('div', 'prov-empty', d.error)); }
+    return;
+  }
+  $('ext-agent-dir').textContent = d.agentDir || '~/.pi/agent';
+  $('ext-settings-file').textContent = d.settingsFile ? String(d.settingsFile).split(/[\\/]/).pop() : 'settings.json';
+  $('ext-ext-count').textContent = d.counts.extensions ? `${d.counts.extensions}` : '';
+  $('ext-skill-count').textContent = d.counts.skills ? `${d.counts.skills}` : '';
+  $('ext-pkg-count').textContent = d.counts.packages ? `${d.counts.packages}` : '';
+
+  extBox.innerHTML = '';
+  if (!d.extensions.length) {
+    extBox.appendChild(el('div', 'prov-empty', 'nothing in ' + (d.agentDir || '') + '/extensions'));
+  } else {
+    for (const r of d.extensions) extBox.appendChild(extRow('extensions', r, reload));
+  }
+
+  skillBox.innerHTML = '';
+  if (!d.skills.length) {
+    skillBox.appendChild(el('div', 'prov-empty', 'no skill folders (a skill is a directory holding SKILL.md)'));
+  } else {
+    for (const r of d.skills) skillBox.appendChild(extRow('skills', r, reload));
+  }
+
+  pkgBox.innerHTML = '';
+  if (!d.packages.length) {
+    pkgBox.appendChild(el('div', 'prov-empty', 'no packages listed in settings.json'));
+  } else {
+    for (const p of d.packages) {
+      const row = el('div', 'prov-row');
+      const info = el('div', 'prov-info');
+      info.appendChild(el('div', 'prov-id', p.source));
+      const meta = [p.form === 'object' ? 'object form' : 'string form'];
+      if (p.filters) {
+        for (const [k, v] of Object.entries(p.filters)) meta.push(`${k}: ${Array.isArray(v) ? v.join(', ') : String(v)}`);
+      }
+      info.appendChild(el('div', 'prov-meta', meta.join(' · ')));
+      const del = el('button', 'btn small', 'remove');
+      del.title = 'Take this entry out of settings.json. The files it installed under ~/.pi stay where they are.';
+      del.onclick = async () => {
+        if (!confirm(`Remove ${p.source} from settings.json?\n\nThis only edits the list. Anything it installed under ~/.pi/agent stays on disk.`)) return;
+        del.disabled = true;
+        try {
+          await postExt('/api/pi-extensions/package', { action: 'remove', source: p.source });
+          toast(`Removed ${p.source} from the package list — reload the agent to apply it`);
+          await reload();
+        } catch (e) { toast(e.message, 'error'); } finally { del.disabled = false; }
+      };
+      row.append(info, del);
+      pkgBox.appendChild(row);
+    }
+  }
+
+  // AGENTS.md: the global file is editable, the project ones are shown as they are.
+  const list = $('ext-agents-list');
+  const box = $('ext-agents-text');
+  list.innerHTML = '';
+  try {
+    const a = await fetch(api('/api/pi-agents')).then((r) => r.json());
+    for (const f of a.files || []) {
+      const row = el('div', 'prov-row');
+      const info = el('div', 'prov-info');
+      info.appendChild(el('div', 'prov-id', f.writable ? 'global — editable here' : f.scope));
+      info.appendChild(el('div', 'prov-meta', f.exists ? `${f.path} · ${f.bytes} bytes${f.truncated ? ' (shown in part)' : ''}` : `${f.path} · does not exist yet`));
+      row.appendChild(info);
+      list.appendChild(row);
+    }
+    const g = (a.files || []).find((f) => f.writable);
+    box.value = (g && g.content) || '';
+    box.placeholder = (g && g.exists) ? '' : '# Instructions for the agent (AGENTS.md is created by saving this box)';
+  } catch (e) {
+    list.appendChild(el('div', 'prov-empty', e.message));
+  }
+}
+
+if ($('btn-ext-pkg-add')) {
+  $('btn-ext-pkg-add').onclick = async () => {
+    const input = $('ext-pkg-source');
+    const source = (input.value || '').trim();
+    if (!source) return;
+    if (source.startsWith('-')) { toast('A package source cannot start with "-"', 'warning'); return; }
+    $('btn-ext-pkg-add').disabled = true;
+    try {
+      const d = await postExt('/api/pi-extensions/package', { action: 'add', source });
+      toast(d.note || `Added ${source}`);
+      input.value = '';
+      await loadExtensionsTab();
+    } catch (e) { toast(e.message, 'error'); } finally { $('btn-ext-pkg-add').disabled = false; }
+  };
+}
+
+if ($('btn-ext-agents-save')) {
+  $('btn-ext-agents-save').onclick = async () => {
+    const content = $('ext-agents-text').value;
+    if (content.trim() === '' && !confirm('Save an empty AGENTS.md?\n\nAn empty box deletes the global AGENTS.md.')) return;
+    $('btn-ext-agents-save').disabled = true;
+    try {
+      const d = await postExt('/api/pi-agents', { content });
+      toast(d.bytes ? `Saved AGENTS.md (${d.bytes} bytes) — reload the agent to apply it` : 'Global AGENTS.md deleted');
+      await loadExtensionsTab();
+    } catch (e) { toast(e.message, 'error'); } finally { $('btn-ext-agents-save').disabled = false; }
+  };
+}
 
 async function loadPiProviders() {
   const list = $('pi-providers-list');

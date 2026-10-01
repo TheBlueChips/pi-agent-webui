@@ -37,7 +37,7 @@ A single `pi --mode rpc` subprocess is shared by every connected client; every p
 | **History fills in upward and the reader stays at the bottom** | A long session is drawn newest-first, so it should grow *upward* and leave the newest message - the one being read - where it is. But each batch was inserted above without re-pinning, so the reader was left looking at the same part of the document while it grew beneath them: the transcript appeared to fill in from the top downwards, which reads as the page still loading. Every batch re-pins now, and the view is pinned once more when the history completes, which also cleared a twenty-odd pixel gap under the newest message that `restoreReading` left a frame later. A reader who has deliberately scrolled up is left alone. |
 | **The sidebar and the confirmation answer the click at once** | Two things held them back, and the second was found only after fixing the first. The highlight and the "Session switched" toast waited for `initSession`, which is eleven refreshes deep - models, levels, commands, the session list, the stats, the transcript. Moving them ahead of that was not enough: they were still behind `switch_session`, which costs pi a second and a half on a long session, so the sidebar sat showing the old session as active and the toast arrived a second and a half later, both trailing a transcript that had already drawn. Neither depends on the agent at all - the path is already set and the view is already drawn from the file - so both now fire on the click, **1689 ms → 0 ms**. The highlight also stopped rebuilding the whole sidebar to move one class: `syncSessionHighlight` threw every row, folder and fork arrow away and built them again, which on a few dozen sessions is the difference between the highlight arriving with the click and arriving a beat later. It walks the rows and moves the class now, using the same rule `renderSessions` uses, so the two cannot disagree about where the blue edge is. |
 | **The queue sits with the composer** | What you have queued to send was the first thing in the dock, which put it above the status and widget lines *and* the composer and the stats row - a row about your own messages parked at the far end of everything else. It now sits directly above the box you queue it in. |
-| **A session switch does the cheap things first** | Switching a session was a chain of eleven awaits, in a row: the fork list, the model list, the levels, the commands, the session list, the stats, and the transcript somewhere in the middle. On a long session that was **3.5 seconds**, of which 1.9 was `refreshForkable` — a right-click feature that shows nothing until you right-click a message — sitting in front of the transcript, and half a second more was waiting for the agent to move into the session before it would even start reading the file it was about to read anyway. The fork list now runs alongside the transcript and is shared rather than fetched twice; everything independent of the transcript runs in parallel; and the file read starts *while* the agent is being switched, because the file is on disk and does not wait for anything. Measured on this machine: the page answers in 20 ms, the transcript request starts at 3 ms, the file is down at 55 ms, the newest messages are readable at ~500 ms and the whole transcript is in place at ~1.1 s. |
+| **A session switch does the cheap things first** | Switching a session was a chain of eleven awaits, in a row: the fork list, the model list, the levels, the commands, the session list, the stats, and the transcript somewhere in the middle. On a long session that was **3.5 seconds**, of which 1.9 was `refreshForkable` — a right-click feature that shows nothing until you right-click a message — sitting in front of the transcript, and half a second more was waiting for the agent to move into the session before it would even start reading the file it was about to read anyway. The fork list now runs alongside the transcript and is shared rather than fetched twice; everything independent of the transcript runs in parallel; and the file read starts *while* the agent is being switched, because the file is on disk and does not wait for anything. Measured: the page answers in 20 ms, the transcript request starts at 3 ms, the file is down at 55 ms, the newest messages are readable at ~500 ms and the whole transcript is in place at ~1.1 s. |
 | **Switching sessions is immediate** | Every load of the transcript takes a number, and a load that is superseded stops at its next yield instead of carrying on. Previously two renders interleaved and fought over the same element, so the session you asked for lost the race against the one you were leaving and you had to wait for it. The request itself is cancelled too, so a session you switched away from stops pulling bytes — and a cancelled load is not reported as an error, because "you asked for something else" is not a failure. |
 | **Sending a message does not rebuild the conversation** | The end of a turn re-read the whole session file and rebuilt every message from scratch, which on a long session is the transcript jumping up and then slowly coming back down. It now only re-reads when the turn was genuinely never finalised (the case the re-read exists for); an ordinary turn leaves the DOM alone. |
 | **Jump to the top** | A round ↑ above the composer, on the right, that appears as soon as you are far enough from the top for it to be worth having and disappears again when you get there. It lands on message 1, not on "near the top" — and if a render is still in flight it waits for it, because the rows that arrive after the scroll would otherwise push the top away again. |
@@ -77,7 +77,7 @@ Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-
 
 ## Run it
 
-> This machine runs Forgejo on port 3000, so the WebUI uses **http://localhost:3080**.
+> The WebUI uses **http://localhost:3080**.
 
 There are three ways in: the **browser UI** (`start-webui.bat`), the same UI in **its own window** with no build step (`start-app-window.bat`, Edge/Chrome app mode), or the **native Windows app** (`start-app.bat`, source in `pi-desktop/`).
 
@@ -87,20 +87,21 @@ The first time you open the UI it asks a handful of things worth deciding up fro
 
 `start-webui.bat` asks once whether your pi agent runs natively on Windows or in a Docker container, and (for Docker) lists your containers so you pick the right one — no name hardcoded. The answer is saved to `bridge/agent-source.txt` and reused afterwards. Run `switch_pi_agent_source.bat` at any time to erase that choice and pick again.
 
-### Your setup: attach to the existing pi agent container (recommended)
+### Attaching to a pi agent that already runs in a container (recommended)
 
-Your pi agent lives in the `heuristic_varahamihira` container (image `buildadatacenter`, pi home in the `pi-agent-datacenter-home` volume, workspace `C:\Users\dambi\Downloads\projects\ai\build_a_datacenter`). pi's RPC protocol is stdio-only — it cannot be reached over the network — so the bridge attaches to that exact container with `docker exec -i`:
+If your pi agent already lives in a Docker container, point the bridge at that instead of installing pi twice. pi's RPC protocol is stdio-only — it cannot be reached over the network — so the bridge attaches with `docker exec -i`:
 
 ```powershell
-start-webui.bat        # or manually:
+start-webui.bat        # asks once and remembers the answer, or manually:
 cd bridge
-set PI_COMMAND=docker exec -i heuristic_varahamihira pi --mode rpc
-set PI_SESSION_DIR=docker:heuristic_varahamihira:/root/.pi/agent/sessions
+set PI_COMMAND=docker exec -i <your-pi-container> pi --mode rpc
+set PI_SESSION_DIR=docker:<your-pi-container>:/root/.pi/agent/sessions
 set PORT=3080
 npm install && npm start
 ```
 
-The agent keeps everything (model config, API endpoints, extensions, MCP servers, sessions) inside its own container — the bridge only shuttles JSON. Session listing, switching, and forking work against the container's `~/.pi/agent/sessions` via the `docker:<container>:<path>` form of `PI_SESSION_DIR`. Extension commands (`/subagents`, `/mcp`, `/council`, …) and extension UI events (MCP status bar, widgets, dialogs) come straight from your agent. Requires the container to be running: `docker start heuristic_varahamihira`.
+Replace `<your-pi-container>` with the container your agent runs in (`docker ps` lists them, and `start-webui.bat` offers the list on first run). The agent keeps everything (model config, API endpoints, extensions, MCP servers, sessions) inside its own container — the bridge only shuttles JSON. Session listing, switching, and forking work against the container's `~/.pi/agent/sessions` via the `docker:<container>:<path>` form of `PI_SESSION_DIR`. Extension commands (`/subagents`, `/mcp`, `/council`, …) and extension UI events (MCP status bar, widgets, dialogs) come straight from your agent. The container has to be running: `docker start <your-pi-container>`.
+
 
 ### Alternative: dedicated container with pi bundled
 

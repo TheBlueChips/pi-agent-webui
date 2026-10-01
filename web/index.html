@@ -313,6 +313,7 @@
     <button class="tab" data-tab="appearance">Appearance</button>
     <button class="tab" data-tab="shorts">Shorts</button>
     <button class="tab" data-tab="providers">Pi providers</button>
+    <button class="tab" data-tab="extensions">Extensions</button>
   </div>
 
   <div class="tab-panel" id="tab-general">
@@ -583,6 +584,60 @@
       <div id="auth-logged-in" class="prov-list auth-logged-in"></div>
       <p class="hint">Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
     </div>
+  </div>
+
+  <!-- Extensions / Skills / Packages / AGENTS.md (issue #46). Everything here
+       reads and writes under ~/.pi/agent, and enable/disable writes pi's own
+       +path/-path entries in settings.json rather than a second mechanism of our
+       own. There is no install button on purpose - see the note at the end. -->
+  <div class="tab-panel hidden" id="tab-extensions">
+    <p class="hint" style="margin-top:2px">
+      From <code id="ext-agent-dir">~/.pi/agent</code>. Disabling writes
+      <code>+path</code>/<code>-path</code> into <code id="ext-settings-file">settings.json</code> — pi's own
+      setting, so pi and this tab always agree. Press <b>reload agent</b> after a change to apply it.
+    </p>
+
+    <div class="prov-section">
+      <h4 class="ext-head">Extensions <span class="ext-count" id="ext-ext-count"></span></h4>
+      <div id="ext-extensions" class="prov-list"></div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">Skills <span class="ext-count" id="ext-skill-count"></span></h4>
+      <div id="ext-skills" class="prov-list"></div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">Packages <span class="ext-count" id="ext-pkg-count"></span></h4>
+      <p class="hint" style="margin:2px 0 6px">Entries in <code>settings.json</code> → <code>packages</code>. Removing one is
+        immediate; adding one only lists it — pi fetches it the next time it starts.</p>
+      <div id="ext-packages" class="prov-list"></div>
+      <div class="rate-row prov-actions">
+        <input id="ext-pkg-source" type="text" placeholder="npm:pi-something  ·  git:host/user/repo" autocomplete="off" spellcheck="false" style="flex:1">
+        <button id="btn-ext-pkg-add" class="btn small">add to list</button>
+      </div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">AGENTS.md</h4>
+      <p class="hint" style="margin:2px 0 6px">
+        The global file is <code>&lt;agent dir&gt;/AGENTS.md</code> and is editable here. The per-project files
+        are shown for reference only — they live at whatever paths the project uses, and writing one would
+        be a write anywhere on disk. Saving an empty box deletes the global file.
+      </p>
+      <div id="ext-agents-list" class="prov-list"></div>
+      <textarea id="ext-agents-text" rows="10" spellcheck="false" placeholder="# Instructions for the agent&#10;"></textarea>
+      <div class="rate-row prov-actions">
+        <button id="btn-ext-agents-save" class="btn small primary">save global AGENTS.md</button>
+      </div>
+    </div>
+
+    <p class="hint" style="margin-top:10px; border-top:1px solid var(--border); padding-top:8px">
+      <b>No install button, on purpose.</b> An extension is code the agent loads and runs. This bridge
+      has no password — only a check that the request came from this page rather than another origin —
+      so &quot;install&quot; here would mean &quot;run my code on that machine&quot; for anyone who can reach the port.
+      Install from a pi terminal with <code>pi install …</code>, then press reload agent.
+    </p>
   </div>
   <div class="dialog-buttons">
     <button id="settings-close" class="btn primary">Done</button>

@@ -7,7 +7,7 @@
 
 /* The default host.
  *
- * Previously a hardcoded LAN address ('192.168.1.39'), which was wrong on every
+ * Previously a hardcoded LAN address, which was wrong on every
  * machine but one and on every network but that one: change the router, get a
  * new address, or run this on a laptop on Wi-Fi at the office, and the app
  * pointed at a stranger's machine and refused to connect. There is also no way
