@@ -66,3 +66,10 @@ project.nuget.cache
 packages.lock.json
 *.nuget.g.props
 *.nuget.g.targets
+
+# Metro scratch the RN build leaves behind next to the project
+pi-desktop/.bundle/
+
+# MSBuild binary logs from local builds
+pi-desktop/windows/*.binlog
+pi-desktop/windows/**/*.binlog
