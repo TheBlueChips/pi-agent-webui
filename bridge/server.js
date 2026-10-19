@@ -6,41 +6,149 @@
  * Also serves the static WebUI and a small HTTP API for session discovery.
  *
  * Env vars:
- *   PORT           HTTP/WS port                (default 3000)
+ *   PORT           HTTP/WS port                (default 3080)
  *   PI_COMMAND     agent command line          (default "pi --mode rpc")
  *                  e.g. "node mock_agent.js" for testing without a real pi install
  *   WORKSPACE_DIR  cwd for the agent process   (default cwd, /workspace in Docker)
  *   PI_SESSION_DIR session dir for listing     (default ~/.pi/agent/sessions)
+ *   PI_WEBUI_HOST  bind address                (default: bridge/lan.json, then 127.0.0.1)
  */
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const zlib = require('zlib');   // streaming gzip for the session transcript response
+/* Shared JSON reply. It only needs the response, so it lives at module scope
+ * now that the route modules use it too (issue #54). */
+function jsonOut(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+const { StringDecoder } = require('string_decoder');
 const { spawn, execFile, execSync } = require('child_process');
 const { pathToFileURL } = require('url');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, WebSocket } = require('ws');
 const { startWhisper, stopWhisper, whisperStatus, WHISPER_MODELS, DEFAULT_MODEL } = require('./whisper_boot');
+const agentSource = require('./agent-source');
 
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = parseInt(process.env.PORT || '3080', 10);
 // Localhost by default. The agent behind this bridge runs commands on this
 // machine and there is no authentication, so exposing the bridge to the LAN is
-// an explicit decision (PI_WEBUI_HOST=0.0.0.0), not the default.
-const HOST = process.env.PI_WEBUI_HOST || '127.0.0.1';
-const PI_COMMAND = process.env.PI_COMMAND || 'pi --mode rpc';
+// an explicit decision, not the default. It is made in bridge/lan.json next to
+// the bridge code: { "lan": true } binds every interface, { "host": "192.168.x.y" }
+// binds one specific one. The PI_WEBUI_HOST env var still wins over the file
+// (it is the explicit override for scripts and Docker).
+const LAN_CONFIG_FILE = process.env.PI_WEBUI_LAN || path.join(__dirname, 'lan.json');
+
+function lanHostFromConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(LAN_CONFIG_FILE, 'utf8'));
+    if (typeof cfg.host === 'string' && cfg.host.trim()) return cfg.host.trim();
+    if (cfg.lan === true) return '0.0.0.0';
+  } catch { /* no file or bad JSON: stay local */ }
+  return null;
+}
+
+// The address another device on the network should type in.
+function lanUrl(port) {
+  const ip = lanAddress();
+  return ip ? `http://${ip}:${port}` : null;
+}
+
+// Move the listening socket between localhost and the network without a restart.
+// Existing connections are dropped on purpose: they were opened on the old
+// address, and the page reconnects on its own.
+let rebinding = false;
+let rebindTarget = null;
+// Where the socket is bound right now. Comparing against HOST (the value from the
+// environment at startup) made switching back to localhost a no-op: HOST was
+// still 127.0.0.1 while the server was actually on 0.0.0.0.
+let boundHost = null;   // set right after HOST is defined
+
+/* Move the listening socket to another address. A request that arrives while a
+ * move is already running is remembered and applied straight after it, never
+ * dropped: flipping the switch twice in quick succession used to lose the second
+ * flip (the config file said "off" while the socket was still on the network),
+ * which is the other half of "sometimes I have to click twice". */
+function rebind(host) {
+  rebindTarget = host;
+  if (rebinding) return;
+  rebinding = true;
+  const step = () => {
+    const target = rebindTarget;
+    rebindTarget = null;
+    if (target == null) { rebinding = false; return; }
+    if (target === boundHost) { step(); return; }
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      server.listen(PORT, target, () => { bindNow(target); step(); });
+    };
+    try { if (server.closeAllConnections) server.closeAllConnections(); } catch { /* older node */ }
+    server.close(() => done());
+    // A socket that refuses to close must not wedge the queue.
+    setTimeout(done, 2000);
+  };
+  step();
+}
+function bindNow(host) {
+  boundHost = host;
+  console.log(`listening on ${host}:${PORT}${host === '0.0.0.0' ? ` (network: ${lanUrl(PORT) || 'no address'})` : ' (this machine only)'}`);
+}
+
+// First non-internal IPv4 address, so the startup banner can show the other
+// devices on the LAN the address to type in (null when there is none).
+function lanAddress() {
+  try {
+    for (const ifaces of Object.values(os.networkInterfaces())) {
+      for (const i of ifaces || []) {
+        if (i.family === 'IPv4' && !i.internal) return i.address;
+      }
+    }
+  } catch { /* no interface info */ }
+  return null;
+}
+
+const HOST = process.env.PI_WEBUI_HOST || lanHostFromConfig() || '127.0.0.1';
+boundHost = HOST;
+/* The agent command: PI_COMMAND wins, then the saved pi location
+ * (bridge/agent-source.txt), then a native pi (issue #157). */
+const PI_COMMAND = agentSource.command();
+// PI_WEBUI_DEBUG_RPC=1 logs every RPC in and out together with the session
+// changes around it. Off by default; it is the fastest way to see what a client
+// asked for and in which session it was answered.
+const DEBUG_RPC = process.env.PI_WEBUI_DEBUG_RPC === '1';
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.cwd();
+/* The directory the agent process is *started* in on this machine. With
+ * PI_COMMAND="docker exec -i <ctr> pi --mode rpc" the workspace is a path inside
+ * that container ("/workspace"), and the shell this bridge spawns through cannot
+ * change into it: the spawn fails with ENOENT and no agent ever starts - which
+ * looked like a Docker problem with sessions, because the UI simply stayed
+ * empty. The host side only needs a directory that exists. */
+function hostSpawnDir() {
+  try { if (fs.statSync(WORKSPACE_DIR).isDirectory()) return WORKSPACE_DIR; } catch { /* not here */ }
+  return __dirname;
+}
+// pi's config dir (~/.pi/agent): models.json / settings.json / auth.json live
+// here. pi itself names the variable PI_CODING_AGENT_DIR; this bridge grew up
+// with PI_AGENT_DIR, so both are read - pi's own first, because when they
+// disagree the one that decides what pi actually loads is pi's (issue #56).
+const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR
+  || path.join(os.homedir(), '.pi', 'agent');
 // Session dir for listing. Either a normal path, or "docker:<container>:<path>"
 // to list sessions inside a container via `docker exec` (used when the pi
 // agent runs in an existing container, e.g. PI_COMMAND="docker exec -i ctr pi --mode rpc").
-const SESSION_DIR =
-  process.env.PI_SESSION_DIR || path.join(os.homedir(), '.pi', 'agent', 'sessions');
+// pi's own PI_CODING_AGENT_SESSION_DIR is honoured, then the bridge's
+// PI_SESSION_DIR, then the agent dir's sessions/.
+const SESSION_DIR = agentSource.sessionDir() || path.join(PI_AGENT_DIR, 'sessions');
 // Same thing, as a list and never a docker spec - used to bound session
 // export/delete to files that really are session files.
 const SESSION_DIRS = SESSION_DIR.startsWith('docker:') ? [] : [SESSION_DIR];
-// pi's config dir (~/.pi/agent): models.json / settings.json / auth.json live here.
-const PI_AGENT_DIR = process.env.PI_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
 const PI_MODELS_FILE = path.join(PI_AGENT_DIR, 'models.json');
 const PI_SETTINGS_FILE = path.join(PI_AGENT_DIR, 'settings.json');
 
@@ -56,69 +164,35 @@ const UPLOAD_DIRS = (() => {
   }
   return out;
 })();
+
+/* What an uploaded file is served back as. A <video> will not play without a
+ * type it recognises, and the filename keeps the original extension. */
 const PI_AUTH_FILE = path.join(PI_AGENT_DIR, 'auth.json');
+/* Where goal-x keeps its goal files for this workspace (PI_GOALS_DIR overrides
+ * it for tests). See readGoalRecord() for the file format. */
+const GOALS_DIR = process.env.PI_GOALS_DIR || path.join(WORKSPACE_DIR, '.pi', 'goals');
 const WEB_DIR = path.join(__dirname, '..', 'web');
-let whisperUrl = null; // set once the local whisper STT server (if any) is up
-const fontsCache = { list: null, at: 0 }; // GET /api/system-fonts cache
 
-/* Decode a UTF-16 name-table string. Node has no utf16be decoder, and in
- * practice name records are found in both byte orders, so try both and pick
- * the one that yields printable text (a wrong order turns ASCII into
- * characters with a zero low byte). */
-function decodeUtf16Name(raw) {
-  const be = [], le = [];
-  for (let i = 0; i + 1 < raw.length; i += 2) {
-    be.push((raw[i] << 8) | raw[i + 1]);
-    le.push((raw[i + 1] << 8) | raw[i]);
-  }
-  const bad = (arr) => arr.filter((c) => c === 0 || (c >= 0x100 && (c & 0xff) === 0)).length;
-  const codes = bad(be) <= bad(le) ? be : le;
-  return codes.map((c) => String.fromCharCode(c)).join('');
-}
-
-/* Read the family name (nameID 1) from a TTF/OTF buffer. This is the name
- * CSS font-family actually matches against, and it can differ from the
- * Windows font-registry label — e.g. a font registered as
- * "RWBY-Z-Regular (TrueType)" has family "RWBY-Z", so using the label makes
- * the browser silently fall back to sans-serif. Returns null for WOFF/TTC
- * collections or malformed files. */
-function ttfFamilyName(buf) {
+/* The build the page is served as: the newest (mtime, size) across web/. It is
+ * the cache-buster in index.html's asset URLs and the value /api/health reports,
+ * so a long-lived tab can notice the bridge was updated under it (issue #89).
+ * app.js alone was not enough: a stylesheet change with app.js untouched left
+ * the old CSS in the browser, which is exactly the mixed-version layout the
+ * issue reported. */
+function webBuild() {
   try {
-    if (!buf || buf.length < 12) return null;
-    const version = buf.readUInt32BE(0);
-    // 0x00010000 = TTF, 'true' = legacy TTF, 'OTTO' = CFF/OTF; WOFF/TTC differ.
-    if (version !== 0x00010000 && version !== 0x74727565 && version !== 0x4f54544f) return null;
-    const numTables = buf.readUInt16BE(4);
-    let off = 12;
-    for (let i = 0; i < numTables; i++) {
-      const tag = buf.toString('ascii', off, off + 4);
-      const tOff = buf.readUInt32BE(off + 8);
-      off += 16;
-      if (tag !== 'name') continue;
-      const count = buf.readUInt16BE(tOff + 2);
-      const strBase = tOff + buf.readUInt16BE(tOff + 4);
-      const candidates = [];
-      for (let j = 0; j < count; j++) {
-        const r = tOff + 6 + j * 12;
-        const pid = buf.readUInt16BE(r);
-        const nid = buf.readUInt16BE(r + 6);
-        const len = buf.readUInt16BE(r + 8);
-        const sOff = buf.readUInt16BE(r + 10);
-        if (nid !== 1 || len < 2 || len % 2) continue;
-        const raw = buf.subarray(strBase + sOff, strBase + sOff + len);
-        const text = decodeUtf16Name(raw).trim();
-        if (text) candidates.push({ pid, text });
-      }
-      // Prefer the Windows (pid 3) record, then Unicode (1), then Mac (0).
-      const pick = candidates.find((c) => c.pid === 3)
-        || candidates.find((c) => c.pid === 1)
-        || candidates[0];
-      return pick ? pick.text : null;
+    let newest = 0, total = 0;
+    for (const f of fs.readdirSync(WEB_DIR)) {
+      let st;
+      try { st = fs.statSync(path.join(WEB_DIR, f)); } catch { continue; }
+      if (!st.isFile()) continue;
+      newest = Math.max(newest, Math.round(st.mtimeMs));
+      total += st.size;
     }
-  } catch { /* malformed */ }
-  return null;
+    return newest + '-' + total;
+  } catch { return null; }
 }
-
+let whisperUrl = null; // set once the local whisper STT server (if any) is up
 function parseSessionDir() {
   if (SESSION_DIR.startsWith('docker:')) {
     const rest = SESSION_DIR.slice('docker:'.length);
@@ -197,11 +271,25 @@ let builtinCommandsCache = null;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json',
+  '.map': 'application/json',
+  '.webmanifest': 'application/manifest+json',
+  '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
 };
 
 /* Resolve a session path for export/delete: only real .jsonl files inside the
@@ -222,11 +310,421 @@ function safeSessionPath(raw) {
   return want;
 }
 
+/* How much of a session is base64 image data, estimated from a few windows
+ * spread across the whole file.
+ *
+ * The windows are averaged, which is what makes this an estimate of the file
+ * rather than of its worst moment. "Worst window" was the first version and it
+ * turned out to be too frightened: a 21 MB session that is 77% text and whose
+ * gzip saves 12 MB had one window that landed inside a picture, and taking the
+ * maximum threw the compression away. The mean lands within a few percent of the
+ * real figure on every real session measured, and the decision that follows
+ * (which is only "is it worth the CPU") is nowhere near that precise.
+ *
+ * The windows are read with seek, so the file is not read twice. */
+const DENSITY_WINDOWS = 8;
+const DENSITY_SPAN = 48 * 1024;
+
+async function sessionSample(ref, from, len) {
+  try {
+    if (ref.kind === 'docker') {
+      // no seeking inside the container: take a prefix for the start of the
+      // file and a suffix for the rest, which is a coarse estimate but costs two
+      // small execs rather than a copy of the file.
+      //
+      // The suffix used to be a script - `tail -c +N '<path>' | head -c L` - which
+      // put the session path inside shell text a second time (see
+      // scanDockerSessions for what that cost). `tail` takes the offset as an
+      // argument and the length is applied here, so there is no pipeline and no
+      // script: the path is only ever argv.
+      const head = from === 0
+        ? await dockerCapture(ref.container, ['head', '-c', String(len), ref.path], 20000)
+        : String(await dockerCapture(ref.container, ['tail', '-c', `+${from + 1}`, ref.path], 20000) || '').slice(0, len);
+      return String(head || '');
+    }
+    const fh = await fs.promises.open(ref.path, 'r');
+    try {
+      const st = await fh.stat();
+      const buf = Buffer.alloc(Math.min(len, Math.max(0, st.size - from)));
+      if (!buf.length) return '';
+      const { bytesRead } = await fh.read(buf, 0, buf.length, from);
+      return buf.slice(0, bytesRead).toString('utf8');
+    } finally { await fh.close(); }
+  } catch { return ''; }
+}
+
+function base64Share(text) {
+  if (!text) return 1;                 // cannot tell: assume the worst
+  let bytes = 0;
+  // Two ways to recognise image data, and the second one matters more:
+  //
+  //  - the marked form, "data": "<base64>", which is how it looks in the
+  //    beginning of an image block;
+  //  - a long unbroken run of base64 characters with no JSON punctuation in it.
+  //
+  // The original probe only looked for the marker, which made it useless: the
+  // sampling windows are 48 KB and an image block is megabytes, so a window
+  // almost always lands *inside* one, with the key thousands of kilobytes away in
+  // a part of the file that window never saw. Measured on a real 70 MB session,
+  // seven of eight windows were pure base64 and all eight reported "no images".
+  //
+  // 400 characters is far longer than any ordinary token - a hash is 64 hex
+  // characters, a JSON key is tens - so a run that long is image data and nothing
+  // else.
+  const re = /"data"\s*:\s*"([A-Za-z0-9+/=]{200,})"|([A-Za-z0-9+/=]{400,})/g;
+  let m;
+  while ((m = re.exec(text)) !== null) bytes += (m[1] || m[2]).length;
+  // base64 carries 3 bytes in 4 characters, so the source bytes are 3/4 of the
+  // character count. Measured against the sample that over-counts, which is the
+  // safe direction: it declines to compress rather than compressing in vain.
+  return bytes ? Math.min(1, (bytes * 0.75) / text.length) : 0;
+}
+
+async function imageDensity(ref) {
+  const size = await sessionSize(ref);
+  if (!size) return 1;
+  const span = Math.min(DENSITY_SPAN, size);
+  const step = size > span ? Math.floor((size - span) / (DENSITY_WINDOWS - 1)) : 0;
+  let total = 0, seen = 0;
+  for (let i = 0; i < DENSITY_WINDOWS; i++) {
+    const at = Math.min(Math.max(0, size - span), i * step);
+    const text = await sessionSample(ref, at, span);
+    if (!text) return 1;            // cannot read it: assume the worst
+    total += base64Share(text);
+    seen++;
+  }
+  return seen ? total / seen : 1;
+}
+
+async function deleteSessionRef(ref) {
+  if (ref.kind === 'docker') { await dockerCapture(ref.container, ['rm', '-f', ref.path], 30000); return; }
+  fs.rmSync(ref.path);
+}
+
+/* ── what a subagent wrote ───────────────────────────────────────────────
+ * pi-subagents keeps one artifact set per run inside the session directory
+ * (`subagent-artifacts/<runId>_<agent>_output.md`, plus `_meta.json` and a
+ * transcript), and a background run keeps its working files in a run directory
+ * (`…/async-subagent-runs/<runId>/output-N.log`) whose path reaches us through
+ * the tool result's details.asyncDir. Both are read here, through `docker exec`
+ * when the agent lives in a container, so the panel works the same either way.
+ *
+ * The run id is a uuid and the run directory has to sit under a pi-subagents run
+ * root, so this cannot be pointed at an arbitrary file. */
+const SUBAGENT_TAIL = 200 * 1024;
+
+function tailText(text, bytes = SUBAGENT_TAIL) {
+  if (!text) return '';
+  if (text.length <= bytes) return text;
+  const cut = text.slice(text.length - bytes);
+  const nl = cut.indexOf('\n');
+  return `… (showing the end of ${Math.round(text.length / 1024)} KB)
+${nl >= 0 ? cut.slice(nl + 1) : cut}`;
+}
+const RUN_DIR_UNSAFE = /["'`$\\;|&<>(){}\[\]*?!#\r\n\u0000]/;
+const RUN_DIR_SHAPE = /\/pi-subagents[^/]*\/async-subagent-runs\/[^/]+$/;
+
+function runDirOk(p) {
+  if (RUN_DIR_UNSAFE.test(p)) return false;
+  if (p.split('/').includes('..')) return false;   // normalise() already removed these
+  return RUN_DIR_SHAPE.test(p);
+}
+
+function runDirRef(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const remote = parseSessionDir();
+  if (remote) {
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return null;
+    const p = path.posix.normalize(raw.trim().replaceAll(String.fromCharCode(92), '/'));
+    if (!p.startsWith('/') || !runDirOk(p)) return null;
+    return { kind: 'docker', container: ctr, dir: p };
+  }
+  let p;
+  try { p = path.resolve(raw.trim()); } catch { return null; }
+  const asPosix = p.replaceAll(String.fromCharCode(92), '/');
+  if (!runDirOk(asPosix)) return null;
+  // ...and under a root this bridge would itself create
+  const roots = asyncRunRoots()
+    .map((r) => path.resolve(r).replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, ''))
+    .filter(Boolean);
+  if (!roots.some((r) => asPosix.startsWith(r + '/'))) return null;
+  return { kind: 'local', dir: p };
+}
+const RUN_CACHE = { at: 0, data: null };
+const ARTIFACT_CACHE = { at: 0, names: null };
+const RUN_ARTIFACT_TTL = 5000;
+
+function runStateFromStatus(s) {
+  if (!s || typeof s !== 'object') return null;
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const id = str(s.runId);
+  if (!id) return null;
+  const tok = s.totalTokens && typeof s.totalTokens === 'object' ? num(s.totalTokens.total) : null;
+  return {
+    runId: id,
+    agent: str(s.agent),
+    mode: str(s.mode),
+    state: str(s.state),
+    activityState: str(s.activityState),
+    currentTool: str(s.currentTool),
+    currentToolStartedAt: num(s.currentToolStartedAt),
+    turnCount: num(s.turnCount) || 0,
+    toolCount: num(s.toolCount) || 0,
+    startedAt: num(s.startedAt),
+    endedAt: num(s.endedAt),
+    lastActivityAt: num(s.lastActivityAt),
+    // sessionFile is the child's own session, sessionId the one it came from.
+    sessionFile: str(s.sessionFile),
+    sessionId: str(s.sessionId),
+    sessionName: str(s.sessionName),
+    model: str(s.model),
+    error: str(s.error),
+    totalTokens: tok ? { total: tok } : null,
+    asyncDir: null,
+  };
+}
+
+/* The temp root pi-subagents uses: "pi-subagents-<scope>" directories under the
+ * system temp dir, or whatever PI_SUBAGENTS_TEMP_ROOT was set to. */
+function asyncRunRoots() {
+  const roots = [];
+  const configured = (process.env.PI_SUBAGENTS_TEMP_ROOT || '').trim();
+  if (configured) roots.push(path.join(configured, 'async-subagent-runs'));
+  try {
+    for (const name of fs.readdirSync(os.tmpdir())) {
+      if (!/^pi-subagents-/.test(name)) continue;
+      roots.push(path.join(os.tmpdir(), name, 'async-subagent-runs'));
+    }
+  } catch { /* nothing to look in */ }
+  return roots;
+}
+
+/* The run status does not carry the agent name for every kind of run (workflow
+ * children leave it empty); the recovery descriptor beside it always does, and
+ * it repeats the child's own session file. */
+function runStateFromDescriptor(st, d) {
+  if (!st || !d || typeof d !== 'object') return st;
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  if (!st.agent) st.agent = str(d.agent);
+  if (!st.sessionFile) st.sessionFile = str(d.sessionFile);
+  return st;
+}
+
+function readJsonFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+function readRunDirsLocal() {
+  const runs = [];
+  for (const root of asyncRunRoots()) {
+    let dirs = [];
+    try { dirs = fs.readdirSync(root); } catch { continue; }
+    for (const name of dirs) {
+      const dir = path.join(root, name);
+      const st = runStateFromStatus(readJsonFile(path.join(dir, 'status.json')));
+      if (!st) continue;
+      runStateFromDescriptor(st, readJsonFile(path.join(dir, 'recovery-descriptor.json')));
+      st.asyncDir = dir;
+      runs.push(st);
+    }
+  }
+  return runs;
+}
+
+async function readRunDirsDocker(remote) {
+  // One exec for all of them: the loop prints a marker per file (and for the
+  // recovery descriptor beside it), so the output can be split apart again.
+  const sh = 'for f in /tmp/pi-subagents-*/async-subagent-runs/*/status.json; do '
+    + '[ -f "$f" ] || continue; d=${f%/status.json}; printf "@@FILE %s\\n" "$d"; cat "$f"; printf "\\n"; '
+    + 'if [ -f "$d/recovery-descriptor.json" ]; then printf "@@REC %s\\n" "$d"; cat "$d/recovery-descriptor.json"; printf "\\n"; fi; done 2>/dev/null';
+  const out = await dockerCapture(remote.container, ['sh', '-c', sh], 20000).catch(() => '');
+  const states = new Map();
+  for (const chunk of String(out || '').split('@@').slice(1)) {
+    const nl = chunk.indexOf(String.fromCharCode(10));
+    if (nl < 0) continue;
+    const head = chunk.slice(0, nl).trim();          // "FILE <dir>" or "REC <dir>"
+    // The markers are not the same length ("FILE " is five characters, "REC " is
+    // four) - slicing a fixed five cut the leading slash off the REC path, so the
+    // descriptor was looked up under a different directory and never merged.
+    const kind = head.startsWith('REC') ? 'REC' : 'FILE';
+    const dir = head.slice(kind === 'REC' ? 4 : 5).trim();
+    if (!dir) continue;
+    const body = chunk.slice(nl + 1).split('@@')[0];
+    let json = null;
+    try { json = JSON.parse(body); } catch { continue; }
+    if (kind === 'FILE') {
+      const st = runStateFromStatus(json);
+      if (st) states.set(dir, st);
+    } else if (kind === 'REC') {
+      const st = states.get(dir);
+      if (st) runStateFromDescriptor(st, json);
+    }
+  }
+  const runs = [];
+  for (const [dir, st] of states) { st.asyncDir = dir; runs.push(st); }
+  return runs;
+}
+
+/* Artifact file names are the only place the agent name of a run appears
+ * (<runId>_<agent>_transcript.jsonl), so they label the rows. */
+/* pi-subagents writes the artifact set next to the session it belongs to
+ * (<session dir>/subagent-artifacts), which is where the agent name in
+ * "<runId>_<agent>_transcript.jsonl" can be read from. */
+async function artifactNamesIn(dir) {
+  if (!dir) return [];
+  const now = Date.now();
+  const hit = ARTIFACT_CACHE.names && ARTIFACT_CACHE.names.get(dir);
+  if (hit && now - hit.at < RUN_ARTIFACT_TTL) return hit.names;
+  const remote = parseSessionDir();
+  let names = [];
+  if (remote) {
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return [];
+    // argv again: this path is derived from a run's status.json, which lives in
+    // the container and is not trusted text
+    const out = await dockerRun(ctr, ['sh', '-c',
+      'ls -1 "$1" 2>/dev/null', 'sh', path.posix.join(dir, 'subagent-artifacts')], 20000).catch(() => '');
+    names = String(out || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  } else {
+    try { names = fs.readdirSync(path.join(dir, 'subagent-artifacts')); } catch { names = []; }
+  }
+  if (!ARTIFACT_CACHE.names) ARTIFACT_CACHE.names = new Map();
+  ARTIFACT_CACHE.names.set(dir, { at: now, names });
+  return names;
+}
+function sameSessionFilePath(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const norm = (v) => String(v).replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, '').toLowerCase();
+  return !!a && !!b && norm(a) === norm(b);
+}
+
+/* ── reaching another instance from this one ─────────────────────────────
+ * Switching instances used to navigate this page to the other machine. In a
+ * browser that means leaving where you were; in the packaged app there is no
+ * address bar, so a host that is switched off leaves you on a network error with
+ * no way back. Instead the local bridge fetches on the page's behalf:
+ * /proxy/<origin>/<path> is forwarded to that instance, WebSocket included, so
+ * the page stays on this origin and the switcher always works.
+ *
+ * Only origins already listed as instances in this bridge's own settings are
+ * proxied - otherwise the bridge would be an open relay for the whole network. */
+function proxyTargets() {
+  try {
+    const st = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    return (st.instances || []).map((i) => (i && i.url) || '').filter(Boolean);
+  } catch { return []; }
+}
+
+function proxyBaseFor(origin) {
+  let want;
+  try { want = new URL(origin).origin; } catch { return null; }
+  for (const u of proxyTargets()) {
+    try { if (new URL(u).origin === want) return want; } catch { /* skip a bad entry */ }
+  }
+  return null;
+}
+
+/* "/proxy/<encoded origin>/rest" -> { base, path: "/rest" }, or null when the
+ * target is not one of ours. */
+function splitProxyPath(url) {
+  if (typeof url !== 'string' || !url.startsWith('/proxy/')) return null;
+  const rest = url.slice('/proxy/'.length);
+  const i = rest.indexOf('/');
+  if (i < 0) return null;
+  let origin;
+  try { origin = decodeURIComponent(rest.slice(0, i)); } catch { return null; }
+  const base = proxyBaseFor(origin);
+  return base ? { base, path: rest.slice(i) } : null;
+}
+
+// Headers that belong to one hop of a connection and must not be forwarded.
+const HOP_HEADERS = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
+  'proxy-authorization', 'proxy-connection', 'te', 'trailer']);
+
+function proxyHttp(req, res, base, pathAndQuery) {
+  let target;
+  try { target = new URL(pathAndQuery, base); } catch { res.writeHead(400).end('bad proxy target'); return; }
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP_HEADERS.has(k.toLowerCase())) headers[k] = v;
+  const secure = target.protocol === 'https:';
+  const send = secure ? https : http;
+  const upstream = send.request({
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || (secure ? 443 : 80),
+    path: target.pathname + target.search,
+    method: req.method,
+    headers,
+  }, (down) => {
+    const out = {};
+    for (const [k, v] of Object.entries(down.headers)) if (!HOP_HEADERS.has(k.toLowerCase())) out[k] = v;
+    try { res.writeHead(down.statusCode || 502, out); } catch { /* headers already sent */ }
+    down.pipe(res);
+  });
+  upstream.on('error', (e) => {
+    if (res.headersSent) { res.destroy(); return; }
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `instance unreachable: ${e.message}` }));
+  });
+  req.pipe(upstream);
+}
+
+/* WebSocket side of the same idea. Messages are forwarded one by one rather than
+ * tunnelling bytes, which keeps ping/pong and close frames correct at both ends. */
+const proxyWss = new WebSocketServer({ noServer: true });
+proxyWss.on('connection', (client, req, parsed) => {
+  const url = new URL(parsed.path, parsed.base);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const upstream = new WebSocket(url.toString());
+  const queue = [];
+  upstream.on('open', () => {
+    for (const m of queue) { try { upstream.send(m.data, { binary: m.binary }); } catch { /* gone */ } }
+    queue.length = 0;
+  });
+  upstream.on('message', (data, isBinary) => {
+    if (client.readyState === client.OPEN) { try { client.send(data, { binary: isBinary }); } catch { /* gone */ } }
+  });
+  upstream.on('close', () => { try { client.close(); } catch { /* already closing */ } });
+  upstream.on('error', (e) => {
+    console.warn(`proxy: ${url.origin} websocket failed: ${e.message}`);
+    try { client.close(1011, 'instance unreachable'); } catch { /* already closing */ }
+  });
+  client.on('message', (data, isBinary) => {
+    if (upstream.readyState === 1) { try { upstream.send(data, { binary: isBinary }); } catch { /* gone */ } }
+    else queue.push({ data, binary: isBinary });
+  });
+  client.on('close', () => { try { upstream.close(); } catch { /* already closing */ } });
+  client.on('error', () => { try { upstream.terminate(); } catch { /* already closed */ } });
+});
+
 function serveStatic(req, res) {
-  let urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  let urlPath;
+  try {
+    urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  } catch {
+    /* decodeURIComponent throws on a malformed escape (/%ZZ, /%E0%A4%A, ...).
+     * The request listener runs async, so a synchronous throw here used to
+     * become an unhandled rejection that killed the whole bridge - every tab
+     * and the agent. A bad URL is a 400, not a reason to stop serving. */
+    res.writeHead(400, { 'Content-Type': 'text/plain' }).end('bad request');
+    return;
+  }
   if (urlPath === '/') urlPath = '/index.html';
+  /* A decoded path can still contain NUL or ".." from an encoded separator:
+   * "/..%2fwebui-settings.json" decodes to "/../webui-settings.json", which
+   * path.normalize() turns into a sibling of WEB_DIR. A plain startsWith()
+   * check accepts that sibling when its name starts with "web" (the old
+   * settings file was named webui-settings.json). Compare the relative path
+   * instead, so only real children of the web root are served. */
+  if (!urlPath || urlPath.includes('\0')) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' }).end('bad request');
+    return;
+  }
   const file = path.normalize(path.join(WEB_DIR, urlPath));
-  if (!file.startsWith(WEB_DIR)) {
+  const rel = path.relative(WEB_DIR, file);
+  if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
     res.writeHead(403).end('forbidden');
     return;
   }
@@ -238,6 +736,14 @@ function serveStatic(req, res) {
     // The UI is edited live from disk, so a stale app.js/style.css would
     // silently hide new features. Revalidate on every load: the files are tiny
     // and served from localhost, and a 304 keeps repeat loads cheap.
+    if (path.extname(file) === '.html') {
+      const build = webBuild();
+      if (build) {
+        data = Buffer.from(String(data)
+          .replace(/(href|src)="([^"?/:][^"]*\.(?:css|js))"/g, `$1="$2?v=${build}"`)
+          .replace('content="__BUILD__"', `content="${build}"`));
+      }
+    }
     const etag = `"${data.length.toString(16)}-${crypto.createHash('sha1').update(data).digest('hex').slice(0, 12)}"`;
     const headers = {
       'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
@@ -258,12 +764,9 @@ function serveStatic(req, res) {
  * step is defensive — worst case the file name is the title.
  */
 
-function execCapture(cmd, args, timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, shell: false },
-      (err, stdout) => resolve(err ? '' : stdout));
-  });
-}
+/* (execCapture lived here - a docker helper with no callers left once
+ * scanDockerSessions stopped building shell scripts. dockerRun() above is the
+ * one to use: same shape, but sized for a session directory's worth of output.) */
 
 // Extract a display title from the head of one session file's content.
 /* Latest `session_info` name found scanning lines backwards (pi appends these
@@ -283,21 +786,9 @@ function nameFromText(text) {
   return null;
 }
 
-function nameFromTail(file, bytes = 64 * 1024) {
-  try {
-    const st = fs.statSync(file);
-    const len = Math.min(bytes, st.size);
-    const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, st.size - len);
-    fs.closeSync(fd);
-    let text = buf.toString('utf8');
-    // a tail read usually starts mid-line — drop the partial first line
-    if (st.size > len) text = text.slice(text.indexOf('\n') + 1);
-    return nameFromText(text);
-  } catch { /* unreadable */ }
-  return null;
-}
+/* (nameFromTail lived here. It stat'ed and opened every session file a second
+ * time just to read the tail. readSessionEdges() above reads head and tail from
+ * one open, so the function went with the second read.) */
 
 function titleFromHead(head) {
   let title = '';
@@ -330,111 +821,203 @@ function titleFromHead(head) {
   return title;
 }
 
-function scanLocalSessions() {
-  let files;
+/* A transcript that belongs to a subagent run rather than to a conversation:
+ * pi-subagents writes one per child under `subagent-artifacts/`, and a
+ * background run keeps its own `…/run-N/session.jsonl` in the temp root. They
+ * are reached through the extension's own panel, not by switching to them - and
+ * in the sidebar they buried every real session (all of them are called
+ * `session.jsonl`, so they also matched each other on name). */
+function isSubagentTranscript(p) {
+  return /(^|[\\/])(subagent-artifacts|async-subagent-runs|chain-runs|subagent-results)([\\/]|$)/.test(p) || /(^|[\\/])(run|step)-\d+[\\/]/.test(p);
+}
+
+/* Read a file's head and its tail from ONE open.
+ *
+ * Two things were wrong with doing this the obvious way. Every session file was
+ * opened twice - once for the head, once inside nameFromTail - and the whole loop
+ * was strictly sequential. Profiled over 200 session files: 19.8 ms of separate
+ * stat() calls, 91.9 ms for the head reads and 105.9 ms for the tail reads, which
+ * is the entire ~210 ms that `GET /api/sessions` measured per call. mtime and size
+ * now come from fstat on the handle already held, and the caller overlaps the
+ * files instead of walking them one at a time. */
+async function readSessionEdges(file, bytes = 64 * 1024) {
+  let fh;
+  try { fh = await fs.promises.open(file, 'r'); } catch { return null; }
   try {
-    files = fs.readdirSync(SESSION_DIR, { recursive: true })
-      .filter((f) => f.endsWith('.jsonl'))
-      .map((f) => path.join(SESSION_DIR, f));
+    const st = await fh.stat();
+    const headLen = Math.min(bytes, st.size);
+    const headBuf = Buffer.alloc(headLen);
+    const headRead = await fh.read(headBuf, 0, headLen, 0);
+    const head = headBuf.toString('utf8', 0, headRead.bytesRead);
+    // a file smaller than one window IS its own tail, exactly as nameFromTail
+    // treated it - otherwise a session under 64 KB would lose its explicit name
+    let tail = head;
+    let tailTruncated = false;
+    if (st.size > headLen) {
+      const tailLen = Math.min(bytes, st.size);
+      const tailBuf = Buffer.alloc(tailLen);
+      const r = await fh.read(tailBuf, 0, tailLen, st.size - tailLen);
+      tail = tailBuf.toString('utf8', 0, r.bytesRead);
+      tailTruncated = true;
+    }
+    return { head, tail, tailTruncated, mtimeMs: st.mtimeMs, size: st.size };
   } catch {
-    return [];
+    return null;
+  } finally {
+    try { await fh.close(); } catch { /* already closed */ }
   }
-  const sessions = [];
-  for (const file of files) {
-    let st;
-    try {
-      st = fs.statSync(file);
-    } catch {
-      continue;
-    }
-    let title = '';
-    let parent = null;
-    try {
-      const fd = fs.openSync(file, 'r');
-      const buf = Buffer.alloc(64 * 1024);
-      const read = fs.readSync(fd, buf, 0, buf.length, 0);
-      fs.closeSync(fd);
-      const head = buf.toString('utf8', 0, read);
-      title = titleFromHead(head);
-      // The header records where a fork came from, which is what the sidebar
-      // uses to show "this one branched off that one".
-      const first = head.split('\n')[0];
-      try { parent = JSON.parse(first).parentSession || null; } catch { /* old or odd file */ }
-    } catch {
-      /* unreadable file — fall back to file name */
-    }
-    const name = path.basename(file);
-    // prefer an explicit rename (tail) over the derived first-message title
-    const explicit = nameFromTail(file);
-    sessions.push({
-      path: file,
-      fileName: name,
-      name: explicit || title || name.replace(/\.jsonl$/, ''),
-      mtime: st.mtimeMs,
-      size: st.size,
-      parent,
-    });
-  }
-  sessions.sort((a, b) => b.mtime - a.mtime);
-  return sessions.slice(0, 200);
 }
 
-async function scanDockerSessions(container, dir) {
-  // Recursive "mtime size path" lines, newest first. find -printf is GNU; the
-  // sandbox images are Debian-based so this holds.
-  const statOut = await execCapture('docker', ['exec', container, 'sh', '-c',
-    `find '${dir}' -name '*.jsonl' -printf '%T@ %s %p\\n' 2>/dev/null | sort -rn | head -200`]);
-  if (!statOut.trim()) return [];
-  const files = statOut.trim().split('\n').map((l) => {
-    const [mtime, size, ...rest] = l.trim().split(' ');
-    return {
-      path: rest.join(' '),
-      fileName: rest.join(' ').split('/').pop(),
-      mtime: Math.floor(parseFloat(mtime) * 1000),
-      size: parseInt(size, 10) || 0,
-    };
-  }).filter((f) => f.path.endsWith('.jsonl'));
-
-  // Pull a title out of each file head + any explicit renames from the tail.
-  const heads = await execCapture('docker', ['exec', container, 'sh', '-c',
-    `for f in ${files.map((f) => `'${f.path}'`).join(' ')}; do` +
-    ` echo "===PIWEBUI $f"; head -c 32768 "$f"; echo;` +
-    ` echo "===PIWEBUITAIL $f"; tail -c 65536 "$f" 2>/dev/null; echo; done`], 30000);
-  const titleByFile = {};
-  const explicitByFile = {};
-  for (const chunk of heads.split('===PIWEBUI')) {
-    const nl = chunk.indexOf('\n');
-    if (nl < 0) continue;
-    const marker = chunk.slice(0, nl).trim();
-    const body = chunk.slice(nl + 1);
-    if (marker.startsWith('TAIL ')) explicitByFile[marker.slice(5).trim()] = nameFromText(body);
-    else if (marker) titleByFile[marker] = titleFromHead(body);
-  }
-  return files.map((f) => ({
-    path: f.path,
-    fileName: f.fileName,
-    name: explicitByFile[f.path] || titleByFile[f.path] || f.fileName.replace(/\.jsonl$/, ''),
-    mtime: f.mtime,
-    size: f.size,
-  }));
-}
-
-async function scanSessions() {
-  const remote = parseSessionDir();
-  if (remote) {
-    try {
-      return await scanDockerSessions(remote.container, remote.dir);
-    } catch {
-      return [];
-    }
-  }
-  return scanLocalSessions();
-}
 
 // UI settings (appearance, agent name/avatar, voice). PI_WEBUI_SETTINGS lets a
 // second instance - a test bridge, say - keep its own file instead of writing
 // over the real one next to the source.
-const SETTINGS_FILE = process.env.PI_WEBUI_SETTINGS || path.join(__dirname, '..', 'webui-settings.json');
+/* Where the WebUI keeps state of its own: its settings, and (below) the session
+ * it was last in. Both used to live next to the bridge, which inside a container
+ * is the image's writable layer - so `docker compose up` after a rebuild reset
+ * every UI setting and forgot where the user was, with nothing to show for it.
+ * The agent's config dir is the right home: in Docker that is exactly the
+ * directory people mount as a volume (and where pi keeps its own settings), and
+ * for a native bridge it is ~/.pi/agent. A file that already exists next to the
+ * bridge still wins, so nobody's settings move out from under them. */
+function stateFile(name) {
+  const legacy = path.join(__dirname, '..', name);
+  try { if (fs.existsSync(legacy)) return legacy; } catch { /* then the agent dir */ }
+  try {
+    fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
+    fs.accessSync(PI_AGENT_DIR, fs.constants.W_OK);
+    return path.join(PI_AGENT_DIR, name);
+  } catch { return legacy; }
+}
+
+const SETTINGS_FILE = process.env.PI_WEBUI_SETTINGS || stateFile('webui-settings.json');
+
+// The session the agent was last in, persisted across bridge/agent restarts.
+// A fresh `pi --mode rpc` always starts a brand-new empty session, and the
+// bridge kills the agent when the last client leaves - so without this, every
+// page refresh (old socket closes, new one opens) dropped the user into a new
+// session. The bridge resumes this session whenever the agent (re)starts, and
+// the WebUI keeps its own copy in localStorage as a fallback.
+/* One record per agent source. A native pi and a pi inside a container keep
+ * their sessions in different places and neither path means anything to the
+ * other, so a single shared file made each of them try to resume into a session
+ * that only existed for the other one. */
+function agentSourceLabel() {
+  const remote = parseSessionDir();
+  if (remote) return 'docker-' + remote.container.replace(/[^A-Za-z0-9_.-]/g, '_');
+  return 'native';
+}
+const LAST_SESSION_FILE = process.env.PI_WEBUI_LAST_SESSION
+  || stateFile(`webui-last-session-${agentSourceLabel()}.json`);
+// Why this is not `last-session-<source>.json` any more: that name belongs to pi
+// itself. pi's CLI/TUI keeps its own "where was I" record under exactly that
+// name in the agent dir, so the bridge and the CLI were writing over each other.
+// Restarting the bridge then resumed whatever session the CLI last used - which
+// is not the session this WebUI was in, and was sometimes a session another pi
+// had open. The WebUI now keeps its own file; a browser that has been here
+// before still recovers its session from localStorage, and the bridge records it
+// again from the first switch.
+const LEGACY_LAST_SESSION_FILE = path.join(__dirname, '..', 'last-session.json');
+
+function readSessionRecord(file) {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return typeof d.path === 'string' && d.path ? d.path : null;
+  } catch { return null; }
+}
+
+/* Sync check for a local path, null when it is a container path (those can only
+ * be asked about with an exec, which is why the async version exists). */
+function sessionFileExistsNow(p) {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  if (parseSessionDir()) return null;
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
+function loadLastSession() {
+  const own = readSessionRecord(LAST_SESSION_FILE);
+  if (own) {
+    // A record whose session is gone is worse than no record: resuming it fails,
+    // and with a pi that does not answer the failed switch wedges the agent until
+    // it is restarted. Drop it here instead, before anything is asked of the agent.
+    if (sessionFileExistsNow(own) === false) {
+      console.warn(`forgetting last session (gone): ${own}`);
+      forgetLastSession();
+      return null;
+    }
+    return own;
+  }
+  // If the record file was named explicitly (PI_WEBUI_LAST_SESSION), that name is
+  // the whole answer: reading other names as well mixed two configurations - a
+  // test bridge picking up the desktop's session, a second bridge on another port
+  // resuming the first one's.
+  if (process.env.PI_WEBUI_LAST_SESSION) return null;
+  // Container records are ours alone (a pi inside a container keeps its own file
+  // in the container's agent dir), so the old per-source name is still worth
+  // reading there. The native one is skipped deliberately: it is pi's own CLI
+  // record, and resuming from it is what dropped the WebUI into whichever session
+  // the terminal used last instead of the one this WebUI was in.
+  if (!parseSessionDir()) return null;
+  // The single file used before records were split per source. Only worth reading
+  // when the path in it belongs to this world: a container path means nothing to
+  // a native pi, and the switch_session that followed did not fail, it hung.
+  const legacy = readSessionRecord(LEGACY_LAST_SESSION_FILE);
+  if (!legacy) return null;
+  const containerPath = legacy.startsWith('/');
+  return containerPath === !!parseSessionDir() ? legacy : null;
+}
+
+function forgetLastSession() {
+  try { fs.rmSync(LAST_SESSION_FILE, { force: true }); } catch { /* nothing to forget */ }
+}
+
+function saveLastSession(p) {
+  if (typeof p !== 'string' || !p) return;
+  // Only ever a session belonging to *this* bridge. The record is what the agent
+  // is resumed into, and it used to be able to hold a path from another world -
+  // pi's own CLI session, a test bridge's file, another instance's session - and
+  // resuming one of those is "it opened the wrong session" (or two pis in the
+  // same session). A path outside this bridge's session dir is never recorded.
+  const remote = parseSessionDir();
+  const roots = remote ? [remote.dir] : SESSION_DIRS;
+  const norm = (v) => String(v).replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, '');
+  const want = norm(p);
+  const inside = roots.some((r) => {
+    const root = norm(r);
+    return !!root && (want === root || want.startsWith(root + '/'));
+  });
+  if (!inside) {
+    console.warn(`not recording a session outside this bridge's session dir: ${p}`);
+    return;
+  }
+  try {
+    fs.writeFileSync(LAST_SESSION_FILE, JSON.stringify({ path: p, at: Date.now() }, null, 2) + '\n');
+  } catch (e) {
+    console.warn('could not save last session:', e.message);
+  }
+}
+
+// Does a session file exist - locally, or inside a "docker:<ctr>:<dir>" session
+// dir (the path is an absolute path inside the container)? A docker failure
+// (container stopped, daemon down) reports "not found": the agent cannot start
+// either in that case, so starting fresh is the right fallback.
+async function sessionFileExists(p) {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  const remote = parseSessionDir();
+  if (remote) {
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return false;
+    // This one escaped its quotes by hand - `p.replace(/'/g, "'\\''")` is the
+    // correct POSIX trick, and it was the only place in the file that got it
+    // right. It is still quoting to be read by a shell when it does not have to:
+    // the path goes in as argv, so there is nothing left to escape. */
+    return await new Promise((resolve) => {
+      execFile('docker', ['exec', ctr, 'sh', '-c', 'test -f "$1"', 'sh', p],
+        { timeout: 15000 }, (err) => resolve(!err));
+    });
+  }
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
 
 // ---------------------------------------------------------------- llama.cpp + pi config
 
@@ -442,120 +1025,316 @@ function readJsonSafe(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
-/*
- * llama.cpp server URL candidates, in the same resolution order as the
- * pi-llama-cpp extension: project .pi/settings.json → $LLAMA_SERVER_URL →
- * global settings.json → auth.json (built-in provider) → default.
- */
-function llamaServerCandidates() {
-  const urls = [];
-  const project = readJsonSafe(path.join(WORKSPACE_DIR, '.pi', 'settings.json'));
-  if (project && project.llamaServerUrl) urls.push(project.llamaServerUrl);
-  if (process.env.LLAMA_SERVER_URL) urls.push(process.env.LLAMA_SERVER_URL);
-  const global = readJsonSafe(PI_SETTINGS_FILE);
-  if (global && global.llamaServerUrl) urls.push(global.llamaServerUrl);
-  const auth = readJsonSafe(PI_AUTH_FILE);
-  if (auth && auth['llama.cpp'] && auth['llama.cpp'].env && auth['llama.cpp'].env.LLAMA_BASE_URL) {
-    urls.push(auth['llama.cpp'].env.LLAMA_BASE_URL);
+const LOCAL_BRIDGE_PORT_BASE = Number(process.env.PI_WEBUI_PORT_BASE || 3080);
+const LOCAL_BRIDGE_PORTS = Array.from({ length: 16 }, (_, i) => LOCAL_BRIDGE_PORT_BASE + i);
+const localBridgesCache = { at: 0, data: [] };
+
+/* ── who is allowed to talk to this bridge ─────────────────────────────────
+ *
+ * There is no authentication, so when the bridge is on the network anyone who
+ * can reach it can drive the agent - including its `bash` RPC, which is a shell on
+ * this machine. That is a deliberate trade for a single-user tool, but two classes
+ * of attack do not need to be able to *reach* the port at all, and both arrive
+ * through a browser the user is already using (issue #23):
+ *
+ *  - **Cross-site request forgery.** Any page you visit can POST to
+ *    http://<this-machine>:<port>/api/session-delete. CORS stops it *reading* the
+ *    reply, but a POST with a side effect needs no reply. Same for the endpoints
+ *    that write auth.json and models.json, and for /api/upload-raw.
+ *  - **DNS rebinding.** A hostname the attacker controls, resolved to this
+ *    machine's LAN address, makes the bridge same-origin with their page - so the
+ *    same-origin policy stops protecting anything and they can read every session.
+ *
+ * Both are fixed the same way and neither needs a login:
+ *
+ *  - the `Host` header must be an address this bridge actually answers on, which
+ *    is what rebinding cannot forge;
+ *  - a write (anything but GET/HEAD/OPTIONS) must not carry an `Origin` from
+ *    somewhere else. Browsers send Origin on every cross-site write, including
+ *    plain form posts, so its absence means a non-browser client - curl, the
+ *    desktop shell - which is not what CSRF is about.
+ *
+ * This is not a substitute for authentication if the machine is on a network you
+ * do not trust; it closes the two holes that need no credentials to exploit.
+ * PI_WEBUI_ALLOWED_HOSTS adds names for setups this cannot guess (a DNS name, a
+ * reverse proxy). */
+const EXTRA_ALLOWED_HOSTS = String(process.env.PI_WEBUI_ALLOWED_HOSTS || '')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+let hostCache = { at: 0, names: null };
+function allowedHostNames() {
+  const now = Date.now();
+  if (hostCache.names && now - hostCache.at < 30000) return hostCache.names;
+  const names = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '::']);
+  for (const n of EXTRA_ALLOWED_HOSTS) names.add(n);
+  // the machine's own names and addresses: how someone actually reaches it
+  try { names.add(String(os.hostname()).toLowerCase()); } catch { /* none */ }
+  try { names.add(String(os.hostname()).toLowerCase() + '.local'); } catch { /* none */ }
+  try { names.add(String(os.hostname()).toLowerCase() + '.localhost'); } catch { /* none */ }
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list || []) if (a && a.address) names.add(String(a.address).toLowerCase());
   }
-  urls.push('http://127.0.0.1:8080');
-  const out = [];
-  for (const raw of urls) {
-    for (const u of String(raw).split(';').map((s) => s.trim().replace(/\/+$/, ''))) {
-      if (u && !out.includes(u)) out.push(u);
-    }
-  }
-  return out;
+  hostCache = { at: now, names };
+  return names;
 }
 
-/* Fetch the model list from one OpenAI-compatible server. Returns null when
- * the server is unreachable or has no models endpoint. A network error on the
- * first path means the host is unreachable — don't waste another timeout on
- * the second path. */
-async function fetchLlamaModels(url) {
-  const parse = (d) => {
-    const arr = Array.isArray(d) ? d : (Array.isArray(d.data) ? d.data : null);
-    if (!arr) return null;
-    return arr
-      .filter((m) => m && typeof m.id === 'string')
-      .map((m) => ({ id: m.id, name: m.name || m.id }));
-  };
+/* The host part of a Host header, without the port and without IPv6 brackets. */
+function hostOnly(hostHeader) {
+  const h = String(hostHeader || '').trim().toLowerCase();
+  if (!h) return '';
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']');
+    return end < 0 ? h : h.slice(1, end);
+  }
+  const colon = h.lastIndexOf(':');
+  // a lone colon means a port; several mean an IPv6 literal without brackets
+  return colon >= 0 && h.indexOf(':') === colon ? h.slice(0, colon) : h;
+}
+
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/* null when the request is fine, or a short reason to log and refuse with. */
+function requestRefused(req) {
+  const host = hostOnly(req.headers.host);
+  // A missing Host means HTTP/1.0. Browsers always send one, and it is the header
+  // a rebinding attack cannot get right, so its absence is not accepted.
+  if (!host) return 'no Host header';
+  if (!allowedHostNames().has(host)) return `Host "${host}" is not an address this bridge answers on`;
+
+  if (!WRITE_METHODS.has(String(req.method || '').toUpperCase())) return null;
+
+  const origin = req.headers.origin;
+  if (!origin) return null;                       // not a browser (curl, the desktop shell)
+  let oHost, oProto;
   try {
-    const res = await fetch(url + '/v1/models', { signal: AbortSignal.timeout(1200) });
-    if (res.ok) {
-      const models = parse(await res.json());
-      if (models) return models;
-    }
-    // Server answered (404/405/etc.) — try the plain /models path (llama.cpp).
-    const res2 = await fetch(url + '/models', { signal: AbortSignal.timeout(1200) });
-    if (res2.ok) return parse(await res2.json());
-    return null;
-  } catch {
-    return null; // unreachable host
+    const u = new URL(String(origin));
+    oHost = hostOnly(u.host);
+    oProto = u.protocol;
+  } catch { return `Origin "${String(origin).slice(0, 60)}" is not a URL`; }
+  // Same origin as the request itself, which covers every way the UI is reached
+  // (loopback, LAN address, hostname, a proxy) without having to list them.
+  const selfProto = req.socket && req.socket.encrypted ? 'https:' : 'http:';
+  if (oHost === host && oProto === selfProto) return null;
+  return `Origin "${String(origin).slice(0, 60)}" is not this bridge`;
+}
+
+/* The endpoints that exist to be read by *another* instance's page - they are
+ * declared cross-origin on purpose and say nothing private (a name, a picture, a
+ * busy flag, a build id). They are still subject to the Host check, which is what
+ * actually stops rebinding. */
+const CROSS_ORIGIN_OK = ['/api/health', '/api/instance-card'];
+
+/* Windows vs POSIX, shared with bridge/agent.js (issue #54 phase 11). */
+const isWin = process.platform === 'win32';
+
+/* goal-x record reading lives in goals.js (the #54 split). */
+const { readGoalRecord, goalSummary } = require('./goals');
+
+/* Route modules (issue #54): each exports { match, handle }; the handler below
+ * asks them before its own routes. */
+const llamaSupport = require('./llama')({
+  PI_AGENT_DIR: PI_AGENT_DIR,
+  PI_AUTH_FILE: PI_AUTH_FILE,
+  PI_MODELS_FILE: PI_MODELS_FILE,
+  PI_SETTINGS_FILE: PI_SETTINGS_FILE,
+  WORKSPACE_DIR: WORKSPACE_DIR,
+  fs: fs,
+  os: os,
+  path: path,
+  readJsonSafe: readJsonSafe,
+});
+const {
+  ALLOWED_APIS, BUILTIN_PROVIDER_IDS, MODEL_FIELDS, PROVIDER_ID_RE, authEntryKind, fetchLlamaModels,
+  isLocalLlamaAddress, llamaConfiguredUrls, llamaLan, llamaLanUrls, llamaModelsCache,
+  llamaServerCandidates, llamaServerIdentity, maskKey, readLlamaServerUrl,
+  writeJsonAtomic, writeModelsFile,
+} = llamaSupport;
+
+const piRoutes = require('./routes/pi')({
+  ALLOWED_APIS: ALLOWED_APIS,
+  GOALS_DIR: GOALS_DIR,
+  MODEL_FIELDS: MODEL_FIELDS,
+  PI_AGENT_DIR: PI_AGENT_DIR,
+  PI_MODELS_FILE: PI_MODELS_FILE,
+  PI_SETTINGS_FILE: PI_SETTINGS_FILE,
+  PROVIDER_ID_RE: PROVIDER_ID_RE,
+  WORKSPACE_DIR: WORKSPACE_DIR,
+  fs: fs,
+  http: http,
+  jsonOut: jsonOut,
+  maskKey: maskKey,
+  os: os,
+  path: path,
+  readJsonSafe: readJsonSafe,
+  serveStatic: serveStatic,
+  writeJsonAtomic: writeJsonAtomic,
+  writeModelsFile: writeModelsFile,
+});
+const uploadRoutes = require('./routes/uploads')({
+  UPLOAD_DIRS: UPLOAD_DIRS,
+  crypto: crypto,
+  fs: fs,
+  http: http,
+  path: path,
+});
+const mcpRoutes = require('./routes/mcp')({
+  PI_AGENT_DIR: PI_AGENT_DIR,
+  WORKSPACE_DIR: WORKSPACE_DIR,
+  fs: fs,
+  jsonOut: jsonOut,
+  path: path,
+  readJsonSafe: readJsonSafe,
+  writeJsonAtomic: writeJsonAtomic,
+});
+const instanceRoutes = require('./routes/instances')({
+  PI_AGENT_DIR: PI_AGENT_DIR,
+  fs: fs,
+  jsonOut: jsonOut,
+  os: os,
+  path: path,
+});
+/* The agent's live status, shared with the route modules (issue #54 phase 9):
+ * bridge/agent.js fills this same object in when it is required at the end of
+ * the file, and the session routes read it while handling a request. Declared
+ * here so requiring them cannot hit its temporal dead zone. */
+const agentStatus = { busy: false, sessionName: null, compacting: null };
+
+/* The last session-scan error, shared the same way: bridge/sessions.js fills
+ * this object in, /api/sessions reads it (issue #54 phase 10). */
+const scanState = { lastScanError: null };
+
+const sessionStore = require('./sessions')({
+  SESSION_DIR: SESSION_DIR,
+  StringDecoder: StringDecoder,
+  execFile: execFile,
+  fs: fs,
+  isSubagentTranscript: isSubagentTranscript,
+  nameFromText: nameFromText,
+  parseSessionDir: parseSessionDir,
+  path: path,
+  readSessionEdges: readSessionEdges,
+  safeSessionPath: safeSessionPath,
+  spawn: spawn,
+  titleFromHead: titleFromHead,
+  scanState: scanState,
+});
+const {
+  WRITE_CHUNK, breathe, dockerCapture, dockerRun, externaliseImages,
+  indexGet, indexKey, indexPut, readLineAt, safeContainerName,
+  scanDockerSessions, scanSessions, sessionLines, sessionRef, sessionSize,
+  sessionStamp, writeStream,
+} = sessionStore;
+
+const sessionRoutes = require('./routes/sessions')({
+  SESSION_DIR: SESSION_DIR,
+  WRITE_CHUNK: WRITE_CHUNK,
+  agentStatus: agentStatus,
+  breathe: breathe,
+  crypto: crypto,
+  deleteSessionRef: deleteSessionRef,
+  dockerCapture: dockerCapture,
+  externaliseImages: externaliseImages,
+  fs: fs,
+  imageDensity: imageDensity,
+  indexGet: indexGet,
+  indexKey: indexKey,
+  indexPut: indexPut,
+  scanState: scanState,
+  loadLastSession: loadLastSession,
+  path: path,
+  readLineAt: readLineAt,
+  scanSessions: scanSessions,
+  sessionLines: sessionLines,
+  sessionRef: sessionRef,
+  sessionSize: sessionSize,
+  sessionStamp: sessionStamp,
+  spawn: spawn,
+  writeStream: writeStream,
+  zlib: zlib,
+});
+const mediaRoutes = require('./routes/media')({
+  UPLOAD_DIRS: UPLOAD_DIRS,
+  fs: fs,
+  path: path,
+  proxyHttp: proxyHttp,
+  splitProxyPath: splitProxyPath,
+});
+const llamaRoutes = require('./routes/llama')({
+  PI_SETTINGS_FILE: PI_SETTINGS_FILE,
+  fetchLlamaModels: fetchLlamaModels,
+  fs: fs,
+  isLocalLlamaAddress: isLocalLlamaAddress,
+  llamaConfiguredUrls: llamaConfiguredUrls,
+  llamaLan: llamaLan,
+  llamaLanUrls: llamaLanUrls,
+  llamaModelsCache: llamaModelsCache,
+  llamaServerCandidates: llamaServerCandidates,
+  llamaServerIdentity: llamaServerIdentity,
+  path: path,
+  readLlamaServerUrl: readLlamaServerUrl,
+});
+const subagentRoutes = require('./routes/subagents')({
+  RUN_CACHE: RUN_CACHE,
+  SESSION_DIR: SESSION_DIR,
+  artifactNamesIn: artifactNamesIn,
+  dockerCapture: dockerCapture,
+  dockerRun: dockerRun,
+  fs: fs,
+  parseSessionDir: parseSessionDir,
+  path: path,
+  readRunDirsDocker: readRunDirsDocker,
+  readRunDirsLocal: readRunDirsLocal,
+  runDirRef: runDirRef,
+  safeContainerName: safeContainerName,
+  sameSessionFilePath: sameSessionFilePath,
+  tailText: tailText,
+});
+const sourceRoutes = require('./routes/source')({
+  agentSource: agentSource,
+  execFile: execFile,
+  jsonOut: jsonOut,
+});
+const systemRoutes = require('./routes/system')({
+  execFile: execFile,
+  fs: fs,
+  path: path,
+});
+async function handleRequest(req, res) {
+  // A client that goes away mid-response (a closed tab, a laptop lid, a Ctrl-C on
+  // a long download) makes the socket's next write raise EPIPE / ECONNRESET.
+  // Unhandled, that is an 'error' event on the socket with no listener, and Node
+  // takes the *whole bridge* down with it - the agent, every other tab, the
+  // WebSocket the agent was streaming on. It happened for real on a large
+  // session-messages response, which is exactly the payload a browser abandons
+  // most often: it re-requests on every reload. Nothing to do about a client
+  // that left; just do not let it stop anything else.
+  //
+  // The listener goes on the socket, not on the response: the error is raised by
+  // Socket._writeGeneric and emitted on the Socket, and a res.on('error') does
+  // not see it.
+  if (req.socket && !req.socket.__guarded) {
+    req.socket.__guarded = true;
+    req.socket.on('error', () => { /* the client went away mid-response */ });
   }
-}
+  req.on('error', () => { /* client aborted the request */ });
+  req.on('aborted', () => { /* ditto */ });
+  res.on('error', () => { /* ditto */ });
 
-const ALLOWED_APIS = new Set([
-  'openai-completions', 'openai-responses', 'anthropic-messages',
-  'google-generative-ai', 'mistral-conversations', 'bedrock-converse-stream',
-  'azure-openai-responses', 'openai-codex-responses',
-]);
-const MODEL_FIELDS = ['id', 'name', 'api', 'baseUrl', 'reasoning', 'input',
-  'contextWindow', 'maxTokens', 'cost', 'compat', 'thinkingLevelMap', 'headers'];
-const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+  /* Refuse before anything else looks at the request: a cross-site write or a
+   * rebound hostname must not reach a handler, whatever the endpoint is. */
+  const refused = requestRefused(req);
+  if (refused) {
+    const why = String(refused);
+    const noisy = !/^Host /.test(why);           // a wrong Host is usually a scanner
+    if (noisy) console.warn(`refused ${req.method} ${String(req.url).slice(0, 80)}: ${why}`);
+    res.writeHead(403, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({
+      error: `refused: ${why}`,
+      hint: 'If you reach this bridge by a name or address not listed here, add it to PI_WEBUI_ALLOWED_HOSTS.',
+    }));
+    return;
+  }
 
-// Built-in provider ids, i.e. the keys pi accepts in auth.json. Sourced from
-// docs/providers.md (API-key table) plus the OAuth/subscription providers.
-const BUILTIN_PROVIDER_IDS = [
-  'anthropic', 'ant-ling', 'amazon-bedrock', 'azure-openai-responses', 'baseten',
-  'cerebras', 'cloudflare-ai-gateway', 'cloudflare-workers-ai', 'deepseek',
-  'fireworks', 'google', 'groq', 'huggingface', 'kimi-coding', 'minimax',
-  'minimax-cn', 'mistral', 'nvidia', 'openai', 'openrouter', 'opencode',
-  'opencode-go', 'qwen-token-plan', 'qwen-token-plan-cn',
-  'qwen-token-plan-individual', 'radius', 'together', 'vercel-ai-gateway',
-  'xiaomi', 'xiaomi-token-plan-ams', 'xiaomi-token-plan-cn',
-  'xiaomi-token-plan-sgp', 'xai', 'zai', 'zai-coding-cn',
-  // subscriptions (/login -> browser flow, stored in auth.json as oauth)
-  'claude-code', 'github-copilot', 'openai-codex',
-];
-
-// Classify an auth.json entry. Only *pure* credential entries count as a login
-// (and may therefore be removed from the UI). Anything carrying extra
-// configuration is protected: the pi-llama-cpp extension's `llama.cpp` entry is
-// `{type:"api_key", env:{...}}` — no key at all — and deleting it would wipe a
-// working server URL.
-const AUTH_KEY_FIELDS = new Set(['type', 'key']);
-const AUTH_OAUTH_FIELDS = new Set([
-  'type', 'access', 'accessToken', 'refresh', 'refreshToken', 'token', 'idToken',
-  'expires', 'expiresAt', 'expiresIn', 'expires_at', 'scope', 'tokenType',
-  'account', 'accountId', 'email', 'label', 'createdAt', 'updatedAt',
-]);
-function authEntryKind(a) {
-  if (!a || typeof a !== 'object') return 'none';
-  const fields = Object.keys(a);
-  if (a.type === 'api_key' && typeof a.key === 'string' && a.key.trim()
-      && fields.every((f) => AUTH_KEY_FIELDS.has(f))) return 'key';
-  if (a.type === 'oauth' && fields.every((f) => AUTH_OAUTH_FIELDS.has(f))) return 'oauth';
-  return 'other';
-}
-
-function maskKey(k) {
-  if (!k) return null;
-  const s = String(k);
-  if (s.length <= 8) return s[0] + '…';
-  return s.slice(0, 4) + '…' + s.slice(-4);
-}
-
-function writeModelsFile(file) {
-  fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
-  fs.writeFileSync(PI_MODELS_FILE, JSON.stringify(file, null, 2) + '\n');
-}
-
-/* Small cache for /api/llama-models (the UI probes it on connect, focus and
- * a retry loop). */
-const llamaModelsCache = { at: 0, data: null };
-
-const server = http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/ui-settings')) {
     if (req.method === 'POST') {
       let body = '';
@@ -579,69 +1358,6 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-  if (req.url.startsWith('/api/sessions')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ sessionDir: SESSION_DIR, sessions: await scanSessions() }));
-    return;
-  }
-  // Read-only transcript of a session file. Lets the WebUI browse other
-  // sessions while the shared agent keeps running in its own session
-  // (the live view of the running session stays in the UI's DOM cache).
-  // Local session dirs only — docker dirs would need `docker exec cat`.
-  if (req.url.startsWith('/api/session-messages')) {
-    const p = new URL(req.url, 'http://x').searchParams.get('path') || '';
-    if (!p) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing path' }));
-      return;
-    }
-    if (parseSessionDir()) {
-      res.writeHead(501, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'docker session dirs are not supported here' }));
-      return;
-    }
-    const root = path.resolve(SESSION_DIR);
-    const resolved = path.resolve(root, p);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'path must stay inside the session dir' }));
-      return;
-    }
-    try {
-      const messages = [];
-      const compactions = [];
-      let parent = null;
-      for (const line of fs.readFileSync(resolved, 'utf8').split('\n')) {
-        if (!line.trim()) continue;
-        let e; try { e = JSON.parse(line); } catch { continue; }
-        // The header records where a fork came from - deleting a fork can send
-        // you back to its original session instead of a blank one.
-        if (e && e.type === 'session' && e.parentSession) parent = e.parentSession;
-        if (e && e.type === 'message' && e.message) {
-          // entryId travels with the message so the UI can offer "fork from
-          // here" while reading a session that the agent has not loaded.
-          messages.push({ ...e.message, timestamp: e.message.timestamp ?? e.timestamp, entryId: e.id || null });
-        } else if (e && e.type === 'compaction' && e.summary) {
-          // Compactions are their own entry type (not messages), so they are
-          // missing from get_messages — without these the "conversation
-          // compacted" markers vanished as soon as the page was reloaded.
-          compactions.push({
-            summary: e.summary,
-            tokensBefore: e.tokensBefore != null ? e.tokensBefore : null,
-            estimatedTokensAfter: e.estimatedTokensAfter != null ? e.estimatedTokensAfter : null,
-            id: e.id || null,
-            timestamp: e.timestamp || null,
-          });
-        }
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ path: p, messages, compactions, parent }));
-    } catch (e) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: `read failed: ${e.message}` }));
-    }
-    return;
-  }
   if (req.url.startsWith('/api/config')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -659,14 +1375,112 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ commands }));
     return;
   }
+
+  if (req.url.startsWith('/api/lan')) {
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { lan } = JSON.parse(body || '{}');
+          const cfg = { lan: !!lan };
+          fs.mkdirSync(path.dirname(LAN_CONFIG_FILE), { recursive: true });
+          fs.writeFileSync(LAN_CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+          const host = lan ? '0.0.0.0' : '127.0.0.1';
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, lan: !!lan, host, url: lan ? lanUrl(PORT) : null,
+            note: process.env.PI_WEBUI_HOST ? 'PI_WEBUI_HOST is set, so it wins on the next start' : null }));
+          // Rebind only after this response is on the wire: moving the socket
+          // closes the connection, and doing it first killed the answer that was
+          // telling the page it had worked.
+          setTimeout(() => rebind(host), 250);
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    const bound = boundHost === '0.0.0.0' || boundHost === '::' || boundHost === '::0';
+    // Report what the switch was *set* to, not only what the socket is bound to
+    // right now: moving the socket takes a moment, and answering from `boundHost`
+    // during it told the page "it is still off" - so the checkbox flipped back
+    // and the switch needed a second click. `bound` still tells the truth about
+    // the socket, for anyone who needs it.
+    let wanted = null;
+    try { wanted = !!JSON.parse(fs.readFileSync(LAN_CONFIG_FILE, 'utf8')).lan; } catch { /* no file yet */ }
+    const enabled = wanted == null ? bound : wanted;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      lan: enabled,
+      bound,
+      host: boundHost,
+      url: enabled ? lanUrl(PORT) : null,
+      pending: enabled !== bound,
+      envOverride: process.env.PI_WEBUI_HOST || null,
+    }));
+    return;
+  }
+
+  /* One small card per instance for the switcher: the agent's name and picture, so
+   * the menu can show who is who. Answers cross-origin requests (like /api/health)
+   * because that is exactly how another instance is reached. */
+  if (req.url.startsWith('/api/instance-card')) {
+    let settings = {};
+    try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify({
+      ok: true,
+      name: settings.agentName || 'pi agent',
+      avatar: settings.avatar || null,
+      avatarCrop: settings.avatarCrop || null,
+      session: agentStatus.sessionName || null,
+      busy: agentStatus.busy,
+      build: webBuild(),
+    }));
+    return;
+  }
+
+  /* Which other pi bridges are running on this machine (issue #57). A second
+   * agent is a second bridge on another port with its own agent dir; the
+   * switcher lists what it finds here so the address does not have to be typed.
+   * The bridge's own port is excluded by comparing the Host header, and the
+   * answer is cached for a few seconds because the UI asks on every poll. */
+  if (req.url.startsWith('/api/local-instances')) {
+    const ttl = 4000;
+    if (localBridgesCache.at && Date.now() - localBridgesCache.at < ttl) {
+      return jsonOut(res, 200, { instances: localBridgesCache.data });
+    }
+    const selfPort = (() => {
+      try { return String(new URL('http://' + String(req.headers.host || '')).port || (req.socket && req.socket.localPort) || PORT); }
+      catch { return String((req.socket && req.socket.localPort) || PORT); }
+    })();
+    const found = await Promise.all(LOCAL_BRIDGE_PORTS
+      .filter((p) => String(p) !== selfPort)
+      .map(async (p) => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${p}/api/health`, { signal: AbortSignal.timeout(700) });
+          if (!r.ok) return null;
+          const d = await r.json();
+          if (!d || !d.ok) return null;
+          return { url: `http://127.0.0.1:${p}`, port: p, name: d.name || null, busy: !!d.busy, build: d.build || null };
+        } catch { return null; }
+      }));
+    localBridgesCache.at = Date.now();
+    localBridgesCache.data = found.filter(Boolean);
+    return jsonOut(res, 200, { instances: localBridgesCache.data });
+  }
+
   if (req.url.startsWith('/api/health')) {
     // Which build is this? Two machines on the same URL can be serving very
-    // different copies of web/, and there was no way to tell them apart.
-    let build = 'unknown';
-    try {
-      const st = fs.statSync(path.join(__dirname, '..', 'web', 'app.js'));
-      build = Math.round(st.mtimeMs) + '-' + st.size;
-    } catch { /* not a checkout */ }
+    // different copies of web/, and there was no way to tell them apart. The
+    // whole directory is folded in, not just app.js, so a stylesheet change
+    // alone also reads as a new build (issue #89).
+    const build = webBuild() || 'unknown';
     // `busy` is the whole point for the multi-instance switcher: every other
     // instance polls this to show a pulsing dot while that agent is working.
     // It is the one endpoint that also answers cross-origin requests (see CORS
@@ -684,9 +1498,61 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Local speech-to-text: started on request, never on boot. The Whisper
-  // backend downloads ~200 MB of whisper.cpp plus the chosen model, so it waits
-  // until someone actually picks it.
+  /* Speech through a cloud service. The browser cannot call these itself (no
+   * CORS, and the API key would be in the page), so the bridge does it: it reads
+   * the key from its own settings and streams the audio straight back. */
+  if (req.url.startsWith('/api/tts')) {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 512 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      let inBody = {};
+      try { inBody = JSON.parse(body || '{}'); } catch { /* error below */ }
+      const text = String(inBody.text || '').slice(0, 8000);
+      if (!text.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no text' }));
+        return;
+      }
+      let settings = {};
+      try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
+      const provider = String(inBody.provider || settings.ttsBackend || '').toLowerCase();
+      const key = String(inBody.apiKey || settings.ttsApiKey || '').trim();
+      const model = String(inBody.model || settings.ttsCloudModel || '').trim();
+      const voice = String(inBody.voice || settings.ttsCloudVoice || '').trim();
+      const base = String(inBody.baseUrl || settings.ttsCloudUrl || '').trim().replace(/\/+$/, '');
+      try {
+        if (!key) throw new Error('no API key set for this voice');
+        let url, payload, headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
+        if (provider === 'fish') {
+          // Fish Audio: text + a reference id (a voice you made or picked), or the
+          // model's default voice when none is given.
+          url = `${base || 'https://api.fish.audio'}/v1/tts`;
+          payload = { text, format: 'mp3', model: model || 's1' };
+          if (voice) payload.reference_id = voice;
+        } else {
+          // Anything OpenAI-compatible: /v1/audio/speech with model + voice.
+          url = `${base || 'https://api.openai.com'}/v1/audio/speech`;
+          payload = { model: model || 'tts-1', input: text, voice: voice || 'alloy', response_format: 'mp3' };
+        }
+        const up = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+        if (!up.ok) {
+          const detail = await up.text().catch(() => '');
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `${provider} said ${up.status}${detail ? ': ' + detail.slice(0, 300) : ''}` }));
+          return;
+        }
+        const buf = Buffer.from(await up.arrayBuffer());
+        res.writeHead(200, { 'Content-Type': up.headers.get('content-type') || 'audio/mpeg', 'Content-Length': buf.length });
+        res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (req.url.startsWith('/api/whisper-status')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(whisperStatus()));
@@ -711,220 +1577,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // llama.cpp: list every model each reachable server knows about. The
-  // providerId matches what the pi-llama-cpp extension registers
-  // ("llama-server=<baseUrl>"), so the WebUI can set_model directly.
-  if (req.url.startsWith('/api/llama-models')) {
-    // 5s cache: the UI probes on connect, on focus, and on a retry loop —
-    // don't hammer the (possibly busy) llama server with identical requests.
-    // Empty results are cached for only 2s so a starting server shows up fast.
-    const ttl = llamaModelsCache.data && llamaModelsCache.data.servers.length ? 5000 : 2000;
-    if (llamaModelsCache.data && Date.now() - llamaModelsCache.at < ttl) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(llamaModelsCache.data));
-      return;
-    }
-    const results = await Promise.all(llamaServerCandidates().map(async (url) => {
-      const models = await fetchLlamaModels(url);
-      return models ? { url, providerId: `llama-server=${url}`, models } : null;
-    }));
-    const payload = { servers: results.filter(Boolean) };
-    llamaModelsCache.at = Date.now();
-    llamaModelsCache.data = payload;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(payload));
-    return;
-  }
 
-  // Read / write the llamaServerUrl in pi's global settings (~/.pi/agent/settings.json).
-  // pi-llama-cpp resolves this URL at agent startup, so after a change the agent
-  // must be restarted (the UI sends {bridge:'restart'}) for it to take effect.
-  if (req.url.startsWith('/api/llama-config')) {
-    if (req.method === 'GET') {
-      let url = null;
-      try { url = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')).llamaServerUrl || null; } catch { /* no file */ }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ url }));
-      return;
-    }
-    if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
-      req.on('end', () => {
-        try {
-          const { url } = JSON.parse(body || '{}');
-          if (typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
-            throw new Error('url must be an http(s) base URL');
-          }
-          const clean = url.trim().replace(/\/+$/, '');
-          let settings = {};
-          try { settings = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
-          const previous = settings.llamaServerUrl || null;
-          settings.llamaServerUrl = clean;
-          fs.mkdirSync(path.dirname(PI_SETTINGS_FILE), { recursive: true });
-          fs.writeFileSync(PI_SETTINGS_FILE, JSON.stringify(settings, null, 2));
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, previous, current: clean }));
-        } catch (e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-    res.writeHead(405).end();
-    return;
-  }
-
-  // Installed system fonts (Windows: font registry; fallback: font dirs).
-  // Cached 5 minutes — the registry query is slow-ish.
-  if (req.url.startsWith('/api/system-fonts')) {
-    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
-    const now = Date.now();
-    if (fontsCache.list && now - fontsCache.at < 5 * 60 * 1000) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(fontsCache.list));
-      return;
-    }
-    (async () => {
-      const families = new Set();
-      const addFamily = (fam) => {
-        if (fam && !/\.(ttf|otf|ttc|woff2?)$/i.test(fam)) families.add(fam.trim());
-      };
-      // Prefer the family name from the font file's own name table (what the
-      // browser matches on); fall back to the registry-derived label.
-      const familyOf = (file, fallback) => {
-        let fam = null;
-        if (file) {
-          try {
-            if (fs.statSync(file).size < 10 * 1024 * 1024) fam = ttfFamilyName(fs.readFileSync(file));
-          } catch { /* unreadable */ }
-        }
-        addFamily(fam || fallback);
-      };
-      const windowsFonts = path.win32.join(process.env.WINDIR || 'C:\\Windows', 'Fonts');
-      const userFonts = path.win32.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows', 'Fonts');
-      const regKey = 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
-      const regUser = 'HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
-      for (const key of [regKey, regUser]) {
-        try {
-          const out = await new Promise((resolve, reject) => {
-            const { execFile } = require('child_process');
-            execFile('reg', ['query', key], { timeout: 8000 }, (e, stdout) => e ? reject(e) : resolve(stdout || ''));
-          });
-          for (const line of out.split('\n')) {
-            const m = line.trim().match(/^(.+?)\s+REG_SZ\s+(.+)$/);
-            if (!m) continue;
-            const label = m[1], val = m[2];
-            if (val.includes(',')) {
-              // Standard layout (machine fonts): key = file name, value =
-              // "Family, version".
-              familyOf(path.win32.join(windowsFonts, label), val.split(',')[0].trim());
-            } else if (/\.(ttf|otf|ttc|woff2?)$/i.test(val)) {
-              // Reversed layout (user fonts): key = "Label (TrueType)",
-              // value = full file path.
-              familyOf(val.trim(), label.replace(/\s*\([^)]*\)\s*$/i, '').trim());
-            }
-          }
-        } catch { /* registry unavailable / no user fonts */ }
-      }
-      if (!families.size) {
-        // Fallback: scan font directories (family ≈ file base name)
-        for (const dir of [windowsFonts, userFonts]) {
-          try {
-            for (const f of fs.readdirSync(dir)) {
-              if (/\.(ttf|otf|ttc|woff2?)$/i.test(f)) familyOf(path.join(dir, f), f.replace(/\.[^.]+$/, ''));
-            }
-          } catch { /* dir missing */ }
-        }
-      }
-      fontsCache.list = { at: now, fonts: [...families].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })) };
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(fontsCache.list));
-    })().catch((e) => {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    });
-    return;
-  }
-
-  // Download a session file (the sidebar's right-click -> export), and delete
-  // one when the user explicitly confirms. Both are restricted to files inside
-  // the configured session directory.
-  if (req.url.startsWith('/api/session-file')) {
-    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
-    const raw = new URL(req.url, 'http://localhost').searchParams.get('path') || '';
-    const file = safeSessionPath(raw);
-    if (!file) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'session not found' })); return; }
-    const st = fs.statSync(file);
-    res.writeHead(200, {
-      'Content-Type': 'application/jsonl',
-      'Content-Length': st.size,
-      'Content-Disposition': `attachment; filename="${path.basename(file)}"`,
-    });
-    fs.createReadStream(file).pipe(res);
-    return;
-  }
-  if (req.url.startsWith('/api/session-delete')) {
-    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
-    let body = '';
-    req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
-    req.on('end', () => {
-      try {
-        const { path: raw } = JSON.parse(body || '{}');
-        const file = safeSessionPath(raw);
-        if (!file) throw new Error('session not found');
-        fs.rmSync(file);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, path: file }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // Save an uploaded file (PDF / audio / video / other) into the workspace so
-  // the agent can read it with its tools. Body: {name, data(base64), mimeType}.
-  // Serve a previously uploaded file back to the browser. Used for background
-  // images / GIFs / videos, which would otherwise blow the localStorage quota
-  // as data URLs. Only files inside an uploads dir are reachable (basename-only,
-  // no traversal).
-  if (req.url.startsWith('/api/bg-file')) {
-    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
-    try {
-      const raw = new URL(req.url, 'http://localhost').searchParams.get('name') || '';
-      const name = path.basename(decodeURIComponent(raw));
-      let file = null;
-      for (const dir of UPLOAD_DIRS) {
-        const cand = path.join(dir, name);
-        if (name && cand.startsWith(dir + path.sep) && fs.existsSync(cand)) { file = cand; break; }
-      }
-      if (!file) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'not found' }));
-        return;
-      }
-      const types = {
-        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-        '.webp': 'image/webp', '.avif': 'image/avif', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
-        '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/x-m4v',
-        '.ogv': 'video/ogg', '.mkv': 'video/x-matroska',
-      };
-      const st = fs.statSync(file);
-      res.writeHead(200, {
-        'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream',
-        'Content-Length': st.size,
-        'Cache-Control': 'public, max-age=86400',
-      });
-      fs.createReadStream(file).pipe(res);
-    } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'bad request' }));
-    }
-    return;
-  }
 
   // Recreate a directory pi needs. A session stores the working directory it
   // was recorded in; renaming the project folder leaves that path missing and
@@ -953,32 +1606,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url.startsWith('/api/upload')) {
-    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
-    let body = '';
-    const MAX = 256 * 1024 * 1024; // base64 of ~190 MB
-    req.on('data', (c) => { body += c; if (body.length > MAX) { req.destroy(); } });
-    req.on('end', () => {
-      try {
-        const { name, data, mimeType } = JSON.parse(body || '{}');
-        if (typeof name !== 'string' || !name) throw new Error('name is required');
-        if (typeof data !== 'string' || !data) throw new Error('data (base64) is required');
-        const safe = name.replace(/[^\w.\- ()\[\]]/g, '_').slice(0, 120);
-        const dir = UPLOAD_DIRS[0];
-        fs.mkdirSync(dir, { recursive: true });
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        const file = path.join(dir, `${stamp}-${safe}`);
-        fs.writeFileSync(file, Buffer.from(data, 'base64'));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, path: file, size: fs.statSync(file).size, mimeType: mimeType || null }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
+  if (uploadRoutes.match(req)) { await uploadRoutes.handle(req, res); return; }
+  if (mcpRoutes.match(req)) { await mcpRoutes.handle(req, res); return; }
+  if (instanceRoutes.match(req)) { await instanceRoutes.handle(req, res); return; }
+  if (sessionRoutes.match(req)) { await sessionRoutes.handle(req, res); return; }
+  if (mediaRoutes.match(req)) { await mediaRoutes.handle(req, res); return; }
+  if (llamaRoutes.match(req)) { await llamaRoutes.handle(req, res); return; }
+  if (subagentRoutes.match(req)) { await subagentRoutes.handle(req, res); return; }
+  if (sourceRoutes.match(req)) { await sourceRoutes.handle(req, res); return; }
+  if (systemRoutes.match(req)) { await systemRoutes.handle(req, res); return; }
   // Transcribe an audio file (base64 WAV) via the local whisper server.
   if (req.url.startsWith('/api/transcribe')) {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
@@ -1148,8 +1784,9 @@ const server = http.createServer(async (req, res) => {
       };
       providers[id] = entry;
     }
+    const response = { file: PI_AUTH_FILE, providers };
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ file: PI_AUTH_FILE, providers }));
+    res.end(JSON.stringify(response));
     return;
   }
   if (req.url.startsWith('/api/auth-login')) {
@@ -1166,7 +1803,7 @@ const server = http.createServer(async (req, res) => {
           const auth = readJsonSafe(PI_AUTH_FILE) || {};
           auth[id] = { type: 'api_key', key };
           try {
-            fs.writeFileSync(PI_AUTH_FILE, JSON.stringify(auth, null, 2));
+            writeJsonAtomic(PI_AUTH_FILE, auth);
           } catch (e) {
             throw new Error(`write failed: ${e.message}`);
           }
@@ -1202,7 +1839,7 @@ const server = http.createServer(async (req, res) => {
       }
       delete auth[id];
       try {
-        fs.writeFileSync(PI_AUTH_FILE, JSON.stringify(auth, null, 2));
+        writeJsonAtomic(PI_AUTH_FILE, auth);
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
@@ -1215,408 +1852,67 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405).end();
     return;
   }
+  if (piRoutes.match(req)) { await piRoutes.handle(req, res); return; }
 
-  if (req.url.startsWith('/api/pi-providers')) {
-    if (req.method === 'GET') {
-      const file = readJsonSafe(PI_MODELS_FILE) || {};
-      const providers = {};
-      for (const [id, p] of Object.entries(file.providers || {})) {
-        providers[id] = {
-          name: p.name || null,
-          baseUrl: p.baseUrl || null,
-          api: p.api || null,
-          hasApiKey: !!p.apiKey,
-          apiKey: maskKey(p.apiKey),
-          models: (p.models || []).map((m) => (typeof m === 'string' ? { id: m } : m)),
-        };
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ file: PI_MODELS_FILE, providers }));
-      return;
-    }
-    if (req.method === 'DELETE') {
-      const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
-      if (!PROVIDER_ID_RE.test(id)) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invalid provider id' }));
-        return;
-      }
-      const file = readJsonSafe(PI_MODELS_FILE) || {};
-      if (!(file.providers && file.providers[id])) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `provider "${id}" not found` }));
-        return;
-      }
-      delete file.providers[id];
-      try {
-        writeModelsFile(file);
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, file: PI_MODELS_FILE, removed: id }));
-      return;
-    }
-    if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => { body += c; if (body.length > 1024 * 1024) req.destroy(); });
-      req.on('end', () => {
-        try {
-          const b = JSON.parse(body || '{}');
-          const id = String(b.id || '').trim();
-          const baseUrl = String(b.baseUrl || '').trim().replace(/\/+$/, '');
-          const api = String(b.api || '');
-          const apiKey = b.apiKey != null ? String(b.apiKey).trim() : '';
-          if (!PROVIDER_ID_RE.test(id)) throw new Error('provider id must be 1-64 chars: letters, digits, . _ -');
-          let u;
-          try { u = new URL(baseUrl); } catch { throw new Error('base URL is not a valid URL'); }
-          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('base URL must be http or https');
-          if (!ALLOWED_APIS.has(api)) throw new Error(`unsupported api "${api}"`);
-          const models = [];
-          if (b.models != null) {
-            if (!Array.isArray(b.models)) throw new Error('models must be an array');
-            for (const m of b.models.slice(0, 500)) {
-              const mid = typeof m === 'string' ? m.trim() : (m && String(m.id || '').trim());
-              if (!mid) continue;
-              const src = typeof m === 'string' ? { id: mid } : { ...m };
-              const clean = {};
-              for (const f of MODEL_FIELDS) if (src[f] !== undefined) clean[f] = src[f];
-              models.push(clean);
-            }
-          }
-          const provider = { baseUrl: u.toString().replace(/\/$/, ''), api };
-          if (b.name) provider.name = String(b.name).trim();
-          if (apiKey) provider.apiKey = apiKey;
-          if (models.length) provider.models = models;
-          if (b.compat && typeof b.compat === 'object') provider.compat = b.compat;
-
-          const file = readJsonSafe(PI_MODELS_FILE) || {};
-          if (!file.providers || typeof file.providers !== 'object') file.providers = {};
-          // blank key on an existing provider keeps its current key
-          if (!apiKey && file.providers[id] && file.providers[id].apiKey) {
-            provider.apiKey = file.providers[id].apiKey;
-          }
-          file.providers[id] = provider;
-          try {
-            writeModelsFile(file);
-          } catch (e) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
-            return;
-          }
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, file: PI_MODELS_FILE, id }));
-        } catch (e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-    res.writeHead(405).end();
-    return;
-  }
 
   serveStatic(req, res);
+}
+
+/* One request must never be able to stop the bridge. Every route is async, and
+ * an exception thrown after the await (or a synchronous throw in a helper such
+ * as serveStatic's decodeURIComponent) would otherwise become an unhandled
+ * rejection: Node prints it and exits, taking every tab and the agent with it.
+ * Answer 500 when the response has not started, and drop the socket when it
+ * has; the server keeps running either way. */
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((e) => {
+    console.error(`request failed (${req.method} ${String(req.url).slice(0, 80)}):`, (e && e.stack) || e);
+    if (!res.headersSent) {
+      try { res.writeHead(500, { 'Content-Type': 'text/plain' }).end('internal error'); } catch { /* gone */ }
+    } else {
+      try { res.destroy(); } catch { /* gone */ }
+    }
+  });
 });
 
 // ---------------------------------------------------------------- agent plumbing
 
-const wss = new WebSocketServer({ server });
-
-/*
- * ONE agent, shared by every connected client.
- *
- * The bridge used to spawn a `pi --mode rpc` child per WebSocket, which meant
- * the browser WebUI and the native app were two independent agents: separate
- * sessions, separate models, and events only one of them ever saw -- so the two
- * UIs drifted apart until a manual refresh.
- *
- * Now there is a single child. Every client writes its commands to it, every
- * event is broadcast to every client, and all UIs stay in lockstep in real time.
- *
- * Command ids are only unique per client, so a `response` is routed back to the
- * socket that asked (pendingOwner) rather than broadcast -- otherwise two
- * clients using "req-1" would resolve each other's requests.
- */
-let agent = null;               // the shared child process
-const clients = new Set();      // connected sockets
-const pendingOwner = new Map(); // rpc request id -> the ws that sent it
-
-function broadcast(obj, except) {
-  for (const ws of clients) {
-    if (ws !== except) wsSend(ws, obj);
-  }
-}
-
-// Tiny activity tracker for /api/health, which other instances poll to show a
-// pulsing dot. agent_start .. agent_settled is exactly "a turn is running".
-const agentStatus = { busy: false, sessionName: null };
-function noteAgentActivity(obj) {
-  if (!obj || typeof obj !== 'object') return;
-  switch (obj.type) {
-    case 'agent_start': agentStatus.busy = true; break;
-    case 'agent_settled':
-    case 'agent_end': agentStatus.busy = false; break;
-    case 'session_info_changed': if (obj.name) agentStatus.sessionName = obj.name; break;
-    case 'agent_exit': agentStatus.busy = false; break;
-    default: break;
-  }
-}
-
-const isWin = process.platform === 'win32';
-
-// Kill a child and (on Windows) its whole process tree. `shell: true` spawns
-// cmd.exe which then spawns the real agent, so a plain child.kill() would
-// orphan the agent and keep it running in the background. taskkill /T kills
-// the entire tree; on POSIX we kill the child's process group.
-function killTree(child) {
-  if (!child || child.pid == null) return;
-  try {
-    if (isWin) {
-      execSync(`taskkill /F /T /PID ${child.pid}`, { stdio: 'ignore' });
-    } else {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
-    }
-  } catch { /* already gone */ }
-}
-
-function wsSend(ws, obj) {
-  if (ws.readyState === ws.OPEN) {
-    try { ws.send(JSON.stringify(obj)); } catch { /* dead socket; keepalive reaps it */ }
-  }
-}
-
-function startAgent() {
-  if (agent) return agent;
-
-  const child = spawn(PI_COMMAND, {
-    shell: true, // pi is an npm .cmd shim on Windows; shell handles both platforms
-    cwd: WORKSPACE_DIR,
-    env: process.env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: !isWin, // POSIX: own process group so killTree can kill the whole tree
-  });
-
-  let buf = '';
-  child.stdout.on('data', (d) => {
-    // Protocol requires splitting on \n only (not U+2028/U+2029 like readline).
-    buf += d.toString('utf8');
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).replace(/\r$/, '');
-      buf = buf.slice(nl + 1);
-      if (!line.trim()) continue;
-      let parsed;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        broadcast({ bridge: 'agent_raw', line });
-        continue;
-      }
-      // A response belongs only to the client that issued the request; events
-      // (everything without a matching owner) go to everybody.
-      noteAgentActivity(parsed);
-      if (parsed && parsed.type === 'response' && parsed.id && pendingOwner.has(parsed.id)) {
-        const owner = pendingOwner.get(parsed.id);
-        pendingOwner.delete(parsed.id);
-        wsSend(owner, { bridge: 'rpc', payload: parsed });
-        continue;
-      }
-      broadcast({ bridge: 'rpc', payload: parsed });
-    }
-  });
-
-  child.stderr.on('data', (d) => {
-    broadcast({ bridge: 'agent_stderr', text: d.toString('utf8') });
-  });
-
-  child.on('error', (err) => {
-    broadcast({
-      bridge: 'agent_exit',
-      error: `Failed to start "${PI_COMMAND}": ${err.message}. ` +
-             `Is the pi coding agent installed and on PATH? (npm install -g @mariozechner/pi-coding-agent)`,
-    });
-  });
-
-  child.on('exit', (code, signal) => {
-    if (agent === child) agent = null;
-    agentStatus.busy = false;
-    broadcast({ bridge: 'agent_exit', code, signal });
-  });
-
-  agent = child;
-  broadcast({
-    bridge: 'agent_started',
-    command: PI_COMMAND,
-    workspace: WORKSPACE_DIR,
-    sessionDir: SESSION_DIR,
-  });
-  return child;
-}
-
-wss.on('connection', (ws) => {
-  clients.add(ws);
-  // Keepalive bookkeeping: the bridge pings every 30s (see below) and a dead
-  // client is terminated once it misses a round. Without this, half-open
-  // connections (sleep/wake, WebView2 network hiccups) linger in `clients`
-  // forever, so "last one out turns off the lights" never fires for a client
-  // that is actually gone.
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-  // A client socket error must not take the bridge down — an unhandled
-  // 'error' event would crash the process and drop every other client.
-  ws.on('error', () => { /* 'close' follows */ });
-  startAgent();
-  // Tell the newcomer where it is, and let it pull the current state itself.
-  wsSend(ws, {
-    bridge: 'agent_started',
-    command: PI_COMMAND,
-    workspace: WORKSPACE_DIR,
-    sessionDir: SESSION_DIR,
-  });
-
-  ws.on('message', (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString('utf8'));
-    } catch {
-      return;
-    }
-    if (msg.bridge === 'restart') {
-      // Shared process: everyone gets the fresh agent.
-      const old = agent;
-      agent = null;
-      if (old) killTree(old);
-      setTimeout(() => startAgent(), 150);
-      return;
-    }
-    if (msg.bridge) return; // bridge-level chatter is not forwarded
-    if (agent && agent.stdin.writable) {
-      // Remember who asked, so the response goes back to them and not to
-      // everybody (ids are only unique per client).
-      if (msg.id) pendingOwner.set(msg.id, ws);
-      agent.stdin.write(JSON.stringify(msg) + '\n');
-    } else {
-      wsSend(ws, { bridge: 'agent_stderr', text: 'Agent process is not running.' });
-    }
-  });
-
-  ws.on('close', () => {
-    clients.delete(ws);
-    // Drop any requests this client will never read.
-    for (const [id, owner] of pendingOwner) {
-      if (owner === ws) pendingOwner.delete(id);
-    }
-    // Last one out turns off the lights, so an abandoned agent is not left
-    // running in the background.
-    if (clients.size === 0 && agent) {
-      killTree(agent);
-      agent = null;
-    }
-  });
-});
-
-// Keepalive: ping every client every 30s and terminate any that miss a round.
-// The browser/WebView answers pings automatically, so a pong proves the whole
-// path (page -> WebView -> bridge) is alive. This is what lets both ends
-// notice a half-open connection: the client side runs its own liveness
-// heartbeat (web/app.js) and auto-reconnects.
-setInterval(() => {
-  for (const ws of clients) {
-    if (ws.readyState !== ws.OPEN) continue;
-    if (!ws.isAlive) { ws.terminate(); continue; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch { /* socket already closing */ }
-  }
-}, 30000);
-
-// A failed listen() (usually EADDRINUSE from an older bridge still running)
-// must produce a readable message instead of a stack trace.
-//
-// The error is delivered on both objects: `ws` re-emits the http server's
-// 'error' event on the WebSocketServer, and it registers that forwarder first -
-// so without a listener on the WebSocketServer the unhandled 'error' throw
-// happens before the http server's own handler ever runs.
-let listening = false;
-function onFatalServerError(err) {
-  if (listening) {
-    // Already serving - a stray socket error must not take the bridge down.
-    console.error('socket error (ignored):', (err && err.message) || err);
-    return;
-  }
-  if (err && err.code === 'EADDRINUSE') {
-    console.error('');
-    console.error(`  Port ${PORT} is already in use - another Pi Agent WebUI is probably`);
-    console.error('  still running (maybe an old window you forgot about).');
-    console.error('');
-    console.error('  Either close that window, or free the port with:');
-    console.error(`    netstat -ano | findstr :${PORT}`);
-    console.error('    taskkill /PID <pid> /F');
-    console.error('');
-    console.error('  (start-webui.bat offers to stop the old one for you.)');
-    console.error('');
-    process.exit(1);
-  }
-  if (err && err.code === 'EACCES') {
-    console.error(`  Cannot bind port ${PORT} - permission denied. Try a port above 1024.`);
-    process.exit(1);
-  }
-  console.error('server error:', (err && err.message) || err);
-  process.exit(1);
-}
-
-server.on('error', onFatalServerError);
-wss.on('error', onFatalServerError);
-
-server.listen(PORT, HOST, () => {
-  listening = true;
-  console.log(`Pi Agent WebUI`);
-  console.log(`  http://localhost:${PORT}`);
-  console.log(`  agent command : ${PI_COMMAND}`);
-  console.log(`  workspace     : ${WORKSPACE_DIR}`);
-  console.log(`  session dir   : ${SESSION_DIR}`);
-  if (HOST === '0.0.0.0' || HOST === '::') {
-    console.log('');
-    console.log('  !! reachable from your network, not just this machine.');
-    console.log('     Anyone on the LAN can drive this agent - there is no login.');
-    console.log('     Start it without PI_WEBUI_HOST to keep it local again.');
-    console.log('');
-  }
-  console.log('  speech to text: browser by default; the local whisper.cpp server is');
-  console.log('                  downloaded only when you pick it in Settings > Voice');
-  if (process.env.AUTO_WHISPER === '1') {
-    startWhisper(DEFAULT_MODEL).then((u) => { whisperUrl = u; });
-  }
-});
-
-// ---------------------------------------------------------------- shutdown
-
-// Ctrl+C (SIGINT) or a stop signal (SIGTERM) should cleanly stop the agent
-// subprocesses and the whisper server instead of leaving them running in the
-// background. The 'exit' handler is a synchronous last resort that also covers
-// "close the console window" on Windows, where the signal handlers may not get
-// a chance to run.
-let shuttingDown = false;
-function shutdown(code = 0) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log('\nStopping Pi Agent WebUI — killing agent processes…');
-  if (agent) killTree(agent);
-  stopWhisper();
-  try { server.close(); } catch { /* ignore */ }
-  process.exit(code);
-}
-process.on('SIGINT', () => shutdown(0));
-process.on('SIGTERM', () => shutdown(0));
-process.on('exit', () => {
-  if (agent) {
-    try {
-      if (isWin) execSync(`taskkill /F /T /PID ${agent.pid}`, { stdio: 'ignore' });
-      else agent.kill('SIGKILL');
-    } catch { /* already gone */ }
-  }
-  try { stopWhisper(); } catch { /* ignore */ }
+// noServer + one upgrade router: the bridge's own sockets answer on /ws, and
+// anything on /proxy/ is forwarded to the instance it names. Letting the server
+// handle every upgrade itself would have aborted the proxy connections before
+// they could be routed.
+/* ── agent supervision ──────────────────────────────────────────────────────
+ * Split out to bridge/agent.js (issue #54, phase 6): the child process, the
+ * RPC pipe, the WebSocket fan-out and the restart/idle bookkeeping. */
+require('./agent')({
+  agentStatus: agentStatus,
+  isWin: isWin,
+  fs: fs,
+  DEBUG_RPC,
+  DEFAULT_MODEL,
+  HOST,
+  PI_AGENT_DIR,
+  PI_COMMAND,
+  PORT,
+  SESSION_DIR,
+  WORKSPACE_DIR,
+  WebSocketServer,
+  allowedHostNames,
+  execSync,
+  forgetLastSession,
+  hostOnly,
+  hostSpawnDir,
+  http,
+  lanAddress,
+  loadLastSession,
+  path,
+  proxyWss,
+  saveLastSession,
+  server,
+  sessionFileExists,
+  spawn,
+  splitProxyPath,
+  startWhisper,
+  stopWhisper,
+  whisperUrl,
 });
